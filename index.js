@@ -12,7 +12,9 @@ const { Pool } = pkg;
 const app = express();
 const PORT = process.env.PORT || 3000;
 const SECRET_KEY = process.env.JWT_SECRET || "vex-secreta";
-const db = new Pool({ connectionString: process.env.DATABASE_URL });
+const db = new Pool({ connectionString: process.env.DATABASE_URL, ssl: {
+    rejectUnauthorized: false
+  } });
 
 app.use(cors());
 app.use(express.json());
