@@ -17,16 +17,23 @@ const db = new Pool({
 });
 
 // 🔐 CORS con opciones explícitas para permitir frontends autorizados
-const corsOptions = {
-  origin: [
-    "https://vex-crm-frontend.vercel.app",
-    "https://core.vex.com"
-  ],
-  credentials: true,
-  allowedHeaders: ["Authorization", "Content-Type"],
-};
+const ALLOWED_ORIGINS = [
+  "https://vex-core-frontend.vercel.app",
+  "https://vex-crm-frontend.vercel.app"
+];
 
-app.use(cors(corsOptions));
+app.use(cors({
+  origin: (origin, callback) => {
+    if (!origin || ALLOWED_ORIGINS.includes(origin)) {
+      callback(null, true);
+    } else {
+      callback(new Error("❌ CORS: Origin no permitido: " + origin));
+    }
+  },
+  credentials: true,
+  allowedHeaders: ["Authorization", "Content-Type"]
+}));
+
 app.use(express.json());
 
 // 🔐 Middleware: verificar JWT
