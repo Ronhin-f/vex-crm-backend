@@ -16,10 +16,20 @@ const db = new Pool({
   ssl: { rejectUnauthorized: false }
 });
 
-app.use(cors());
+// 🔐 CORS con opciones explícitas para permitir frontends autorizados
+const corsOptions = {
+  origin: [
+    "https://vex-crm-frontend.vercel.app",
+    "https://core.vex.com"
+  ],
+  credentials: true,
+  allowedHeaders: ["Authorization", "Content-Type"],
+};
+
+app.use(cors(corsOptions));
 app.use(express.json());
 
-// Middleware: verificar JWT
+// 🔐 Middleware: verificar JWT
 function authenticateToken(req, res, next) {
   const authHeader = req.headers["authorization"];
   const token = authHeader?.split(" ")[1];
