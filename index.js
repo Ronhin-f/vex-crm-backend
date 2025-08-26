@@ -1,41 +1,55 @@
-// Backend/index.js
+// backend/index.js
+// Arranque sin dependencias externas más que express.
+// No usa dotenv, ni helmet/cors, ni top-level await obligatorio.
+
 import express from "express";
-import dotenv from "dotenv";
 import { applySecurity } from "./middleware/security.js";
-import { initDB } from "./utils/db.js";
-
-import clientes from "./routes/clientes.js";
-import pedidos from "./routes/pedidos.js";
-import tareas from "./routes/tareas.js";
-import dashboard from "./routes/dashboard.js";
-import health from "./routes/health.js";
-import modulos from "./routes/modulos.js";
-import integraciones from "./routes/integraciones.js";
-import recordatorios from "./routes/recordatorios.js";
-import jobs from "./routes/job.js"; // <— nombre correcto
-
-dotenv.config();
 
 const app = express();
 app.use(express.json());
 applySecurity(app);
 
-// funcional
-app.use("/clientes", clientes);
-app.use("/pedidos", pedidos);
-app.use("/tareas", tareas);
-app.use("/dashboard", dashboard);
+// ===== Helpers para montar rutas con tolerancia a fallos =====
+async function mount(path, modulePath) {
+  try {
+    const mod = await import(modulePath);
+    const router = mod.default || mod.router || mod;
+    if (router && typeof router === "function") {
+      app.use(path, router);
+      console.log(`✅ Ruta montada: ${path} <- ${modulePath}`);
+    } else {
+      console.warn(`⚠️  ${modulePath} no exporta un router válido. Montando stub 501 en ${path}`);
+      app.use(path, (_req, res) => res.status(501).json({ error: "Ruta no disponible" }));
+    }
+  } catch (e) {
+    console.error(`💥 Error importando ${modulePath}:`, e?.message || e);
+    app.use(path, (_req, res) => res.status(500).json({ error: "Ruta falló al cargar" }));
+  }
+}
 
-// infra
-app.use("/modulos", modulos);            // opcional si consultás Core
-app.use("/integraciones", integraciones);
-app.use("/recordatorios", recordatorios);
-app.use("/jobs", jobs);
-app.use("/health", health);
+// ===== Montaje de rutas (suma o quita según tu repo) =====
+await mount("/clientes",       "./routes/clientes.js");
+await mount("/pedidos",        "./routes/pedidos.js");
+await mount("/tareas",         "./routes/tareas.js");
+await mount("/dashboard",      "./routes/dashboard.js");
+await mount("/modulos",        "./routes/modulos.js");
+await mount("/integraciones",  "./routes/integraciones.js");
+await mount("/recordatorios",  "./routes/recordatorios.js");
+await mount("/jobs",           "./routes/job.js");
+await mount("/health",         "./routes/health.js");
 
+// ===== Home / 404 =====
+app.get("/", (_req, res) => res.json({ ok: true, service: "vex-crm-backend" }));
+app.use((_req, res) => res.status(404).json({ error: "Not found" }));
+
+// ===== Hardening de proceso: que no se caiga por promesas sueltas =====
+process.on("unhandledRejection", (e) => {
+  console.error("UNHANDLED REJECTION:", e);
+});
+process.on("uncaughtException", (e) => {
+  console.error("UNCAUGHT EXCEPTION:", e);
+});
+
+// ===== Start =====
 const PORT = process.env.PORT || 3000;
-
-(async () => {
-  await initDB();
-  app.listen(PORT, () => console.log(`✅ VEX CRM en :${PORT}`));
-})();
+app.listen(PORT, () => console.log(`✅ VEX CRM en :${PORT}`));

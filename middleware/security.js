@@ -1,23 +1,21 @@
-import cors from "cors";
-import helmet from "helmet";
-import rateLimit from "express-rate-limit";
-
-const ALLOWED_ORIGINS = [
-  "https://vex-core-frontend.vercel.app",
-  "https://vex-crm-frontend.vercel.app"
-];
-
+// backend/middleware/security.js
 export function applySecurity(app) {
-  app.use(helmet());
-  app.set("trust proxy", 1);
-  app.use(rateLimit({ windowMs: 60_000, max: 300 })); // 300 req/min/IP
+  app.disable("x-powered-by");
 
-  app.use(cors({
-    origin: (origin, cb) => {
-      if (!origin || ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
-      cb(new Error("❌ CORS: Origin no permitido: " + origin));
-    },
-    credentials: true,
-    allowedHeaders: ["Authorization", "Content-Type"]
-  }));
+  // CORS básico
+  app.use((req, res, next) => {
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+    res.setHeader("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS");
+    if (req.method === "OPTIONS") return res.sendStatus(204);
+    next();
+  });
+
+  // Headers de hardening mínimos
+  app.use((req, res, next) => {
+    res.setHeader("Referrer-Policy", "no-referrer");
+    res.setHeader("X-Content-Type-Options", "nosniff");
+    res.setHeader("X-Frame-Options", "DENY");
+    next();
+  });
 }
