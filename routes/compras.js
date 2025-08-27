@@ -25,8 +25,7 @@ router.get("/", authenticateToken, async (req, res) => {
         i.observacion,
         p.id AS pedido_id,
         p.estado,
-        p.fecha,
-        p.created_at
+        p.fecha
       FROM pedido_items i
       JOIN pedidos p ON p.id = i.pedido_id
       ${where}
@@ -165,4 +164,3 @@ router.delete("/:id", authenticateToken, async (req, res) => {
 });
 
 export default router;
-x
