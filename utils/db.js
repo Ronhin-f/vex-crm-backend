@@ -24,7 +24,6 @@ function buildPoolConfig() {
 }
 
 export const db = new Pool(buildPoolConfig());
-
 export async function q(text, params = []) {
   // console.log("[SQL]", text, params);
   return db.query(text, params);
@@ -44,7 +43,7 @@ async function ensureOrgText(table) {
 }
 
 export async function initDB() {
-  // ===== Tablas base (no pisan existentes) =====
+  // ===== Tablas base (no pisa existentes) =====
   await q(`
     CREATE TABLE IF NOT EXISTS usuarios (
       id SERIAL PRIMARY KEY,
@@ -117,31 +116,26 @@ export async function initDB() {
       id SERIAL PRIMARY KEY,
       nombre TEXT NOT NULL,
       organizacion_id TEXT
-      -- columnas extra se agregan abajo con ALTER IF NOT EXISTS
+      -- si existe nombre_ci generado en instalaciones viejas, lo dejamos quieto
     );
   `);
 
-  // ===== Aseguro columnas que pueden faltar por instalaciones viejas =====
-  // clientes
+  // ===== Columnas que pueden faltar =====
   await q(`ALTER TABLE clientes ADD COLUMN IF NOT EXISTS email TEXT;`);
   await q(`ALTER TABLE clientes ADD COLUMN IF NOT EXISTS categoria TEXT;`);
   await q(`ALTER TABLE clientes ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW();`);
 
-  // tareas
   await q(`ALTER TABLE tareas ADD COLUMN IF NOT EXISTS completada BOOLEAN DEFAULT FALSE;`);
   await q(`ALTER TABLE tareas ADD COLUMN IF NOT EXISTS vence_en TIMESTAMPTZ;`);
   await q(`ALTER TABLE tareas ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW();`);
   await q(`ALTER TABLE tareas ADD COLUMN IF NOT EXISTS estado TEXT DEFAULT 'todo';`);
   await q(`ALTER TABLE tareas ADD COLUMN IF NOT EXISTS orden INTEGER DEFAULT 0;`);
 
-  // categorias
-  await q(`ALTER TABLE categorias ADD COLUMN IF NOT EXISTS nombre_ci TEXT;`);
+  // categorias: NO tocamos nombre_ci (puede ser generado). Solo agregamos lo que falta.
   await q(`ALTER TABLE categorias ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW();`);
   await q(`ALTER TABLE categorias ADD COLUMN IF NOT EXISTS orden INTEGER DEFAULT 0;`);
-  await q(`UPDATE categorias SET nombre_ci = LOWER(nombre) WHERE nombre_ci IS NULL;`);
-  await q(`CREATE UNIQUE INDEX IF NOT EXISTS categorias_org_nombre_ci_uniq ON categorias(organizacion_id, nombre_ci);`);
 
-  // ===== Normalizo tipo de org =====
+  // ===== Normalizo tipo de org a TEXT =====
   for (const t of ["usuarios","clientes","pedidos","tareas","integraciones","recordatorios","categorias"]) {
     await ensureOrgText(t);
   }
@@ -156,22 +150,27 @@ export async function initDB() {
   await q(`CREATE INDEX IF NOT EXISTS idx_tareas_estado    ON tareas(estado);`);
   await q(`CREATE INDEX IF NOT EXISTS idx_tareas_orden     ON tareas(orden);`);
 
-  // ===== Seed/Upsert del pipeline canónico (orden consistente) =====
+  // Unique por (org, lower(nombre)) para evitar depender de nombre_ci
+  await q(`CREATE UNIQUE INDEX IF NOT EXISTS categorias_org_nombre_lower_uniq
+             ON categorias (organizacion_id, lower(nombre));`);
+
+  // ===== Seed/Upsert del pipeline canónico (case-insensitive) =====
   for (let i = 0; i < CANON_CATS.length; i++) {
     const name = CANON_CATS[i];
-    // 1) actualizo orden si ya existía (case-insensitive)
+    // Actualizo orden si ya existe (global NULL)
     await q(
-      `UPDATE categorias SET orden=$2, nombre_ci=LOWER(nombre)
-         WHERE organizacion_id IS NULL AND LOWER(nombre)=LOWER($1)`,
+      `UPDATE categorias SET orden=$2
+         WHERE organizacion_id IS NULL AND lower(nombre)=lower($1)`,
       [name, i]
     );
-    // 2) inserto si no existe
+    // Inserto si no existe
     await q(
-      `INSERT INTO categorias (nombre, nombre_ci, organizacion_id, orden)
-       SELECT $1, LOWER($1), NULL, $2
-       WHERE NOT EXISTS (
-         SELECT 1 FROM categorias WHERE organizacion_id IS NULL AND LOWER(nombre)=LOWER($1)
-       )`,
+      `INSERT INTO categorias (nombre, organizacion_id, orden)
+       SELECT $1, NULL, $2
+        WHERE NOT EXISTS (
+          SELECT 1 FROM categorias
+           WHERE organizacion_id IS NULL AND lower(nombre)=lower($1)
+        )`,
       [name, i]
     );
   }
