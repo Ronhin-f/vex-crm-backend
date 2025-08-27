@@ -3,14 +3,14 @@
   "version": "1.0.0",
   "type": "module",
   "main": "index.js",
-  "scripts": {
-    "start": "node index.js",
-    "dev": "nodemon index.js"
-  },
-  "keywords": [],
+  "description": "Backend de VEX CRM",
   "author": "Vector Inc.",
   "license": "MIT",
-  "description": "Backend de VEX CRM",
+  "engines": { "node": ">=18.17.0" },
+  "scripts": {
+    "start": "node index.js",
+    "dev": "nodemon --watch . --ext js,mjs,cjs json --signal SIGTERM index.js"
+  },
   "dependencies": {
     "bcryptjs": "^2.4.3",
     "cors": "^2.8.5",
