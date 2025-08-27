@@ -1,18 +1,32 @@
-// index.js — VEX CRM Backend
+// index.js — VEX CRM Backend (ESM)
 import "dotenv/config";
 import express from "express";
+import morgan from "morgan";
 import { applySecurity } from "./middleware/security.js";
 import { initDB } from "./utils/db.js";
 
 const app = express();
 app.set("trust proxy", true);
-app.use(express.json());
+
+// Parsers
+app.use(express.json({ limit: "1mb" }));
+app.use(express.urlencoded({ extended: false }));
+
+// Logs
+if (process.env.NODE_ENV !== "test") {
+  app.use(morgan("tiny"));
+}
+
+// Seguridad (CORS + Helmet)
 applySecurity(app);
 
-// Migraciones mínimas + catálogo de categorías
+// Migraciones mínimas + catálogo
 await initDB();
 
-// ===== Helpers para montar rutas con tolerancia a fallos =====
+// Health de respaldo (aunque /health falle al montar)
+app.get("/healthz", (_req, res) => res.status(200).json({ ok: true, minimal: true }));
+
+// ===== Helper para montaje tolerante a fallos =====
 async function mount(path, modulePath) {
   try {
     const mod = await import(modulePath);
@@ -21,7 +35,7 @@ async function mount(path, modulePath) {
       app.use(path, router);
       console.log(`✅ Ruta montada: ${path} <- ${modulePath}`);
     } else {
-      console.warn(`⚠️  ${modulePath} no exporta un router válido. Montando stub 501 en ${path}`);
+      console.warn(`⚠️  ${modulePath} no exporta un router válido. Stub 501 en ${path}`);
       app.use(path, (_req, res) => res.status(501).json({ error: "Ruta no disponible" }));
     }
   } catch (e) {
@@ -32,7 +46,8 @@ async function mount(path, modulePath) {
 
 // ===== Montaje de rutas =====
 await mount("/clientes",       "./routes/clientes.js");
-await mount("/categorias",     "./routes/categorias.js");   // << NUEVO
+await mount("/categorias",     "./routes/categorias.js");
+await mount("/kanban",         "./routes/kanban.js");      // Kanban clientes/tareas + KPIs
 await mount("/pedidos",        "./routes/pedidos.js");
 await mount("/tareas",         "./routes/tareas.js");
 await mount("/dashboard",      "./routes/dashboard.js");
@@ -46,9 +61,18 @@ await mount("/health",         "./routes/health.js");
 app.get("/", (_req, res) => res.json({ ok: true, service: "vex-crm-backend" }));
 app.use((_req, res) => res.status(404).json({ error: "Not found" }));
 
+// ===== Handler global de errores (evita 500 crudo sin shape) =====
+/* eslint-disable no-unused-vars */
+app.use((err, _req, res, _next) => {
+  console.error("🔥 Unhandled error:", err?.stack || err?.message || err);
+  res.status(500).json({ error: "Internal error" });
+});
+/* eslint-enable no-unused-vars */
+
 // ===== Hardening =====
 process.on("unhandledRejection", (e) => console.error("UNHANDLED REJECTION:", e));
-process.on("uncaughtException", (e) => console.error("UNCAUGHT EXCEPTION:", e));
+process.on("uncaughtException",  (e) => console.error("UNCAUGHT EXCEPTION:", e));
 
+// ===== Start =====
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`✅ VEX CRM en :${PORT}`));
