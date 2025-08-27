@@ -48,6 +48,7 @@ async function mount(path, modulePath) {
 await mount("/clientes",       "./routes/clientes.js");
 await mount("/categorias",     "./routes/categorias.js");
 await mount("/kanban",         "./routes/kanban.js");      // Kanban clientes/tareas + KPIs
+await mount("/compras",        "./routes/compras.js"); 
 await mount("/pedidos",        "./routes/pedidos.js");
 await mount("/tareas",         "./routes/tareas.js");
 await mount("/dashboard",      "./routes/dashboard.js");
