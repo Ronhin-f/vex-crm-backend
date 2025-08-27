@@ -1,25 +1,64 @@
 // routes/kanban.js
 import { Router } from "express";
-import { q, CANON_CATS } from "../utils/db.js";
+import { q } from "../utils/db.js";
 import { authenticateToken } from "../middleware/auth.js";
 
 const router = Router();
 
-// ---------- KANBAN CLIENTES (pipeline fijo) ----------
-router.get("/clientes", authenticateToken, async (req, res) => {
+// ---------- KPIs para dashboard ----------
+router.get("/kpis", authenticateToken, async (req, res) => {
   try {
     const org = req.organizacion_id || null;
 
-    // Orden por catálogo (global y por org), con fallback al orden CANON
-    const cats = await q(
-      `SELECT nombre, orden
-         FROM categorias
-        WHERE organizacion_id IS NULL OR organizacion_id = $1
-        ORDER BY orden ASC, nombre ASC`,
-      [org]
+    const p1 = org ? [org] : [];
+    const w1 = org ? "WHERE organizacion_id = $1" : "";
+    const clientesPorCat = await q(
+      `SELECT COALESCE(categoria,'Uncategorized') AS categoria, COUNT(*)::int AS total
+         FROM clientes
+         ${w1}
+         GROUP BY categoria
+         ORDER BY total DESC`,
+      p1
     );
-    const order = cats.rowCount ? cats.rows.map(r => r.nombre) : CANON_CATS;
 
+    const p2 = org ? [org] : [];
+    const w2 = org ? "WHERE organizacion_id = $1" : "";
+    const tareasPorEstado = await q(
+      `SELECT COALESCE(estado,'todo') AS estado, COUNT(*)::int AS total
+         FROM tareas
+         ${w2}
+         GROUP BY estado
+         ORDER BY total DESC`,
+      p2
+    );
+
+    const vencen7 = await q(
+      `SELECT COUNT(*)::int AS total
+         FROM tareas
+        WHERE completada = FALSE
+          AND vence_en IS NOT NULL
+          AND vence_en <= NOW() + INTERVAL '7 days'
+          ${org ? "AND organizacion_id = $1" : ""}`,
+      org ? [org] : []
+    );
+
+    res.json({
+      clientesPorCat: clientesPorCat.rows,
+      tareasPorEstado: tareasPorEstado.rows,
+      proximos7d: vencen7.rows?.[0]?.total ?? 0,
+    });
+  } catch (e) {
+    console.error("[GET /kanban/kpis]", e?.stack || e?.message || e);
+    res.status(500).json({ message: "Error obteniendo KPIs" });
+  }
+});
+
+// ---------- Kanban de CLIENTES (pipeline fijo si te sirve) ----------
+const PIPELINE = ["Incoming Leads", "Qualified", "Bid/Estimate Sent", "Won", "Lost"];
+
+router.get("/clientes", authenticateToken, async (req, res) => {
+  try {
+    const org = req.organizacion_id || null;
     const params = [];
     let where = "";
     if (org) { params.push(org); where = `WHERE c.organizacion_id = $${params.length}`; }
@@ -32,18 +71,18 @@ router.get("/clientes", authenticateToken, async (req, res) => {
       params
     );
 
-    // Inicializo columnas en orden canon
-    const map = new Map(order.map(n => [n, []]));
+    // armo columnas en orden del pipeline
+    const map = new Map(PIPELINE.map(k => [k, []]));
     for (const row of rs.rows) {
-      const key = order.includes(row.categoria) ? row.categoria : "Lost"; // bucket de descarte: Lost
+      const key = PIPELINE.includes(row.categoria) ? row.categoria : "Lost";
       map.get(key).push(row);
     }
 
-    const columns = order.map(name => ({
+    const columns = PIPELINE.map(name => ({
       key: name,
       title: name,
       count: map.get(name)?.length || 0,
-      items: map.get(name) || []
+      items: map.get(name) || [],
     }));
 
     res.json({ columns });
@@ -53,7 +92,7 @@ router.get("/clientes", authenticateToken, async (req, res) => {
   }
 });
 
-// mover cliente de etapa (solo a categorías canónicas)
+// mover cliente entre columnas del pipeline
 router.patch("/clientes/:id/move", authenticateToken, async (req, res) => {
   try {
     const id = Number(req.params.id);
@@ -61,16 +100,7 @@ router.patch("/clientes/:id/move", authenticateToken, async (req, res) => {
     if (!Number.isInteger(id)) return res.status(400).json({ message: "ID inválido" });
     if (!categoria || typeof categoria !== "string") return res.status(400).json({ message: "Categoría requerida" });
     categoria = categoria.trim();
-    if (!CANON_CATS.includes(categoria)) return res.status(400).json({ message: "Categoría no permitida" });
-
-    // Garantizo que exista en catálogo global (si no, la creo con el orden canon)
-    const idx = CANON_CATS.indexOf(categoria);
-    await q(
-      `INSERT INTO categorias (nombre, organizacion_id, orden)
-       VALUES ($1, NULL, $2)
-       ON CONFLICT (organizacion_id, nombre_ci) DO UPDATE SET orden=EXCLUDED.orden`,
-      [categoria, idx]
-    );
+    if (!PIPELINE.includes(categoria)) return res.status(400).json({ message: "Categoría fuera del pipeline" });
 
     const r = await q(
       `UPDATE clientes SET categoria=$1 WHERE id=$2 RETURNING id, nombre, categoria`,
@@ -84,12 +114,12 @@ router.patch("/clientes/:id/move", authenticateToken, async (req, res) => {
   }
 });
 
-// ---------- KANBAN TAREAS (igual que antes) ----------
+// ---------- Kanban de TAREAS ----------
 const TASK_COLUMNS = [
   { key: "todo",    title: "Por hacer" },
   { key: "doing",   title: "En curso" },
   { key: "waiting", title: "En espera" },
-  { key: "done",    title: "Hecho" }
+  { key: "done",    title: "Hecho" },
 ];
 
 router.get("/tareas", authenticateToken, async (req, res) => {
@@ -123,7 +153,7 @@ router.get("/tareas", authenticateToken, async (req, res) => {
       key: col.key,
       title: col.title,
       count: (byState.get(col.key) || []).length,
-      items: byState.get(col.key) || []
+      items: byState.get(col.key) || [],
     }));
 
     res.json({ columns });
@@ -141,10 +171,12 @@ router.patch("/tareas/:id/move", authenticateToken, async (req, res) => {
     if (!estado || !["todo","doing","waiting","done"].includes(estado))
       return res.status(400).json({ message: "Estado inválido" });
 
-    const p = [estado];
-    let where = "WHERE estado=$1";
+    // si no envían orden, lo pongo al final
     if (orden == null) {
-      const mr = await q(`SELECT COALESCE(MAX(orden),0) AS m FROM tareas ${where}`, p);
+      const mr = await q(
+        `SELECT COALESCE(MAX(orden),0) AS m FROM tareas WHERE estado=$1`,
+        [estado]
+      );
       orden = (mr.rows?.[0]?.m ?? 0) + 1;
     }
 
