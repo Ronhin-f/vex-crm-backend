@@ -28,7 +28,7 @@ async function ensureOrgText(table) {
 }
 
 export async function initDB() {
-  // Base
+  // ===== Tablas base (no pisa nada existente) =====
   await q(`
     CREATE TABLE IF NOT EXISTS usuarios (
       id SERIAL PRIMARY KEY,
@@ -70,8 +70,8 @@ export async function initDB() {
       id SERIAL PRIMARY KEY,
       titulo TEXT NOT NULL,
       descripcion TEXT,
-      completada BOOLEAN DEFAULT false,
-      vence_en TIMESTAMPTZ,
+      -- OJO: muchas instalaciones viejas no tienen estas columnas:
+      -- completada, vence_en, created_at; las agrego luego con ALTER IF NOT EXISTS
       cliente_id INTEGER,
       usuario_email TEXT,
       organizacion_id TEXT
@@ -100,7 +100,7 @@ export async function initDB() {
     );
   `);
 
-  // Catálogo de categorías (por organización)
+  // ===== Catálogo de categorías (por organización) =====
   await q(`
     CREATE TABLE IF NOT EXISTS categorias (
       id SERIAL PRIMARY KEY,
@@ -112,18 +112,23 @@ export async function initDB() {
     );
   `);
 
-  // Columnas que usan front/dashboard
+  // ===== Columnas que pueden faltar por instalaciones previas =====
+  // clientes
   await q(`ALTER TABLE clientes ADD COLUMN IF NOT EXISTS email TEXT;`);
   await q(`ALTER TABLE clientes ADD COLUMN IF NOT EXISTS categoria TEXT;`);
   await q(`ALTER TABLE clientes ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW();`);
-  await q(`ALTER TABLE tareas   ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW();`);
 
-  // Normalizo organizacion_id a TEXT (si venías con INTEGER)
+  // tareas
+  await q(`ALTER TABLE tareas ADD COLUMN IF NOT EXISTS completada BOOLEAN DEFAULT FALSE;`);
+  await q(`ALTER TABLE tareas ADD COLUMN IF NOT EXISTS vence_en TIMESTAMPTZ;`);
+  await q(`ALTER TABLE tareas ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW();`);
+
+  // ===== Normalizo organizacion_id a TEXT (si venías con INTEGER) =====
   for (const t of ["usuarios", "clientes", "pedidos", "tareas", "integraciones", "recordatorios", "categorias"]) {
     await ensureOrgText(t);
   }
 
-  // Índices
+  // ===== Índices (después de asegurar columnas) =====
   await q(`CREATE INDEX IF NOT EXISTS idx_clientes_org     ON clientes(organizacion_id);`);
   await q(`CREATE INDEX IF NOT EXISTS idx_clientes_created ON clientes(created_at);`);
   await q(`CREATE INDEX IF NOT EXISTS idx_clientes_cat     ON clientes(categoria);`);
@@ -131,7 +136,7 @@ export async function initDB() {
   await q(`CREATE INDEX IF NOT EXISTS idx_tareas_vence     ON tareas(vence_en);`);
   await q(`CREATE INDEX IF NOT EXISTS idx_tareas_compl     ON tareas(completada);`);
 
-  // Semillas suaves (no duplica si ya existen)
+  // ===== Semillas suaves de categorías =====
   await q(`
     INSERT INTO categorias (nombre, organizacion_id)
     VALUES ('Lead', NULL), ('Opportunity', NULL), ('Customer', NULL), ('Partner', NULL), ('Dormant', NULL)
