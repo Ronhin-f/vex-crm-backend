@@ -9,28 +9,33 @@ export const db = new Pool({
   idleTimeoutMillis: Number(process.env.PG_IDLE || 30000),
 });
 
-// Helper por si querés loguear SQL en debug
 export async function q(text, params = []) {
   // console.log("[SQL]", text, params);
   return db.query(text, params);
 }
 
-/**
- * Migración mínima y segura:
- * - No reemplaza tus tablas existentes.
- * - Agrega columnas faltantes que el dashboard necesita:
- *   clientes.email, clientes.created_at, tareas.created_at
- * - Crea índices razonables.
- */
+async function ensureOrgText(table) {
+  const info = await q(
+    `SELECT data_type
+       FROM information_schema.columns
+      WHERE table_schema='public' AND table_name=$1 AND column_name='organizacion_id'`,
+    [table]
+  );
+  const type = info.rows?.[0]?.data_type;
+  if (type && type !== "text") {
+    await q(`ALTER TABLE ${table} ALTER COLUMN organizacion_id TYPE TEXT USING organizacion_id::text;`);
+  }
+}
+
 export async function initDB() {
-  // Tablas base (como ya tenías)
-  await db.query(`
+  // Base
+  await q(`
     CREATE TABLE IF NOT EXISTS usuarios (
       id SERIAL PRIMARY KEY,
       email TEXT UNIQUE,
       password TEXT,
       rol TEXT,
-      organizacion_id INTEGER
+      organizacion_id TEXT
     );
 
     CREATE TABLE IF NOT EXISTS clientes (
@@ -40,8 +45,7 @@ export async function initDB() {
       direccion TEXT,
       observacion TEXT,
       usuario_email TEXT,
-      organizacion_id INTEGER
-      -- OJO: email y created_at los agregamos abajo con ALTER IF NOT EXISTS
+      organizacion_id TEXT
     );
 
     CREATE TABLE IF NOT EXISTS pedidos (
@@ -51,7 +55,7 @@ export async function initDB() {
       estado TEXT DEFAULT 'pendiente',
       fecha DATE DEFAULT CURRENT_DATE,
       usuario_email TEXT,
-      organizacion_id INTEGER
+      organizacion_id TEXT
     );
 
     CREATE TABLE IF NOT EXISTS pedido_items (
@@ -70,20 +74,19 @@ export async function initDB() {
       vence_en TIMESTAMPTZ,
       cliente_id INTEGER,
       usuario_email TEXT,
-      organizacion_id INTEGER
-      -- created_at lo agregamos abajo si falta
+      organizacion_id TEXT
     );
 
     CREATE TABLE IF NOT EXISTS integraciones (
       id SERIAL PRIMARY KEY,
-      organizacion_id INTEGER UNIQUE,
+      organizacion_id TEXT UNIQUE,
       slack_webhook_url TEXT,
       updated_at TIMESTAMPTZ DEFAULT NOW()
     );
 
     CREATE TABLE IF NOT EXISTS recordatorios (
       id SERIAL PRIMARY KEY,
-      organizacion_id INTEGER NOT NULL,
+      organizacion_id TEXT NOT NULL,
       titulo TEXT NOT NULL,
       mensaje TEXT NOT NULL,
       enviar_en TIMESTAMPTZ NOT NULL,
@@ -97,15 +100,41 @@ export async function initDB() {
     );
   `);
 
-  // --- Columnas faltantes necesarias para el dashboard ---
-  await db.query(`ALTER TABLE clientes ADD COLUMN IF NOT EXISTS email TEXT;`);
-  await db.query(`ALTER TABLE clientes ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW();`);
-  await db.query(`ALTER TABLE tareas   ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW();`);
+  // Catálogo de categorías (por organización)
+  await q(`
+    CREATE TABLE IF NOT EXISTS categorias (
+      id SERIAL PRIMARY KEY,
+      nombre TEXT NOT NULL,
+      nombre_ci TEXT GENERATED ALWAYS AS (LOWER(nombre)) STORED,
+      organizacion_id TEXT,
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      UNIQUE (organizacion_id, nombre_ci)
+    );
+  `);
 
-  // --- Índices útiles ---
-  await db.query(`CREATE INDEX IF NOT EXISTS idx_clientes_org ON clientes(organizacion_id);`);
-  await db.query(`CREATE INDEX IF NOT EXISTS idx_clientes_created ON clientes(created_at);`);
-  await db.query(`CREATE INDEX IF NOT EXISTS idx_tareas_org ON tareas(organizacion_id);`);
-  await db.query(`CREATE INDEX IF NOT EXISTS idx_tareas_vence ON tareas(vence_en);`);
-  await db.query(`CREATE INDEX IF NOT EXISTS idx_tareas_completada ON tareas(completada);`);
+  // Columnas que usan front/dashboard
+  await q(`ALTER TABLE clientes ADD COLUMN IF NOT EXISTS email TEXT;`);
+  await q(`ALTER TABLE clientes ADD COLUMN IF NOT EXISTS categoria TEXT;`);
+  await q(`ALTER TABLE clientes ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW();`);
+  await q(`ALTER TABLE tareas   ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW();`);
+
+  // Normalizo organizacion_id a TEXT (si venías con INTEGER)
+  for (const t of ["usuarios", "clientes", "pedidos", "tareas", "integraciones", "recordatorios", "categorias"]) {
+    await ensureOrgText(t);
+  }
+
+  // Índices
+  await q(`CREATE INDEX IF NOT EXISTS idx_clientes_org     ON clientes(organizacion_id);`);
+  await q(`CREATE INDEX IF NOT EXISTS idx_clientes_created ON clientes(created_at);`);
+  await q(`CREATE INDEX IF NOT EXISTS idx_clientes_cat     ON clientes(categoria);`);
+  await q(`CREATE INDEX IF NOT EXISTS idx_tareas_org       ON tareas(organizacion_id);`);
+  await q(`CREATE INDEX IF NOT EXISTS idx_tareas_vence     ON tareas(vence_en);`);
+  await q(`CREATE INDEX IF NOT EXISTS idx_tareas_compl     ON tareas(completada);`);
+
+  // Semillas suaves (no duplica si ya existen)
+  await q(`
+    INSERT INTO categorias (nombre, organizacion_id)
+    VALUES ('Lead', NULL), ('Opportunity', NULL), ('Customer', NULL), ('Partner', NULL), ('Dormant', NULL)
+    ON CONFLICT (organizacion_id, nombre_ci) DO NOTHING;
+  `);
 }

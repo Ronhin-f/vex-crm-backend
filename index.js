@@ -1,13 +1,16 @@
-// backend/index.js
-// Arranque sin dependencias externas más que express.
-// No usa dotenv, ni helmet/cors, ni top-level await obligatorio.
-
+// index.js — VEX CRM Backend
+import "dotenv/config";
 import express from "express";
 import { applySecurity } from "./middleware/security.js";
+import { initDB } from "./utils/db.js";
 
 const app = express();
+app.set("trust proxy", true);
 app.use(express.json());
 applySecurity(app);
+
+// Migraciones mínimas + catálogo de categorías
+await initDB();
 
 // ===== Helpers para montar rutas con tolerancia a fallos =====
 async function mount(path, modulePath) {
@@ -22,13 +25,14 @@ async function mount(path, modulePath) {
       app.use(path, (_req, res) => res.status(501).json({ error: "Ruta no disponible" }));
     }
   } catch (e) {
-    console.error(`💥 Error importando ${modulePath}:`, e?.message || e);
+    console.error(`💥 Error importando ${modulePath}:`, e?.stack || e?.message || e);
     app.use(path, (_req, res) => res.status(500).json({ error: "Ruta falló al cargar" }));
   }
 }
 
-// ===== Montaje de rutas (suma o quita según tu repo) =====
+// ===== Montaje de rutas =====
 await mount("/clientes",       "./routes/clientes.js");
+await mount("/categorias",     "./routes/categorias.js");   // << NUEVO
 await mount("/pedidos",        "./routes/pedidos.js");
 await mount("/tareas",         "./routes/tareas.js");
 await mount("/dashboard",      "./routes/dashboard.js");
@@ -42,14 +46,9 @@ await mount("/health",         "./routes/health.js");
 app.get("/", (_req, res) => res.json({ ok: true, service: "vex-crm-backend" }));
 app.use((_req, res) => res.status(404).json({ error: "Not found" }));
 
-// ===== Hardening de proceso: que no se caiga por promesas sueltas =====
-process.on("unhandledRejection", (e) => {
-  console.error("UNHANDLED REJECTION:", e);
-});
-process.on("uncaughtException", (e) => {
-  console.error("UNCAUGHT EXCEPTION:", e);
-});
+// ===== Hardening =====
+process.on("unhandledRejection", (e) => console.error("UNHANDLED REJECTION:", e));
+process.on("uncaughtException", (e) => console.error("UNCAUGHT EXCEPTION:", e));
 
-// ===== Start =====
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`✅ VEX CRM en :${PORT}`));
