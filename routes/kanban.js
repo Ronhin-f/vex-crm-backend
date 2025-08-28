@@ -1,81 +1,154 @@
 // routes/kanban.js
 import { Router } from "express";
-import { q } from "../utils/db.js";
+import { q, CANON_CATS } from "../utils/db.js";
 import { authenticateToken } from "../middleware/auth.js";
 
 const router = Router();
 
-// ---------- KPIs para dashboard ----------
+/* ---------------------------- helpers ---------------------------- */
+function getUserFromReq(req) {
+  const u = req.usuario || {};
+  return {
+    email:
+      u.email ??
+      req.usuario_email ??
+      u.usuario_email ??
+      null,
+    organizacion_id:
+      u.organizacion_id ??
+      req.organizacion_id ??
+      u.organization_id ??
+      null,
+  };
+}
+
+// Pipeline canónico
+const PIPELINE = CANON_CATS; // ["Incoming Leads","Qualified","Bid/Estimate Sent","Won","Lost"]
+
+/* ============================ KPIs ============================ */
+/**
+ * KPIs para dashboard:
+ *  - clientesPorStage (usa stage; fallback a "Uncategorized")
+ *  - tareasPorEstado
+ *  - proximos7d (tareas con due en <= 7 días, incompletas)
+ *
+ * Debe devolver zeros/arrays vacíos si no hay datos (no 500).
+ */
 router.get("/kpis", authenticateToken, async (req, res) => {
   try {
-    const org = req.organizacion_id || null;
+    const { organizacion_id } = getUserFromReq(req);
 
-    const p1 = org ? [org] : [];
-    const w1 = org ? "WHERE organizacion_id = $1" : "";
-    const clientesPorCat = await q(
-      `SELECT COALESCE(categoria,'Uncategorized') AS categoria, COUNT(*)::int AS total
-         FROM clientes
-         ${w1}
-         GROUP BY categoria
-         ORDER BY total DESC`,
+    const p1 = [];
+    const w1 = [];
+    if (organizacion_id) {
+      p1.push(organizacion_id);
+      w1.push(`organizacion_id = $${p1.length}`);
+    }
+    const clientesPorStage = await q(
+      `
+      SELECT COALESCE(stage,'Uncategorized') AS stage, COUNT(*)::int AS total
+        FROM clientes
+       ${w1.length ? "WHERE " + w1.join(" AND ") : ""}
+       GROUP BY stage
+       ORDER BY total DESC
+      `,
       p1
     );
 
-    const p2 = org ? [org] : [];
-    const w2 = org ? "WHERE organizacion_id = $1" : "";
+    const p2 = [];
+    const w2 = [];
+    if (organizacion_id) {
+      p2.push(organizacion_id);
+      w2.push(`organizacion_id = $${p2.length}`);
+    }
     const tareasPorEstado = await q(
-      `SELECT COALESCE(estado,'todo') AS estado, COUNT(*)::int AS total
-         FROM tareas
-         ${w2}
-         GROUP BY estado
-         ORDER BY total DESC`,
+      `
+      SELECT COALESCE(estado,'todo') AS estado, COUNT(*)::int AS total
+        FROM tareas
+       ${w2.length ? "WHERE " + w2.join(" AND ") : ""}
+       GROUP BY estado
+       ORDER BY total DESC
+      `,
       p2
     );
 
     const vencen7 = await q(
-      `SELECT COUNT(*)::int AS total
-         FROM tareas
-        WHERE completada = FALSE
-          AND vence_en IS NOT NULL
-          AND vence_en <= NOW() + INTERVAL '7 days'
-          ${org ? "AND organizacion_id = $1" : ""}`,
-      org ? [org] : []
+      `
+      SELECT COUNT(*)::int AS total
+        FROM tareas
+       WHERE completada = FALSE
+         AND vence_en IS NOT NULL
+         AND vence_en <= NOW() + INTERVAL '7 days'
+         ${organizacion_id ? "AND organizacion_id = $1" : ""}
+      `,
+      organizacion_id ? [organizacion_id] : []
     );
 
     res.json({
-      clientesPorCat: clientesPorCat.rows,
-      tareasPorEstado: tareasPorEstado.rows,
+      clientesPorStage: clientesPorStage.rows || [],
+      tareasPorEstado: tareasPorEstado.rows || [],
       proximos7d: vencen7.rows?.[0]?.total ?? 0,
     });
   } catch (e) {
     console.error("[GET /kanban/kpis]", e?.stack || e?.message || e);
-    res.status(500).json({ message: "Error obteniendo KPIs" });
+    res.json({
+      clientesPorStage: [],
+      tareasPorEstado: [],
+      proximos7d: 0,
+    });
   }
 });
 
-// ---------- Kanban de CLIENTES (pipeline fijo si te sirve) ----------
-const PIPELINE = ["Incoming Leads", "Qualified", "Bid/Estimate Sent", "Won", "Lost"];
-
+/* ====================== Kanban de CLIENTES ===================== */
+/**
+ * Devuelve columnas del pipeline con tarjetas ricas para la UI:
+ *  - id, nombre, email, telefono
+ *  - stage, source, assignee, due_date
+ *  - estimate_url (y flag if file), created_at
+ */
 router.get("/clientes", authenticateToken, async (req, res) => {
   try {
-    const org = req.organizacion_id || null;
+    const { organizacion_id } = getUserFromReq(req);
     const params = [];
-    let where = "";
-    if (org) { params.push(org); where = `WHERE c.organizacion_id = $${params.length}`; }
+    const where = [];
+
+    if (organizacion_id) {
+      params.push(organizacion_id);
+      where.push(`c.organizacion_id = $${params.length}`);
+    }
 
     const rs = await q(
-      `SELECT c.id, c.nombre, c.telefono, c.email, c.categoria, c.created_at
-         FROM clientes c
-         ${where}
-         ORDER BY c.created_at DESC NULLS LAST, c.id DESC`,
+      `
+      SELECT
+        c.id, c.nombre, c.telefono, c.email,
+        c.stage, c.categoria, c.source, c.assignee, c.due_date,
+        c.estimate_url, c.estimate_file, c.created_at
+      FROM clientes c
+      ${where.length ? "WHERE " + where.join(" AND ") : ""}
+      ORDER BY c.created_at DESC NULLS LAST, c.id DESC
+      `,
       params
     );
 
-    // armo columnas en orden del pipeline
     const map = new Map(PIPELINE.map(k => [k, []]));
     for (const row of rs.rows) {
-      const key = PIPELINE.includes(row.categoria) ? row.categoria : "Lost";
-      map.get(key).push(row);
+      const key = PIPELINE.includes(row.stage) ? row.stage
+                 : PIPELINE.includes(row.categoria) ? row.categoria
+                 : "Lost"; // fallback duro para no mezclar "Uncategorized" en la demo
+      const estimateChip = !!(row.estimate_url || row.estimate_file);
+      map.get(key).push({
+        id: row.id,
+        nombre: row.nombre,
+        email: row.email,
+        telefono: row.telefono,
+        stage: row.stage,
+        source: row.source,
+        assignee: row.assignee,
+        due_date: row.due_date,
+        estimate_url: row.estimate_url,
+        estimate: estimateChip,    // flag para mostrar chip en UI
+        created_at: row.created_at,
+      });
     }
 
     const columns = PIPELINE.map(name => ({
@@ -92,19 +165,28 @@ router.get("/clientes", authenticateToken, async (req, res) => {
   }
 });
 
-// mover cliente entre columnas del pipeline
+/**
+ * Move one-click del pipeline
+ * Body: { stage: "Qualified" }  (acepta "categoria" por compat)
+ * Espeja stage <-> categoria para evitar inconsistencias con instalaciones viejas.
+ */
 router.patch("/clientes/:id/move", authenticateToken, async (req, res) => {
   try {
     const id = Number(req.params.id);
-    let { categoria } = req.body || {};
+    let next = (req.body?.stage ?? req.body?.categoria ?? "").toString().trim();
     if (!Number.isInteger(id)) return res.status(400).json({ message: "ID inválido" });
-    if (!categoria || typeof categoria !== "string") return res.status(400).json({ message: "Categoría requerida" });
-    categoria = categoria.trim();
-    if (!PIPELINE.includes(categoria)) return res.status(400).json({ message: "Categoría fuera del pipeline" });
+    if (!next) return res.status(400).json({ message: "stage requerido" });
+    if (!PIPELINE.includes(next)) return res.status(400).json({ message: "stage fuera del pipeline" });
 
     const r = await q(
-      `UPDATE clientes SET categoria=$1 WHERE id=$2 RETURNING id, nombre, categoria`,
-      [categoria, id]
+      `
+      UPDATE clientes
+         SET stage = $1,
+             categoria = $1
+       WHERE id = $2
+       RETURNING id, nombre, stage, categoria
+      `,
+      [next, id]
     );
     if (!r.rowCount) return res.status(404).json({ message: "Cliente no encontrado" });
     res.json(r.rows[0]);
@@ -114,30 +196,34 @@ router.patch("/clientes/:id/move", authenticateToken, async (req, res) => {
   }
 });
 
-// ---------- Kanban de TAREAS ----------
+/* ======================= Kanban de TAREAS ====================== */
 const TASK_COLUMNS = [
-  { key: "todo",    title: "Por hacer" },
-  { key: "doing",   title: "En curso" },
-  { key: "waiting", title: "En espera" },
-  { key: "done",    title: "Hecho" },
+  { key: "todo",    title: "Por hacer"  },
+  { key: "doing",   title: "En curso"   },
+  { key: "waiting", title: "En espera"  },
+  { key: "done",    title: "Hecho"      },
 ];
 
 router.get("/tareas", authenticateToken, async (req, res) => {
   try {
-    const org = req.organizacion_id || null;
+    const { organizacion_id } = getUserFromReq(req);
 
     const params = [];
-    let where = "";
-    if (org) { params.push(org); where = `WHERE t.organizacion_id = $${params.length}`; }
+    const where = [];
+    if (organizacion_id) {
+      params.push(organizacion_id);
+      where.push(`t.organizacion_id = $${params.length}`);
+    }
 
     const rows = await q(
       `
-      SELECT t.id, t.titulo, t.descripcion, t.estado, t.orden, t.completada,
-             t.vence_en, t.created_at, t.cliente_id, c.nombre AS cliente_nombre
-        FROM tareas t
-        LEFT JOIN clientes c ON c.id = t.cliente_id
-        ${where}
-        ORDER BY t.estado ASC, t.orden ASC, t.created_at DESC
+      SELECT
+        t.id, t.titulo, t.descripcion, t.estado, t.orden, t.completada,
+        t.vence_en, t.created_at, t.cliente_id, c.nombre AS cliente_nombre
+      FROM tareas t
+      LEFT JOIN clientes c ON c.id = t.cliente_id
+      ${where.length ? "WHERE " + where.join(" AND ") : ""}
+      ORDER BY t.estado ASC, t.orden ASC, t.created_at DESC
       `,
       params
     );
@@ -168,10 +254,12 @@ router.patch("/tareas/:id/move", authenticateToken, async (req, res) => {
     const id = Number(req.params.id);
     let { estado, orden } = req.body || {};
     if (!Number.isInteger(id)) return res.status(400).json({ message: "ID inválido" });
-    if (!estado || !["todo","doing","waiting","done"].includes(estado))
+
+    const valid = ["todo","doing","waiting","done"];
+    if (!estado || !valid.includes(estado))
       return res.status(400).json({ message: "Estado inválido" });
 
-    // si no envían orden, lo pongo al final
+    // si no envían orden, lo pongo al final del carril
     if (orden == null) {
       const mr = await q(
         `SELECT COALESCE(MAX(orden),0) AS m FROM tareas WHERE estado=$1`,
@@ -181,12 +269,14 @@ router.patch("/tareas/:id/move", authenticateToken, async (req, res) => {
     }
 
     const r = await q(
-      `UPDATE tareas
-          SET estado=$1,
-              orden=$2,
-              completada = ($1 = 'done')
-        WHERE id=$3
-        RETURNING id, titulo, estado, orden, completada`,
+      `
+      UPDATE tareas
+         SET estado=$1,
+             orden=$2,
+             completada = ($1 = 'done')
+       WHERE id=$3
+       RETURNING id, titulo, estado, orden, completada
+      `,
       [estado, orden, id]
     );
     if (!r.rowCount) return res.status(404).json({ message: "Tarea no encontrada" });

@@ -1,18 +1,25 @@
-// Backend/routes/job.js
+// routes/job.js
 import { Router } from "express";
-import { db } from "../utils/db.js";
+import { q } from "../utils/db.js";
 import { authenticateToken, requireRole } from "../middleware/auth.js";
 import { sendSlackMessage, followupBlocks } from "../utils/slack.js";
+import { sendWhatsAppText } from "../utils/whatsapp.js";
 
 const router = Router();
 
-/** Despacha recordatorios vencidos o próximos (<= now) */
-router.post("/dispatch", authenticateToken, requireRole(["owner","admin","superadmin"]), async (req, res) => {
-  const org = req.organizacion_id;
+/** Despacha recordatorios vencidos (<= now). Idempotente por estado. */
+router.post("/dispatch", authenticateToken, requireRole("owner","admin","superadmin"), async (req, res) => {
+  const org = (req.usuario?.organizacion_id ?? req.organizacion_id) || null;
 
   try {
-    const { rows } = await db.query(
-      `SELECT r.*, i.slack_webhook_url, t.titulo AS tarea_titulo, t.vence_en, c.nombre AS cliente_nombre
+    const { rows } = await q(
+      `SELECT r.*,
+              i.slack_webhook_url,
+              i.whatsapp_meta_token,
+              i.whatsapp_phone_id,
+              t.titulo AS tarea_titulo, t.vence_en,
+              c.nombre AS cliente_nombre,
+              c.telefono AS cliente_telefono
          FROM recordatorios r
          LEFT JOIN integraciones i ON i.organizacion_id = r.organizacion_id
          LEFT JOIN tareas t ON t.id = r.tarea_id
@@ -26,10 +33,8 @@ router.post("/dispatch", authenticateToken, requireRole(["owner","admin","supera
     );
 
     let ok = 0, err = 0;
-
     for (const r of rows) {
       try {
-        if (!r.slack_webhook_url) throw new Error("Slack no configurado");
         const text = r.mensaje || r.titulo;
         const blocks = followupBlocks({
           titulo: r.tarea_titulo || r.titulo,
@@ -37,18 +42,37 @@ router.post("/dispatch", authenticateToken, requireRole(["owner","admin","supera
           vence_en: r.vence_en,
           url: null,
         });
-        await sendSlackMessage(r.slack_webhook_url, text, blocks);
-        await db.query(
-          `UPDATE recordatorios SET estado='enviado', sent_at=NOW() WHERE id = $1`,
-          [r.id]
-        );
+
+        let delivered = false;
+
+        // 1) Slack si está configurado
+        if (!delivered && r.slack_webhook_url) {
+          await sendSlackMessage(r.slack_webhook_url, text, blocks);
+          delivered = true;
+        }
+
+        // 2) WhatsApp si está configurado y hay teléfono del cliente
+        if (!delivered && r.whatsapp_meta_token && r.whatsapp_phone_id && r.cliente_telefono) {
+          await sendWhatsAppText({
+            metaToken: r.whatsapp_meta_token,
+            phoneId: r.whatsapp_phone_id,
+            to: String(r.cliente_telefono).replace(/[^\d+]/g, ""), // naive sanitize
+            text,
+          });
+          delivered = true;
+        }
+
+        // Si no hay canales configurados, marcamos error descriptivo
+        if (!delivered) throw new Error("Sin canales configurados (Slack/WhatsApp)");
+
+        await q(`UPDATE recordatorios SET estado='enviado', sent_at=NOW() WHERE id = $1`, [r.id]);
         ok++;
       } catch (e) {
-        await db.query(
+        await q(
           `UPDATE recordatorios
               SET estado='error', intento_count=intento_count+1, last_error=$1
             WHERE id = $2`,
-          [String(e.message || e), r.id]
+          [String(e?.message || e), r.id]
         );
         err++;
       }
@@ -56,7 +80,7 @@ router.post("/dispatch", authenticateToken, requireRole(["owner","admin","supera
 
     res.json({ ok, err, total: rows.length });
   } catch (e) {
-    console.error("[POST /jobs/dispatch]", e);
+    console.error("[POST /jobs/dispatch]", e?.stack || e?.message || e);
     res.status(500).json({ message: "Error al despachar recordatorios" });
   }
 });

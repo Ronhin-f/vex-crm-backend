@@ -1,50 +1,61 @@
+// routes/recordatorios.js
 import { Router } from "express";
-import { db } from "../utils/db.js";
+import { q } from "../utils/db.js";
 import { authenticateToken } from "../middleware/auth.js";
 
 const router = Router();
 
-router.get("/", authenticateToken, async (req, res) => {
-  const { estado } = req.query; // pendiente|enviado|error
-  const params = [req.organizacion_id];
-  let sql = "SELECT * FROM recordatorios WHERE organizacion_id = $1";
-  if (estado) { params.push(estado); sql += " AND estado = $2"; }
-  sql += " ORDER BY enviar_en ASC";
+function getOrg(req) {
+  return (req.usuario?.organizacion_id ?? req.organizacion_id) || null;
+}
 
+// Listar (filtro por estado opcional)
+router.get("/", authenticateToken, async (req, res) => {
   try {
-    const { rows } = await db.query(sql, params);
-    res.json(rows);
+    const org = getOrg(req);
+    const estado = req.query?.estado ? String(req.query.estado) : null;
+    const params = [org];
+    let sql = "SELECT * FROM recordatorios WHERE organizacion_id = $1";
+    if (estado) { params.push(estado); sql += ` AND estado = $${params.length}`; }
+    sql += " ORDER BY enviar_en ASC";
+    const r = await q(sql, params);
+    res.json(r.rows || []);
   } catch (e) {
-    console.error("[GET /recordatorios]", e);
+    console.error("[GET /recordatorios]", e?.stack || e?.message || e);
     res.status(500).json({ message: "Error al obtener recordatorios" });
   }
 });
 
+// Crear
 router.post("/", authenticateToken, async (req, res) => {
-  const { titulo, mensaje, enviar_en, cliente_id, tarea_id } = req.body;
-  if (!titulo?.trim() || !mensaje?.trim() || !enviar_en)
-    return res.status(400).json({ message: "Campos requeridos: titulo, mensaje, enviar_en" });
-
   try {
-    const { rows } = await db.query(
+    const org = getOrg(req);
+    const { titulo, mensaje, enviar_en, cliente_id = null, tarea_id = null } = req.body || {};
+    if (!titulo?.trim() || !mensaje?.trim() || !enviar_en) {
+      return res.status(400).json({ message: "Campos requeridos: titulo, mensaje, enviar_en" });
+    }
+    const ins = await q(
       `INSERT INTO recordatorios (organizacion_id, titulo, mensaje, enviar_en, cliente_id, tarea_id)
-       VALUES ($1,$2,$3,$4,$5,$6) RETURNING id`,
-      [req.organizacion_id, titulo, mensaje, enviar_en, cliente_id || null, tarea_id || null]
+       VALUES ($1,$2,$3,$4,$5,$6)
+       RETURNING id`,
+      [org, titulo.trim(), mensaje.trim(), new Date(enviar_en).toISOString(), cliente_id, tarea_id]
     );
-    res.status(201).json({ id: rows[0].id });
+    res.status(201).json({ id: ins.rows[0].id });
   } catch (e) {
-    console.error("[POST /recordatorios]", e);
+    console.error("[POST /recordatorios]", e?.stack || e?.message || e);
     res.status(500).json({ message: "Error al crear recordatorio" });
   }
 });
 
+// Eliminar
 router.delete("/:id", authenticateToken, async (req, res) => {
   try {
-    await db.query("DELETE FROM recordatorios WHERE id=$1 AND organizacion_id=$2",
-      [req.params.id, req.organizacion_id]);
-    res.sendStatus(204);
+    const org = getOrg(req);
+    const id = Number(req.params.id);
+    await q(`DELETE FROM recordatorios WHERE id=$1 AND organizacion_id=$2`, [id, org]);
+    res.json({ ok: true });
   } catch (e) {
-    console.error("[DELETE /recordatorios/:id]", e);
+    console.error("[DELETE /recordatorios/:id]", e?.stack || e?.message || e);
     res.status(500).json({ message: "Error al eliminar recordatorio" });
   }
 });

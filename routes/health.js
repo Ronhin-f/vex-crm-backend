@@ -1,6 +1,9 @@
+// routes/health.js
 import { Router } from "express";
 const router = Router();
 
-router.get("/", (_, res) => res.send("✅ VEX CRM corriendo"));
+router.get("/", (_req, res) => {
+  res.status(200).json({ ok: true, service: "vex-crm-backend" });
+});
 
 export default router;
