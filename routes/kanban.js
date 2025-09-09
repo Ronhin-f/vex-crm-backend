@@ -29,6 +29,7 @@ const PIPELINE = CANON_CATS; // ["Incoming Leads","Qualified","Bid/Estimate Sent
 /**
  * KPIs para dashboard:
  *  - clientesPorStage (usa stage; fallback a "Uncategorized")
+ *  - clientesPorCat   (compat por categoría)
  *  - tareasPorEstado
  *  - proximos7d (tareas con due en <= 7 días, incompletas)
  *
@@ -38,6 +39,7 @@ router.get("/kpis", authenticateToken, async (req, res) => {
   try {
     const { organizacion_id } = getUserFromReq(req);
 
+    // ---- Clientes por STAGE
     const p1 = [];
     const w1 = [];
     if (organizacion_id) {
@@ -55,6 +57,19 @@ router.get("/kpis", authenticateToken, async (req, res) => {
       p1
     );
 
+    // ---- Compat: Clientes por CATEGORÍA
+    const clientesPorCat = await q(
+      `
+      SELECT COALESCE(categoria,'Uncategorized') AS categoria, COUNT(*)::int AS total
+        FROM clientes
+       ${w1.length ? "WHERE " + w1.join(" AND ") : ""}
+       GROUP BY categoria
+       ORDER BY total DESC
+      `,
+      p1
+    );
+
+    // ---- Tareas por estado
     const p2 = [];
     const w2 = [];
     if (organizacion_id) {
@@ -72,6 +87,7 @@ router.get("/kpis", authenticateToken, async (req, res) => {
       p2
     );
 
+    // ---- Tareas que vencen en <= 7 días (incompletas)
     const vencen7 = await q(
       `
       SELECT COUNT(*)::int AS total
@@ -84,17 +100,23 @@ router.get("/kpis", authenticateToken, async (req, res) => {
       organizacion_id ? [organizacion_id] : []
     );
 
+    const prox7 = vencen7.rows?.[0]?.total ?? 0;
+
     res.json({
       clientesPorStage: clientesPorStage.rows || [],
+      clientesPorCat: clientesPorCat.rows || [],     // ⬅️ agregado
       tareasPorEstado: tareasPorEstado.rows || [],
-      proximos7d: vencen7.rows?.[0]?.total ?? 0,
+      proximos7d: prox7,
+      proximos_7d: prox7,                             // ⬅️ alias snake_case
     });
   } catch (e) {
     console.error("[GET /kanban/kpis]", e?.stack || e?.message || e);
     res.json({
       clientesPorStage: [],
+      clientesPorCat: [],     // ⬅️ compat
       tareasPorEstado: [],
       proximos7d: 0,
+      proximos_7d: 0,         // ⬅️ compat
     });
   }
 });
