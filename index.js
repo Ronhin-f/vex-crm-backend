@@ -58,14 +58,14 @@ await mount("/kanban",         "./routes/kanban.js");       // Kanban clientes/t
 await mount("/compras",        "./routes/compras.js");
 await mount("/tareas",         "./routes/tareas.js");
 await mount("/dashboard",      "./routes/dashboard.js");
+
+// 🔹 Nuevo: KPIs consolidados del CRM
+await mount("/analytics",      "./routes/analytics.js");    // /analytics/kpis
+
 await mount("/upload",         "./routes/upload.js");       // Upload de estimates
 await mount("/modulos",        "./routes/modulos.js");      // Proxy resiliente a Core (safe)
 
 // Integraciones y automatización (on por pedido)
-// - Slack/WhatsApp config
-// - Recordatorios CRUD
-// - Dispatcher (Slack/WhatsApp)
-// - IA insights
 await mount("/integraciones",  "./routes/integraciones.js");
 await mount("/recordatorios",  "./routes/recordatorios.js");
 await mount("/jobs",           "./routes/job.js");
