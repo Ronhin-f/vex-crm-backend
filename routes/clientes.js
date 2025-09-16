@@ -66,10 +66,13 @@ router.get("/", authenticateToken, async (req, res) => {
       where.push(`source = $${params.length}`);
     }
     if (qtext) {
-      params.push(`%${String(qtext).toLowerCase()}%`);
-      where.push(`(lower(nombre) LIKE $${params.length} OR lower(email) LIKE $${params.length} OR lower(telefono) LIKE $${params.length})`);
-      // Nota: reutilizamos el mismo parámetro tres veces (Postgres no permite), así que duplicamos:
-      params.push(params[params.length - 1], params[params.length - 1]);
+      // Un solo parámetro para las tres columnas (Postgres permite reutilizar $idx)
+      const qval = `%${String(qtext).trim()}%`;
+      params.push(qval);
+      const idx = params.length;
+      where.push(
+        `(nombre ILIKE $${idx} OR email ILIKE $${idx} OR telefono ILIKE $${idx})`
+      );
     }
 
     const sql = `
@@ -83,16 +86,6 @@ router.get("/", authenticateToken, async (req, res) => {
       ${where.length ? "WHERE " + where.join(" AND ") : ""}
       ORDER BY created_at DESC NULLS LAST, id DESC
     `;
-
-    // Ajuste por el LIKE triple (reutilización de param):
-    const fixedParams = [];
-    let pIndex = 0;
-    for (const w of where) {
-      if (w.includes("LIKE")) {
-        // Ya empujamos 3 veces el mismo valor arriba; nada extra que hacer
-      }
-    }
-    // params ya está correcto
 
     const r = await q(sql, params);
     res.json(r.rows || []);
