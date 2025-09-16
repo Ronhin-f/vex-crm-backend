@@ -9,48 +9,31 @@ const router = Router();
 function getUserFromReq(req) {
   const u = req.usuario || {};
   return {
-    email:
-      u.email ??
-      req.usuario_email ??
-      u.usuario_email ??
-      null,
-    organizacion_id:
-      u.organizacion_id ??
-      req.organizacion_id ??
-      u.organization_id ??
-      null,
+    email: u.email ?? req.usuario_email ?? u.usuario_email ?? null,
+    organizacion_id: u.organizacion_id ?? req.organizacion_id ?? u.organization_id ?? null,
   };
 }
-
 function coerceText(v) {
   if (v == null) return null;
   const s = String(v).trim();
   return s.length ? s : null;
 }
-
 function coerceDate(v) {
   if (!v) return null;
   const d = new Date(v);
   return isNaN(d.getTime()) ? null : d.toISOString();
 }
 
-function isTruthy(v) {
-  if (v == null) return false;
-  const s = String(v).trim().toLowerCase();
-  return s === "1" || s === "true" || s === "t" || s === "yes" || s === "y" || s === "on";
-}
-
 /* ========================= GET ========================== */
 /**
- * Listado de clientes de la organización.
- * Filtros opcionales (query):
- *  - stage, assignee, source, only_due (1|true)
- *  - q (busca en nombre/email/telefono)
+ * Listado de clientes (con filtros opcionales):
+ *  - stage, assignee, source
+ *  - q (nombre/email/telefono) — telefono casteado a TEXT por compat
  */
 router.get("/", authenticateToken, async (req, res) => {
   try {
     const { organizacion_id } = getUserFromReq(req);
-    const { stage, assignee, source, q: qtext, only_due } = req.query || {};
+    const { stage, assignee, source, q: qtext } = req.query || {};
 
     const params = [];
     const where = [];
@@ -64,30 +47,32 @@ router.get("/", authenticateToken, async (req, res) => {
       where.push(`stage = $${params.length}`);
     }
     if (assignee) {
-      // "Sin asignar" / "unassigned" => NULL o vacío
-      if (/^(sin asignar|unassigned)$/i.test(String(assignee))) {
-        where.push(`(assignee IS NULL OR TRIM(assignee) = '')`);
-      } else {
-        params.push(String(assignee));
-        where.push(`assignee = $${params.length}`);
-      }
+      params.push(String(assignee));
+      where.push(`assignee = $${params.length}`);
     }
     if (source) {
       params.push(String(source));
       where.push(`source = $${params.length}`);
     }
     if (qtext) {
-      // Un solo parámetro para las tres columnas (Postgres permite reutilizar $idx)
       const qval = `%${String(qtext).trim()}%`;
       params.push(qval);
       const idx = params.length;
+      // telefono casteado a TEXT por si es numérico en DB viejas
       where.push(
-        `(nombre ILIKE $${idx} OR email ILIKE $${idx} OR telefono ILIKE $${idx})`
+        `(nombre ILIKE $${idx} OR email ILIKE $${idx} OR CAST(telefono AS TEXT) ILIKE $${idx})`
       );
     }
-    if (isTruthy(only_due)) {
-      where.push(`due_date IS NOT NULL`);
-    }
+
+    // order-by seguro si falta created_at
+    const rCols = await q(
+      `SELECT 1
+         FROM information_schema.columns
+        WHERE table_schema='public' AND table_name='clientes' AND column_name='created_at'`
+    );
+    const orderBy = rCols.rowCount > 0
+      ? "created_at DESC NULLS LAST, id DESC"
+      : "id DESC";
 
     const sql = `
       SELECT
@@ -95,29 +80,22 @@ router.get("/", authenticateToken, async (req, res) => {
         stage, categoria, assignee, source, due_date,
         contacto_nombre,
         estimate_url, estimate_file, estimate_uploaded_at,
-        organizacion_id, created_at,
-        assignee    AS assignee_email,  -- alias para FE
-        observacion AS contact_info     -- alias para FE
+        organizacion_id, created_at
       FROM clientes
       ${where.length ? "WHERE " + where.join(" AND ") : ""}
-      ORDER BY created_at DESC NULLS LAST, id DESC
+      ORDER BY ${orderBy}
     `;
 
     const r = await q(sql, params);
-    res.json(r.rows || []);
+    return res.json(r.rows || []);
   } catch (e) {
     console.error("[GET /clientes]", e?.stack || e?.message || e);
-    res.status(500).json({ message: "Error listando clientes" });
+    // Degradamos a 200 [] para no romper el Kanban del FE
+    return res.status(200).json([]);
   }
 });
 
 /* ======================== POST ========================== */
-/**
- * Crea cliente.
- * Body mínimo: { nombre }
- * Opcionales: email, telefono, stage | categoria, assignee|assignee_email, source, due_date,
- *             contacto_nombre, contact_info, estimate_url
- */
 router.post("/", authenticateToken, async (req, res) => {
   try {
     const { organizacion_id, email: usuario_email } = getUserFromReq(req);
@@ -128,11 +106,9 @@ router.post("/", authenticateToken, async (req, res) => {
       stage = null,
       categoria = null,     // back-compat
       assignee = null,
-      assignee_email = null, // alias desde FE
       source = null,
       due_date = null,
       contacto_nombre = null,
-      contact_info = null,   // alias → observacion
       estimate_url = null,
     } = req.body || {};
 
@@ -143,10 +119,9 @@ router.post("/", authenticateToken, async (req, res) => {
     nombre = nombre.trim();
     email = coerceText(email);
     telefono = coerceText(telefono);
-    assignee = coerceText(assignee) || coerceText(assignee_email);
+    assignee = coerceText(assignee);
     source = coerceText(source);
     contacto_nombre = coerceText(contacto_nombre);
-    const observacion = coerceText(contact_info);
     estimate_url = coerceText(estimate_url);
     stage = coerceText(stage) || coerceText(categoria); // preferimos stage
 
@@ -154,19 +129,17 @@ router.post("/", authenticateToken, async (req, res) => {
       `
       INSERT INTO clientes
         (nombre, email, telefono, stage, categoria, assignee, source, due_date,
-         contacto_nombre, observacion, estimate_url, usuario_email, organizacion_id)
+         contacto_nombre, estimate_url, usuario_email, organizacion_id)
       VALUES
         ($1, $2, $3, $4, $5, $6, $7, $8,
-         $9, $10, $11, $12, $13)
+         $9, $10, $11, $12)
       RETURNING id, nombre, email, telefono, stage, categoria, assignee, source, due_date,
                 contacto_nombre, estimate_url, estimate_file, estimate_uploaded_at,
-                organizacion_id, created_at,
-                assignee AS assignee_email,
-                observacion AS contact_info
+                organizacion_id, created_at
       `,
       [
         nombre, email, telefono, stage, categoria, assignee, source,
-        coerceDate(due_date), contacto_nombre, observacion, estimate_url, usuario_email, organizacion_id
+        coerceDate(due_date), contacto_nombre, estimate_url, usuario_email, organizacion_id
       ]
     );
 
@@ -178,48 +151,30 @@ router.post("/", authenticateToken, async (req, res) => {
 });
 
 /* ======================== PATCH ========================= */
-/**
- * Update parcial.
- * Campos permitidos:
- *  nombre, email, telefono, stage, categoria, assignee|assignee_email, source, due_date,
- *  contacto_nombre, estimate_url, contact_info (alias -> observacion)
- */
 router.patch("/:id", authenticateToken, async (req, res) => {
   try {
     const id = Number(req.params.id);
     if (!Number.isInteger(id)) return res.status(400).json({ message: "ID inválido" });
 
-    const allowed = new Set([
+    const allowed = [
       "nombre","email","telefono",
-      "stage","categoria","assignee","assignee_email","source","due_date",
-      "contacto_nombre","estimate_url","contact_info"
-    ]);
+      "stage","categoria","assignee","source","due_date",
+      "contacto_nombre","estimate_url"
+    ];
 
     const fields = [];
     const values = [];
     let idx = 1;
 
-    const push = (dbField, val) => {
-      fields.push(`${dbField} = $${idx++}`);
-      values.push(val);
-    };
-
-    for (const [k, raw] of Object.entries(req.body || {})) {
-      if (!allowed.has(k)) continue;
-
-      if (k === "assignee_email") {
-        push("assignee", coerceText(raw));                // alias
-      } else if (k === "contact_info") {
-        push("observacion", coerceText(raw));             // alias
-      } else if (k === "due_date") {
-        push("due_date", coerceDate(raw));
-      } else if (k === "nombre" || k === "email" || k === "telefono" ||
-                 k === "stage" || k === "categoria" || k === "assignee" ||
-                 k === "source" || k === "contacto_nombre" || k === "estimate_url") {
-        push(k, coerceText(raw));
+    for (const k of allowed) {
+      if (k in req.body) {
+        let v = req.body[k];
+        if (k === "due_date") v = coerceDate(v);
+        else v = coerceText(v);
+        fields.push(`${k} = $${idx++}`);
+        values.push(v);
       }
     }
-
     if (!fields.length) return res.status(400).json({ message: "Nada para actualizar" });
 
     values.push(id);
@@ -227,9 +182,7 @@ router.patch("/:id", authenticateToken, async (req, res) => {
       `UPDATE clientes SET ${fields.join(", ")} WHERE id = $${idx}
        RETURNING id, nombre, email, telefono, stage, categoria, assignee, source, due_date,
                  contacto_nombre, estimate_url, estimate_file, estimate_uploaded_at,
-                 organizacion_id, created_at,
-                 assignee AS assignee_email,
-                 observacion AS contact_info`,
+                 organizacion_id, created_at`,
       values
     );
     if (!r.rowCount) return res.status(404).json({ message: "Cliente no encontrado" });
@@ -242,11 +195,6 @@ router.patch("/:id", authenticateToken, async (req, res) => {
 });
 
 /* ==================== PATCH stage (one-click) ==================== */
-/**
- * Move one-click del pipeline.
- * Path: PATCH /clientes/:id/stage
- * Body: { stage: "Qualified" }  (si viene categoria, también la espejamos)
- */
 router.patch("/:id/stage", authenticateToken, async (req, res) => {
   try {
     const id = Number(req.params.id);
@@ -262,9 +210,7 @@ router.patch("/:id/stage", authenticateToken, async (req, res) => {
        WHERE id = $2
        RETURNING id, nombre, email, telefono, stage, categoria, assignee, source, due_date,
                  contacto_nombre, estimate_url, estimate_file, estimate_uploaded_at,
-                 organizacion_id, created_at,
-                 assignee AS assignee_email,
-                 observacion AS contact_info`,
+                 organizacion_id, created_at`,
       [newStage, id]
     );
     if (!r.rowCount) return res.status(404).json({ message: "Cliente no encontrado" });
@@ -277,12 +223,6 @@ router.patch("/:id/stage", authenticateToken, async (req, res) => {
 });
 
 /* ================== PATCH estimate (file/url) =================== */
-/**
- * Adjunta estimate al cliente.
- * - Si viene { estimate_url }, se guarda URL.
- * - Si viene { filename }, se guarda como file público en /uploads + marca de tiempo.
- * Body: { estimate_url?: string, filename?: string }
- */
 router.patch("/:id/estimate", authenticateToken, async (req, res) => {
   try {
     const id = Number(req.params.id);
@@ -300,7 +240,6 @@ router.patch("/:id/estimate", authenticateToken, async (req, res) => {
     let estimate_uploaded_at = null;
 
     if (filename) {
-      // Si nos pasan filename desde /upload/estimate
       const publicBase = process.env.PUBLIC_BASE_URL || `${req.protocol}://${req.get("host")}`;
       estimate_file = filename;
       estimate_url = new URL(`/uploads/${filename}`, publicBase).toString();
@@ -315,9 +254,7 @@ router.patch("/:id/estimate", authenticateToken, async (req, res) => {
        WHERE id = $4
        RETURNING id, nombre, email, telefono, stage, categoria, assignee, source, due_date,
                  contacto_nombre, estimate_url, estimate_file, estimate_uploaded_at,
-                 organizacion_id, created_at,
-                 assignee AS assignee_email,
-                 observacion AS contact_info`,
+                 organizacion_id, created_at`,
       [estimate_url, estimate_file, estimate_uploaded_at, id]
     );
 
