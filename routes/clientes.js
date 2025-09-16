@@ -34,17 +34,23 @@ function coerceDate(v) {
   return isNaN(d.getTime()) ? null : d.toISOString();
 }
 
+function isTruthy(v) {
+  if (v == null) return false;
+  const s = String(v).trim().toLowerCase();
+  return s === "1" || s === "true" || s === "t" || s === "yes" || s === "y" || s === "on";
+}
+
 /* ========================= GET ========================== */
 /**
  * Listado de clientes de la organización.
  * Filtros opcionales (query):
- *  - stage, assignee, source
+ *  - stage, assignee, source, only_due (1|true)
  *  - q (busca en nombre/email/telefono)
  */
 router.get("/", authenticateToken, async (req, res) => {
   try {
     const { organizacion_id } = getUserFromReq(req);
-    const { stage, assignee, source, q: qtext } = req.query || {};
+    const { stage, assignee, source, q: qtext, only_due } = req.query || {};
 
     const params = [];
     const where = [];
@@ -58,8 +64,13 @@ router.get("/", authenticateToken, async (req, res) => {
       where.push(`stage = $${params.length}`);
     }
     if (assignee) {
-      params.push(String(assignee));
-      where.push(`assignee = $${params.length}`);
+      // "Sin asignar" / "unassigned" => NULL o vacío
+      if (/^(sin asignar|unassigned)$/i.test(String(assignee))) {
+        where.push(`(assignee IS NULL OR TRIM(assignee) = '')`);
+      } else {
+        params.push(String(assignee));
+        where.push(`assignee = $${params.length}`);
+      }
     }
     if (source) {
       params.push(String(source));
@@ -74,6 +85,9 @@ router.get("/", authenticateToken, async (req, res) => {
         `(nombre ILIKE $${idx} OR email ILIKE $${idx} OR telefono ILIKE $${idx})`
       );
     }
+    if (isTruthy(only_due)) {
+      where.push(`due_date IS NOT NULL`);
+    }
 
     const sql = `
       SELECT
@@ -81,7 +95,9 @@ router.get("/", authenticateToken, async (req, res) => {
         stage, categoria, assignee, source, due_date,
         contacto_nombre,
         estimate_url, estimate_file, estimate_uploaded_at,
-        organizacion_id, created_at
+        organizacion_id, created_at,
+        assignee    AS assignee_email,  -- alias para FE
+        observacion AS contact_info     -- alias para FE
       FROM clientes
       ${where.length ? "WHERE " + where.join(" AND ") : ""}
       ORDER BY created_at DESC NULLS LAST, id DESC
@@ -99,8 +115,8 @@ router.get("/", authenticateToken, async (req, res) => {
 /**
  * Crea cliente.
  * Body mínimo: { nombre }
- * Opcionales: email, telefono, stage | categoria, assignee, source, due_date,
- *             contacto_nombre, estimate_url
+ * Opcionales: email, telefono, stage | categoria, assignee|assignee_email, source, due_date,
+ *             contacto_nombre, contact_info, estimate_url
  */
 router.post("/", authenticateToken, async (req, res) => {
   try {
@@ -112,9 +128,11 @@ router.post("/", authenticateToken, async (req, res) => {
       stage = null,
       categoria = null,     // back-compat
       assignee = null,
+      assignee_email = null, // alias desde FE
       source = null,
       due_date = null,
       contacto_nombre = null,
+      contact_info = null,   // alias → observacion
       estimate_url = null,
     } = req.body || {};
 
@@ -125,9 +143,10 @@ router.post("/", authenticateToken, async (req, res) => {
     nombre = nombre.trim();
     email = coerceText(email);
     telefono = coerceText(telefono);
-    assignee = coerceText(assignee);
+    assignee = coerceText(assignee) || coerceText(assignee_email);
     source = coerceText(source);
     contacto_nombre = coerceText(contacto_nombre);
+    const observacion = coerceText(contact_info);
     estimate_url = coerceText(estimate_url);
     stage = coerceText(stage) || coerceText(categoria); // preferimos stage
 
@@ -135,17 +154,19 @@ router.post("/", authenticateToken, async (req, res) => {
       `
       INSERT INTO clientes
         (nombre, email, telefono, stage, categoria, assignee, source, due_date,
-         contacto_nombre, estimate_url, usuario_email, organizacion_id)
+         contacto_nombre, observacion, estimate_url, usuario_email, organizacion_id)
       VALUES
         ($1, $2, $3, $4, $5, $6, $7, $8,
-         $9, $10, $11, $12)
+         $9, $10, $11, $12, $13)
       RETURNING id, nombre, email, telefono, stage, categoria, assignee, source, due_date,
                 contacto_nombre, estimate_url, estimate_file, estimate_uploaded_at,
-                organizacion_id, created_at
+                organizacion_id, created_at,
+                assignee AS assignee_email,
+                observacion AS contact_info
       `,
       [
         nombre, email, telefono, stage, categoria, assignee, source,
-        coerceDate(due_date), contacto_nombre, estimate_url, usuario_email, organizacion_id
+        coerceDate(due_date), contacto_nombre, observacion, estimate_url, usuario_email, organizacion_id
       ]
     );
 
@@ -160,33 +181,45 @@ router.post("/", authenticateToken, async (req, res) => {
 /**
  * Update parcial.
  * Campos permitidos:
- *  nombre, email, telefono, stage, categoria, assignee, source, due_date,
- *  contacto_nombre, estimate_url
+ *  nombre, email, telefono, stage, categoria, assignee|assignee_email, source, due_date,
+ *  contacto_nombre, estimate_url, contact_info (alias -> observacion)
  */
 router.patch("/:id", authenticateToken, async (req, res) => {
   try {
     const id = Number(req.params.id);
     if (!Number.isInteger(id)) return res.status(400).json({ message: "ID inválido" });
 
-    const allowed = [
+    const allowed = new Set([
       "nombre","email","telefono",
-      "stage","categoria","assignee","source","due_date",
-      "contacto_nombre","estimate_url"
-    ];
+      "stage","categoria","assignee","assignee_email","source","due_date",
+      "contacto_nombre","estimate_url","contact_info"
+    ]);
 
     const fields = [];
     const values = [];
     let idx = 1;
 
-    for (const k of allowed) {
-      if (k in req.body) {
-        let v = req.body[k];
-        if (k === "due_date") v = coerceDate(v);
-        else v = coerceText(v);
-        fields.push(`${k} = $${idx++}`);
-        values.push(v);
+    const push = (dbField, val) => {
+      fields.push(`${dbField} = $${idx++}`);
+      values.push(val);
+    };
+
+    for (const [k, raw] of Object.entries(req.body || {})) {
+      if (!allowed.has(k)) continue;
+
+      if (k === "assignee_email") {
+        push("assignee", coerceText(raw));                // alias
+      } else if (k === "contact_info") {
+        push("observacion", coerceText(raw));             // alias
+      } else if (k === "due_date") {
+        push("due_date", coerceDate(raw));
+      } else if (k === "nombre" || k === "email" || k === "telefono" ||
+                 k === "stage" || k === "categoria" || k === "assignee" ||
+                 k === "source" || k === "contacto_nombre" || k === "estimate_url") {
+        push(k, coerceText(raw));
       }
     }
+
     if (!fields.length) return res.status(400).json({ message: "Nada para actualizar" });
 
     values.push(id);
@@ -194,7 +227,9 @@ router.patch("/:id", authenticateToken, async (req, res) => {
       `UPDATE clientes SET ${fields.join(", ")} WHERE id = $${idx}
        RETURNING id, nombre, email, telefono, stage, categoria, assignee, source, due_date,
                  contacto_nombre, estimate_url, estimate_file, estimate_uploaded_at,
-                 organizacion_id, created_at`,
+                 organizacion_id, created_at,
+                 assignee AS assignee_email,
+                 observacion AS contact_info`,
       values
     );
     if (!r.rowCount) return res.status(404).json({ message: "Cliente no encontrado" });
@@ -227,7 +262,9 @@ router.patch("/:id/stage", authenticateToken, async (req, res) => {
        WHERE id = $2
        RETURNING id, nombre, email, telefono, stage, categoria, assignee, source, due_date,
                  contacto_nombre, estimate_url, estimate_file, estimate_uploaded_at,
-                 organizacion_id, created_at`,
+                 organizacion_id, created_at,
+                 assignee AS assignee_email,
+                 observacion AS contact_info`,
       [newStage, id]
     );
     if (!r.rowCount) return res.status(404).json({ message: "Cliente no encontrado" });
@@ -278,7 +315,9 @@ router.patch("/:id/estimate", authenticateToken, async (req, res) => {
        WHERE id = $4
        RETURNING id, nombre, email, telefono, stage, categoria, assignee, source, due_date,
                  contacto_nombre, estimate_url, estimate_file, estimate_uploaded_at,
-                 organizacion_id, created_at`,
+                 organizacion_id, created_at,
+                 assignee AS assignee_email,
+                 observacion AS contact_info`,
       [estimate_url, estimate_file, estimate_uploaded_at, id]
     );
 

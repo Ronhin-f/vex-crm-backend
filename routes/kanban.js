@@ -22,8 +22,28 @@ function getUserFromReq(req) {
   };
 }
 
-// Pipeline canónico
-const PIPELINE = CANON_CATS; // ["Incoming Leads","Qualified","Bid/Estimate Sent","Won","Lost"]
+function coerceText(v) {
+  if (v == null) return null;
+  const s = String(v).trim();
+  return s.length ? s : null;
+}
+function isTruthy(v) {
+  if (v == null) return false;
+  const s = String(v).trim().toLowerCase();
+  return s === "1" || s === "true" || s === "t" || s === "yes" || s === "y" || s === "on";
+}
+
+// Pipeline preferido por la UI (agrega 2 columnas extra a las canónicas)
+const ORDER = [
+  "Incoming Leads",
+  "Unqualified",
+  "Qualified",
+  "Follow-up Missed",
+  "Bid/Estimate Sent",
+  "Won",
+  "Lost",
+];
+const PIPELINE_SET = new Set(ORDER);
 
 /* ============================ KPIs ============================ */
 /**
@@ -104,19 +124,19 @@ router.get("/kpis", authenticateToken, async (req, res) => {
 
     res.json({
       clientesPorStage: clientesPorStage.rows || [],
-      clientesPorCat: clientesPorCat.rows || [],     // ⬅️ agregado
+      clientesPorCat: clientesPorCat.rows || [],
       tareasPorEstado: tareasPorEstado.rows || [],
       proximos7d: prox7,
-      proximos_7d: prox7,                             // ⬅️ alias snake_case
+      proximos_7d: prox7,
     });
   } catch (e) {
     console.error("[GET /kanban/kpis]", e?.stack || e?.message || e);
     res.json({
       clientesPorStage: [],
-      clientesPorCat: [],     // ⬅️ compat
+      clientesPorCat: [],
       tareasPorEstado: [],
       proximos7d: 0,
-      proximos_7d: 0,         // ⬅️ compat
+      proximos_7d: 0,
     });
   }
 });
@@ -125,18 +145,49 @@ router.get("/kpis", authenticateToken, async (req, res) => {
 /**
  * Devuelve columnas del pipeline con tarjetas ricas para la UI:
  *  - id, nombre, email, telefono
- *  - stage, source, assignee, due_date
- *  - estimate_url (y flag if file), created_at
+ *  - stage, source, assignee(+alias assignee_email), due_date
+ *  - estimate_url (y flag si hay file), created_at
+ *
+ * Acepta filtros: q, source, assignee ("Sin asignar"), stage, only_due=1|true
  */
 router.get("/clientes", authenticateToken, async (req, res) => {
   try {
     const { organizacion_id } = getUserFromReq(req);
+    const { q: qtext, source, assignee, stage, only_due } = req.query || {};
+
     const params = [];
     const where = [];
 
     if (organizacion_id) {
       params.push(organizacion_id);
       where.push(`c.organizacion_id = $${params.length}`);
+    }
+    if (stage) {
+      params.push(String(stage));
+      where.push(`c.stage = $${params.length}`);
+    }
+    if (source) {
+      params.push(String(source));
+      where.push(`c.source = $${params.length}`);
+    }
+    if (assignee) {
+      if (/^(sin asignar|unassigned)$/i.test(String(assignee))) {
+        where.push(`(c.assignee IS NULL OR TRIM(c.assignee) = '')`);
+      } else {
+        params.push(String(assignee));
+        where.push(`c.assignee = $${params.length}`);
+      }
+    }
+    if (qtext) {
+      const qval = `%${String(qtext).trim()}%`;
+      params.push(qval);
+      const idx = params.length;
+      where.push(
+        `(c.nombre ILIKE $${idx} OR c.email ILIKE $${idx} OR c.telefono ILIKE $${idx})`
+      );
+    }
+    if (isTruthy(only_due)) {
+      where.push(`c.due_date IS NOT NULL`);
     }
 
     const rs = await q(
@@ -152,13 +203,15 @@ router.get("/clientes", authenticateToken, async (req, res) => {
       params
     );
 
-    const map = new Map(PIPELINE.map(k => [k, []]));
+    const bucket = new Map(ORDER.map(k => [k, []]));
     for (const row of rs.rows) {
-      const key = PIPELINE.includes(row.stage) ? row.stage
-                 : PIPELINE.includes(row.categoria) ? row.categoria
-                 : "Lost"; // fallback duro para no mezclar "Uncategorized" en la demo
+      const key =
+        PIPELINE_SET.has(row.stage) ? row.stage
+        : PIPELINE_SET.has(row.categoria) ? row.categoria
+        : "Lost"; // fallback sólido para no mezclar "Uncategorized" en la demo
+
       const estimateChip = !!(row.estimate_url || row.estimate_file);
-      map.get(key).push({
+      bucket.get(key)?.push({
         id: row.id,
         nombre: row.nombre,
         email: row.email,
@@ -166,21 +219,22 @@ router.get("/clientes", authenticateToken, async (req, res) => {
         stage: row.stage,
         source: row.source,
         assignee: row.assignee,
+        assignee_email: row.assignee, // alias para FE
         due_date: row.due_date,
         estimate_url: row.estimate_url,
-        estimate: estimateChip,    // flag para mostrar chip en UI
+        estimate: estimateChip,       // flag para mostrar chip en UI
         created_at: row.created_at,
       });
     }
 
-    const columns = PIPELINE.map(name => ({
+    const columns = ORDER.map(name => ({
       key: name,
       title: name,
-      count: map.get(name)?.length || 0,
-      items: map.get(name) || [],
+      count: bucket.get(name)?.length || 0,
+      items: bucket.get(name) || [],
     }));
 
-    res.json({ columns });
+    res.json({ columns, order: ORDER });
   } catch (e) {
     console.error("[GET /kanban/clientes]", e?.stack || e?.message || e);
     res.status(500).json({ message: "Error obteniendo Kanban de clientes" });
@@ -195,10 +249,13 @@ router.get("/clientes", authenticateToken, async (req, res) => {
 router.patch("/clientes/:id/move", authenticateToken, async (req, res) => {
   try {
     const id = Number(req.params.id);
-    let next = (req.body?.stage ?? req.body?.categoria ?? "").toString().trim();
+    let next = coerceText(req.body?.stage ?? req.body?.categoria);
     if (!Number.isInteger(id)) return res.status(400).json({ message: "ID inválido" });
     if (!next) return res.status(400).json({ message: "stage requerido" });
-    if (!PIPELINE.includes(next)) return res.status(400).json({ message: "stage fuera del pipeline" });
+    // Permitimos también las columnas extra del ORDER
+    if (!PIPELINE_SET.has(next) && !CANON_CATS.includes(next)) {
+      return res.status(400).json({ message: "stage fuera del pipeline" });
+    }
 
     const r = await q(
       `
