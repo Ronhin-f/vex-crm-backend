@@ -1,4 +1,4 @@
-// routes/analytics.js — KPIs CRM (ESM)
+// routes/analytics.js — KPIs CRM (ESM) — ahora el pipeline se mide sobre PROYECTOS (fallback a clientes)
 import { Router } from "express";
 import { q, CANON_CATS } from "../utils/db.js";
 import { authenticateToken } from "../middleware/auth.js";
@@ -40,6 +40,17 @@ function pct(n, d) {
   return D > 0 ? Math.round((N * 100) / D) : 0;
 }
 
+async function pickPipelineTable() {
+  // Si existe "proyectos", medimos pipeline ahí; si no, usamos "clientes" (compat)
+  const r = await q(
+    `SELECT EXISTS (
+       SELECT 1 FROM information_schema.tables
+       WHERE table_schema='public' AND table_name='proyectos'
+     ) AS ok`
+  );
+  return r.rows?.[0]?.ok ? "proyectos" : "clientes";
+}
+
 /* ============================ KPIs ============================ */
 /**
  * GET /analytics/kpis?from=YYYY-MM-DD&to=YYYY-MM-DD&stalled_days=7
@@ -49,14 +60,8 @@ function pct(n, d) {
  *   range: {...},
  *   contacts: { total, new_by_day, contactability_pct, first_touch:{...} },
  *   tasks: { overdue, due_next_7d },
- *   pipeline: { by_source:[], by_owner:[] },
- *   qualification: {
- *     total, qualified, rate_pct,
- *     uncontactable:{ total, pct },
- *     no_first_touch:{ total, pct },
- *     uncategorized:{ total, pct },
- *     stalled_in_incoming:{ total, days }
- *   }
+ *   pipeline: { by_source:[], by_owner:[], summary:{ won, lost, win_rate, stages:[{stage,total}] } },
+ *   qualification: { ... }   // (se mantiene igual)
  * }
  */
 router.get("/kpis", authenticateToken, async (req, res) => {
@@ -65,7 +70,10 @@ router.get("/kpis", authenticateToken, async (req, res) => {
     const { fromISO, toISO } = parseRange(req.query);
     const stalledDays = Math.max(1, Number(req.query.stalled_days || 7));
 
-    /* ---------- CONTACTS: total & new_by_day ---------- */
+    // ---------- Tabla de pipeline (proyectos ► default / clientes ► compat)
+    const PIPE = await pickPipelineTable();
+
+    /* ---------- CONTACTS (se mantiene basado en CLIENTES para que el widget “Clients” siga igual) ---------- */
     const contactsTotal = await q(
       `
       SELECT COUNT(*)::int AS total
@@ -87,7 +95,7 @@ router.get("/kpis", authenticateToken, async (req, res) => {
       [organizacion_id, fromISO, toISO]
     );
 
-    /* ---------- CONTACTABILITY: % con al menos 1 tarea en período ---------- */
+    /* ---------- CONTACTABILITY (primer contacto vía tareas sobre clientes) ---------- */
     const contactability = await q(
       `
       WITH touched AS (
@@ -112,7 +120,7 @@ router.get("/kpis", authenticateToken, async (req, res) => {
       [organizacion_id, fromISO, toISO]
     );
 
-    /* ---------- FIRST TOUCH SLA (p50/p90/avg en minutos) ---------- */
+    /* ---------- FIRST TOUCH SLA (p50/p90/avg en min) sobre clientes ---------- */
     const firstTouch = await q(
       `
       WITH first_task AS (
@@ -164,7 +172,8 @@ router.get("/kpis", authenticateToken, async (req, res) => {
       [organizacion_id]
     );
 
-    /* ---------- PIPELINE: by_source & by_owner (dentro del período) ---------- */
+    /* ---------- PIPELINE (sobre PROYECTOS si existen) ---------- */
+    // Win/Loss por source (en el rango por created_at; sin updated_at no podemos fechar cambios de etapa)
     const bySource = await q(
       `
       WITH agg AS (
@@ -172,7 +181,7 @@ router.get("/kpis", authenticateToken, async (req, res) => {
           COALESCE(source,'Unknown') AS source,
           SUM(CASE WHEN stage='Won'  THEN 1 ELSE 0 END)::int AS won,
           SUM(CASE WHEN stage='Lost' THEN 1 ELSE 0 END)::int AS lost
-        FROM clientes
+        FROM ${PIPE}
         WHERE ($1::text IS NULL OR organizacion_id = $1)
           AND created_at >= $2::timestamptz AND created_at < $3::timestamptz
         GROUP BY 1
@@ -187,6 +196,7 @@ router.get("/kpis", authenticateToken, async (req, res) => {
       [organizacion_id, fromISO, toISO]
     );
 
+    // Win/Loss por owner/assignee
     const byOwner = await q(
       `
       WITH agg AS (
@@ -194,7 +204,7 @@ router.get("/kpis", authenticateToken, async (req, res) => {
           COALESCE(assignee,'Unassigned') AS owner,
           SUM(CASE WHEN stage='Won'  THEN 1 ELSE 0 END)::int AS won,
           SUM(CASE WHEN stage='Lost' THEN 1 ELSE 0 END)::int AS lost
-        FROM clientes
+        FROM ${PIPE}
         WHERE ($1::text IS NULL OR organizacion_id = $1)
           AND created_at >= $2::timestamptz AND created_at < $3::timestamptz
         GROUP BY 1
@@ -209,10 +219,24 @@ router.get("/kpis", authenticateToken, async (req, res) => {
       [organizacion_id, fromISO, toISO]
     );
 
-    /* ---------- QUALIFICATION KPIs (nuevos) ---------- */
+    // Resumen simple por etapas (incluye Unqualified y Follow-up Missed)
+    const stagesAgg = await q(
+      `
+      SELECT COALESCE(stage,'Uncategorized') AS stage, COUNT(*)::int AS total
+      FROM ${PIPE}
+      WHERE ($1::text IS NULL OR organizacion_id = $1)
+        AND created_at >= $2::timestamptz AND created_at < $3::timestamptz
+      GROUP BY 1
+      `,
+      [organizacion_id, fromISO, toISO]
+    );
+    const wonTotal  = stagesAgg.rows?.find?.((r) => r.stage === "Won")?.total ?? 0;
+    const lostTotal = stagesAgg.rows?.find?.((r) => r.stage === "Lost")?.total ?? 0;
+    const win_rate  = (wonTotal + lostTotal) > 0 ? Math.round((wonTotal * 100) / (wonTotal + lostTotal)) : 0;
+
+    /* ---------- QUALIFICATION (mantiene definición histórica; usa clientes) ---------- */
     const canonLower = CANON_CATS.map((s) => s.toLowerCase());
 
-    // Total de leads creados en el rango (denominador)
     const leadsRange = await q(
       `
       SELECT COUNT(*)::int AS total
@@ -224,7 +248,6 @@ router.get("/kpis", authenticateToken, async (req, res) => {
     );
     const totalLeads = leadsRange.rows?.[0]?.total ?? 0;
 
-    // No contactables (sin email y sin teléfono) en el rango
     const uncontactableQ = await q(
       `
       SELECT COUNT(*)::int AS n
@@ -238,7 +261,6 @@ router.get("/kpis", authenticateToken, async (req, res) => {
     );
     const uncontactable = uncontactableQ.rows?.[0]?.n ?? 0;
 
-    // Sin primer contacto (ninguna tarea asociada) en el rango
     const noFirstTouchQ = await q(
       `
       SELECT COUNT(*)::int AS n
@@ -255,7 +277,6 @@ router.get("/kpis", authenticateToken, async (req, res) => {
     );
     const noFirstTouch = noFirstTouchQ.rows?.[0]?.n ?? 0;
 
-    // Sin stage / fuera de pipeline canónico en el rango
     const uncategorizedQ = await q(
       `
       SELECT COUNT(*)::int AS n
@@ -271,7 +292,6 @@ router.get("/kpis", authenticateToken, async (req, res) => {
     );
     const uncategorized = uncategorizedQ.rows?.[0]?.n ?? 0;
 
-    // Estancados en Incoming ≥ N días y sin tareas (no usa rango; fotografía actual)
     const stalledQ = await q(
       `
       SELECT COUNT(*)::int AS n
@@ -289,7 +309,6 @@ router.get("/kpis", authenticateToken, async (req, res) => {
     );
     const stalledIncoming = stalledQ.rows?.[0]?.n ?? 0;
 
-    // Tasa de calificación (Qualified + Bid/Estimate Sent + Won) en el rango
     const qualifiedQ = await q(
       `
       SELECT COUNT(*)::int AS n
@@ -332,6 +351,13 @@ router.get("/kpis", authenticateToken, async (req, res) => {
       pipeline: {
         by_source: bySource.rows || [],
         by_owner: byOwner.rows || [],
+        summary: {
+          won: wonTotal,
+          lost: lostTotal,
+          win_rate,
+          stages: stagesAgg.rows || [],
+          table: PIPE, // para debug/telemetría en FE si se quiere mostrar “source”
+        },
       },
       qualification: {
         total: totalLeads,
@@ -349,7 +375,7 @@ router.get("/kpis", authenticateToken, async (req, res) => {
       range: null,
       contacts: { total: 0, new_by_day: [], contactability_pct: 0, first_touch: { p50_min: 0, p90_min: 0, avg_min: 0 } },
       tasks: { overdue: 0, due_next_7d: 0 },
-      pipeline: { by_source: [], by_owner: [] },
+      pipeline: { by_source: [], by_owner: [], summary: { won: 0, lost: 0, win_rate: 0, stages: [], table: "clientes" } },
       qualification: {
         total: 0,
         qualified: 0,
@@ -365,8 +391,8 @@ router.get("/kpis", authenticateToken, async (req, res) => {
 
 function contactsabilitySafe(row) {
   if (!row) return 0;
-  const pct = Number(row.pct);
-  return Number.isFinite(pct) ? pct : 0;
+  const p = Number(row.pct);
+  return Number.isFinite(p) ? p : 0;
 }
 
 export default router;
