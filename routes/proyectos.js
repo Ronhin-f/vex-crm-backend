@@ -1,0 +1,246 @@
+// routes/proyectos.js — Oportunidades/Proyectos
+import { Router } from "express";
+import { q, CANON_CATS } from "../utils/db.js";
+import { authenticateToken } from "../middleware/auth.js";
+
+const router = Router();
+
+/* ---------------------------- helpers ---------------------------- */
+function getUserFromReq(req) {
+  const u = req.usuario || {};
+  return {
+    email: u.email ?? req.usuario_email ?? u.usuario_email ?? null,
+    organizacion_id: u.organizacion_id ?? req.organizacion_id ?? u.organization_id ?? null,
+  };
+}
+const T = (v) => { if (v == null) return null; const s = String(v).trim(); return s.length ? s : null; };
+const N = (v) => (v == null || v === "" ? null : Number(v));
+const D = (v) => { if (!v) return null; const d = new Date(v); return isNaN(d.getTime()) ? null : d.toISOString(); };
+
+/* ============== GET /proyectos ============== */
+/**
+ * Filtros soportados: q (nombre/descripcion), stage, cliente_id
+ * Compat mínima con FE: ordena por updated_at DESC, luego id DESC
+ */
+router.get("/", authenticateToken, async (req, res) => {
+  try {
+    const { organizacion_id } = getUserFromReq(req);
+    const { stage, cliente_id, q: qtext } = req.query || {};
+
+    const params = [];
+    const where = [];
+
+    if (organizacion_id) { params.push(organizacion_id); where.push(`p.organizacion_id = $${params.length}`); }
+    if (stage)          { params.push(String(stage));   where.push(`p.stage = $${params.length}`); }
+    if (cliente_id)     { params.push(Number(cliente_id)); where.push(`p.cliente_id = $${params.length}`); }
+    if (qtext) {
+      const qv = `%${String(qtext).trim()}%`;
+      params.push(qv);
+      const i = params.length;
+      where.push(`(p.nombre ILIKE $${i} OR p.descripcion ILIKE $${i})`);
+    }
+
+    const sql = `
+      SELECT
+        p.id, p.nombre, p.descripcion, p.cliente_id,
+        p.stage, p.categoria,
+        p.estimate_amount, p.estimate_currency,
+        p.prob_win, p.fecha_cierre_estimada,
+        p.usuario_email, p.organizacion_id,
+        p.created_at, p.updated_at
+      FROM proyectos p
+      ${where.length ? "WHERE " + where.join(" AND ") : ""}
+      ORDER BY p.updated_at DESC NULLS LAST, p.id DESC
+      LIMIT 1000
+    `;
+    const r = await q(sql, params);
+    res.json({ ok: true, items: r.rows || [] });
+  } catch (e) {
+    console.error("[GET /proyectos]", e?.stack || e?.message || e);
+    res.status(200).json({ ok: true, items: [] });
+  }
+});
+
+/* ============== POST /proyectos ============== */
+/**
+ * Crea un proyecto (oportunidad).
+ * Requeridos: nombre
+ * Opcionales: descripcion, cliente_id, stage/categoria, estimate_amount/currency, prob_win, fecha_cierre_estimada
+ */
+router.post("/", authenticateToken, async (req, res) => {
+  try {
+    const { organizacion_id, email: usuario_email } = getUserFromReq(req);
+    let {
+      nombre,
+      descripcion = null,
+      cliente_id = null,
+      stage = null,
+      categoria = null,
+      estimate_amount = null,
+      estimate_currency = null,
+      prob_win = null,
+      fecha_cierre_estimada = null,
+    } = req.body || {};
+
+    if (!nombre || !String(nombre).trim()) {
+      return res.status(400).json({ ok: false, message: "Nombre requerido" });
+    }
+    const finalStage = (s => (CANON_CATS.includes(s) ? s : "Incoming Leads"))(T(stage) || T(categoria) || "Incoming Leads");
+
+    const r = await q(
+      `INSERT INTO proyectos
+        (nombre, descripcion, cliente_id, stage, categoria,
+         estimate_amount, estimate_currency, prob_win, fecha_cierre_estimada,
+         usuario_email, organizacion_id)
+       VALUES
+        ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+       RETURNING id, nombre, descripcion, cliente_id, stage, categoria,
+                 estimate_amount, estimate_currency, prob_win, fecha_cierre_estimada,
+                 usuario_email, organizacion_id, created_at, updated_at`,
+      [
+        T(nombre),
+        T(descripcion),
+        cliente_id == null ? null : Number(cliente_id),
+        finalStage,
+        finalStage,
+        N(estimate_amount),
+        T(estimate_currency),
+        N(prob_win),
+        D(fecha_cierre_estimada),
+        usuario_email,
+        organizacion_id,
+      ]
+    );
+    res.status(201).json({ ok: true, item: r.rows[0] });
+  } catch (e) {
+    console.error("[POST /proyectos]", e?.stack || e?.message || e);
+    res.status(500).json({ ok: false, message: "Error creando proyecto" });
+  }
+});
+
+/* ============== PATCH /proyectos/:id ============== */
+router.patch("/:id", authenticateToken, async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id)) return res.status(400).json({ ok: false, message: "ID inválido" });
+
+    const allowed = {
+      nombre: (v) => T(v),
+      descripcion: (v) => T(v),
+      cliente_id: (v) => (v == null || v === "" ? null : Number(v)),
+      stage: (v) => T(v),
+      categoria: (v) => T(v),
+      estimate_amount: (v) => N(v),
+      estimate_currency: (v) => T(v),
+      prob_win: (v) => N(v),
+      fecha_cierre_estimada: (v) => D(v),
+    };
+
+    const sets = [];
+    const values = [];
+    let i = 1;
+
+    for (const k of Object.keys(allowed)) {
+      if (k in (req.body || {})) {
+        const conv = allowed[k](req.body[k]);
+        sets.push(`${k} = $${i++}`);
+        values.push(conv);
+      }
+    }
+    if (!sets.length) return res.status(400).json({ ok: false, message: "Nada para actualizar" });
+
+    // mantener updated_at
+    sets.push(`updated_at = NOW()`);
+
+    values.push(id);
+    const r = await q(
+      `UPDATE proyectos SET ${sets.join(", ")} WHERE id=$${i}
+       RETURNING id, nombre, descripcion, cliente_id, stage, categoria,
+                 estimate_amount, estimate_currency, prob_win, fecha_cierre_estimada,
+                 usuario_email, organizacion_id, created_at, updated_at`,
+      values
+    );
+    if (!r.rowCount) return res.status(404).json({ ok: false, message: "Proyecto no encontrado" });
+    res.json({ ok: true, item: r.rows[0] });
+  } catch (e) {
+    console.error("[PATCH /proyectos/:id]", e?.stack || e?.message || e);
+    res.status(500).json({ ok: false, message: "Error actualizando proyecto" });
+  }
+});
+
+/* ============== PATCH /proyectos/:id/stage ============== */
+/**
+ * Body: { stage }  (acepta "categoria" por compat)
+ * Espeja stage <-> categoria.
+ */
+router.patch("/:id/stage", authenticateToken, async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id)) return res.status(400).json({ ok: false, message: "ID inválido" });
+
+    const next = T(req.body?.stage ?? req.body?.categoria);
+    if (!next) return res.status(400).json({ ok: false, message: "stage requerido" });
+    if (!CANON_CATS.includes(next)) return res.status(400).json({ ok: false, message: "stage fuera del pipeline" });
+
+    const r = await q(
+      `UPDATE proyectos
+          SET stage=$1, categoria=$1, updated_at=NOW()
+        WHERE id=$2
+        RETURNING id, nombre, descripcion, cliente_id, stage, categoria,
+                  estimate_amount, estimate_currency, prob_win, fecha_cierre_estimada,
+                  usuario_email, organizacion_id, created_at, updated_at`,
+      [next, id]
+    );
+    if (!r.rowCount) return res.status(404).json({ ok: false, message: "Proyecto no encontrado" });
+    res.json({ ok: true, item: r.rows[0] });
+  } catch (e) {
+    console.error("[PATCH /proyectos/:id/stage]", e?.stack || e?.message || e);
+    res.status(500).json({ ok: false, message: "Error moviendo de etapa" });
+  }
+});
+
+/* ============== PATCH /proyectos/:id/estimate ============== */
+/**
+ * Body: { amount, currency }
+ */
+router.patch("/:id/estimate", authenticateToken, async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id)) return res.status(400).json({ ok: false, message: "ID inválido" });
+
+    const amount = N(req.body?.amount);
+    const currency = T(req.body?.currency);
+
+    const r = await q(
+      `UPDATE proyectos
+          SET estimate_amount=$1, estimate_currency=$2, updated_at=NOW()
+        WHERE id=$3
+        RETURNING id, nombre, descripcion, cliente_id, stage, categoria,
+                  estimate_amount, estimate_currency, prob_win, fecha_cierre_estimada,
+                  usuario_email, organizacion_id, created_at, updated_at`,
+      [amount, currency, id]
+    );
+    if (!r.rowCount) return res.status(404).json({ ok: false, message: "Proyecto no encontrado" });
+    res.json({ ok: true, item: r.rows[0] });
+  } catch (e) {
+    console.error("[PATCH /proyectos/:id/estimate]", e?.stack || e?.message || e);
+    res.status(500).json({ ok: false, message: "Error actualizando estimate" });
+  }
+});
+
+/* ============== DELETE /proyectos/:id ============== */
+router.delete("/:id", authenticateToken, async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id)) return res.status(400).json({ ok: false, message: "ID inválido" });
+
+    const r = await q(`DELETE FROM proyectos WHERE id=$1`, [id]);
+    if (!r.rowCount) return res.status(404).json({ ok: false, message: "Proyecto no encontrado" });
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("[DELETE /proyectos/:id]", e?.stack || e?.message || e);
+    res.status(500).json({ ok: false, message: "Error eliminando proyecto" });
+  }
+});
+
+export default router;

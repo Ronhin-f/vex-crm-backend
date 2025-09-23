@@ -11,12 +11,12 @@ const app = express();
 app.set("trust proxy", true);
 
 // Parsers
-app.use(express.json({ limit: "1mb" }));
+app.use(express.json({ limit: process.env.JSON_LIMIT || "1mb" }));
 app.use(express.urlencoded({ extended: false }));
 
 // Logs
 if (process.env.NODE_ENV !== "test") {
-  app.use(morgan("tiny"));
+  app.use(morgan(process.env.LOG_FORMAT || "tiny"));
 }
 
 // Seguridad (CORS + headers)
@@ -34,43 +34,47 @@ await initDB();
 app.get("/healthz", (_req, res) => res.status(200).json({ ok: true, minimal: true }));
 
 // ===== Helper para montaje tolerante a fallos =====
-async function mount(path, modulePath) {
+async function mount(pathname, modulePath) {
   try {
     const mod = await import(modulePath);
     const router = mod.default || mod.router || mod;
     if (router && typeof router === "function") {
-      app.use(path, router);
-      console.log(`✅ Ruta montada: ${path} <- ${modulePath}`);
+      app.use(pathname, router);
+      console.log(`✅ Ruta montada: ${pathname} <- ${modulePath}`);
     } else {
-      console.warn(`⚠️  ${modulePath} no exporta un router válido. Stub 501 en ${path}`);
-      app.use(path, (_req, res) => res.status(501).json({ error: "Ruta no disponible" }));
+      console.warn(`⚠️  ${modulePath} no exporta un router válido. Stub 501 en ${pathname}`);
+      app.use(pathname, (_req, res) => res.status(501).json({ error: "Ruta no disponible" }));
     }
   } catch (e) {
     console.error(`💥 Error importando ${modulePath}:`, e?.stack || e?.message || e);
-    app.use(path, (_req, res) => res.status(500).json({ error: "Ruta falló al cargar" }));
+    app.use(pathname, (_req, res) => res.status(500).json({ error: "Ruta falló al cargar" }));
   }
 }
 
-// ===== Montaje de rutas (MVP+) =====
-await mount("/clientes",       "./routes/clientes.js");
+// ===== Montaje de rutas (CRM v2) =====
+await mount("/clientes",       "./routes/clientes.js");      // datos puros de cliente
+await mount("/proyectos",      "./routes/proyectos.js");     // NUEVO: pipeline basado en proyectos/oportunidades
+await mount("/proveedores",    "./routes/proveedores.js");   // NUEVO: proveedores/subcontratistas
+
+// Legacy/compat (apagamos después de migrar FE)
+await mount("/compras",        "./routes/compras.js");       // dejar montado por ahora
+
+// CRM utilidades
 await mount("/categorias",     "./routes/categorias.js");
-await mount("/kanban",         "./routes/kanban.js");       // Kanban clientes/tareas + KPIs
-await mount("/compras",        "./routes/compras.js");
+await mount("/kanban",         "./routes/kanban.js");        // Kanban + KPIs (proyectos + compat clientes)
 await mount("/tareas",         "./routes/tareas.js");
 await mount("/dashboard",      "./routes/dashboard.js");
 
-// 🔹 Nuevo: KPIs consolidados del CRM
-await mount("/analytics",      "./routes/analytics.js");    // /analytics/kpis
+// KPIs consolidados
+await mount("/analytics",      "./routes/analytics.js");     // /analytics/kpis
 
-await mount("/upload",         "./routes/upload.js");       // Upload de estimates
-await mount("/modulos",        "./routes/modulos.js");      // Proxy resiliente a Core (safe)
-
-// Integraciones y automatización (on por pedido)
+// Integraciones y otros
+await mount("/upload",         "./routes/upload.js");        // Upload de estimates
+await mount("/modulos",        "./routes/modulos.js");       // Proxy resiliente a Core
 await mount("/integraciones",  "./routes/integraciones.js");
 await mount("/recordatorios",  "./routes/recordatorios.js");
 await mount("/jobs",           "./routes/job.js");
 await mount("/ai",             "./routes/ai.js");
-
 await mount("/health",         "./routes/health.js");
 
 // ===== Home / 404 =====

@@ -47,9 +47,9 @@ const PIPELINE_SET = new Set(ORDER);
 
 /* ============================ KPIs ============================ */
 /**
- * KPIs para dashboard:
- *  - clientesPorStage (usa stage; fallback a "Uncategorized")
- *  - clientesPorCat   (compat por categoría)
+ * KPIs para dashboard (basados en PROYECTOS):
+ *  - clientesPorStage  -> ahora se calcula desde proyectos.stage (compat FE)
+ *  - clientesPorCat    -> ahora se calcula desde proyectos.categoria (compat FE)
  *  - tareasPorEstado
  *  - proximos7d (tareas con due en <= 7 días, incompletas)
  *
@@ -59,17 +59,17 @@ router.get("/kpis", authenticateToken, async (req, res) => {
   try {
     const { organizacion_id } = getUserFromReq(req);
 
-    // ---- Clientes por STAGE
+    // ---- Proyectos por STAGE  (compat key name: clientesPorStage)
     const p1 = [];
     const w1 = [];
     if (organizacion_id) {
       p1.push(organizacion_id);
       w1.push(`organizacion_id = $${p1.length}`);
     }
-    const clientesPorStage = await q(
+    const proyectosPorStage = await q(
       `
       SELECT COALESCE(stage,'Uncategorized') AS stage, COUNT(*)::int AS total
-        FROM clientes
+        FROM proyectos
        ${w1.length ? "WHERE " + w1.join(" AND ") : ""}
        GROUP BY stage
        ORDER BY total DESC
@@ -77,11 +77,11 @@ router.get("/kpis", authenticateToken, async (req, res) => {
       p1
     );
 
-    // ---- Compat: Clientes por CATEGORÍA
-    const clientesPorCat = await q(
+    // ---- Compat: Proyectos por CATEGORÍA (compat key name: clientesPorCat)
+    const proyectosPorCat = await q(
       `
       SELECT COALESCE(categoria,'Uncategorized') AS categoria, COUNT(*)::int AS total
-        FROM clientes
+        FROM proyectos
        ${w1.length ? "WHERE " + w1.join(" AND ") : ""}
        GROUP BY categoria
        ORDER BY total DESC
@@ -123,8 +123,9 @@ router.get("/kpis", authenticateToken, async (req, res) => {
     const prox7 = vencen7.rows?.[0]?.total ?? 0;
 
     res.json({
-      clientesPorStage: clientesPorStage.rows || [],
-      clientesPorCat: clientesPorCat.rows || [],
+      // Compat keys para FE existente:
+      clientesPorStage: proyectosPorStage.rows || [],
+      clientesPorCat: proyectosPorCat.rows || [],
       tareasPorEstado: tareasPorEstado.rows || [],
       proximos7d: prox7,
       proximos_7d: prox7,
@@ -141,7 +142,124 @@ router.get("/kpis", authenticateToken, async (req, res) => {
   }
 });
 
-/* ====================== Kanban de CLIENTES ===================== */
+/* ===================== Kanban de PROYECTOS ===================== */
+/**
+ * Devuelve columnas del pipeline con tarjetas para la UI:
+ *  - id, nombre, cliente_id
+ *  - stage, categoria
+ *  - estimate_amount, estimate_currency, prob_win, fecha_cierre_estimada
+ *  - created_at
+ *
+ * Filtros: q, stage
+ */
+router.get("/proyectos", authenticateToken, async (req, res) => {
+  try {
+    const { organizacion_id } = getUserFromReq(req);
+    const { q: qtext, stage } = req.query || {};
+
+    const params = [];
+    const where = [];
+
+    if (organizacion_id) {
+      params.push(organizacion_id);
+      where.push(`p.organizacion_id = $${params.length}`);
+    }
+    if (stage) {
+      params.push(String(stage));
+      where.push(`p.stage = $${params.length}`);
+    }
+    if (qtext) {
+      const qval = `%${String(qtext).trim()}%`;
+      params.push(qval);
+      const idx = params.length;
+      where.push(`(p.nombre ILIKE $${idx} OR p.descripcion ILIKE $${idx})`);
+    }
+
+    const rs = await q(
+      `
+      SELECT
+        p.id, p.nombre, p.descripcion, p.cliente_id,
+        p.stage, p.categoria,
+        p.estimate_amount, p.estimate_currency, p.prob_win, p.fecha_cierre_estimada,
+        p.created_at, p.updated_at
+      FROM proyectos p
+      ${where.length ? "WHERE " + where.join(" AND ") : ""}
+      ORDER BY p.updated_at DESC NULLS LAST, p.id DESC
+      `,
+      params
+    );
+
+    const bucket = new Map(ORDER.map(k => [k, []]));
+    for (const row of rs.rows) {
+      const key =
+        PIPELINE_SET.has(row.stage) ? row.stage
+        : PIPELINE_SET.has(row.categoria) ? row.categoria
+        : "Lost"; // fallback estable
+
+      bucket.get(key)?.push({
+        id: row.id,
+        nombre: row.nombre,
+        cliente_id: row.cliente_id,
+        stage: row.stage,
+        categoria: row.categoria,
+        estimate_amount: row.estimate_amount,
+        estimate_currency: row.estimate_currency,
+        prob_win: row.prob_win,
+        fecha_cierre_estimada: row.fecha_cierre_estimada,
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+      });
+    }
+
+    const columns = ORDER.map(name => ({
+      key: name,
+      title: name,
+      count: bucket.get(name)?.length || 0,
+      items: bucket.get(name) || [],
+    }));
+
+    res.json({ columns, order: ORDER });
+  } catch (e) {
+    console.error("[GET /kanban/proyectos]", e?.stack || e?.message || e);
+    res.status(500).json({ message: "Error obteniendo Kanban de proyectos" });
+  }
+});
+
+/**
+ * Move one-click del pipeline (PROYECTOS)
+ * Body: { stage: "Qualified" } (acepta "categoria" por compat)
+ * Espeja stage <-> categoria.
+ */
+router.patch("/proyectos/:id/move", authenticateToken, async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    let next = coerceText(req.body?.stage ?? req.body?.categoria);
+    if (!Number.isInteger(id)) return res.status(400).json({ message: "ID inválido" });
+    if (!next) return res.status(400).json({ message: "stage requerido" });
+    if (!PIPELINE_SET.has(next) && !CANON_CATS.includes(next)) {
+      return res.status(400).json({ message: "stage fuera del pipeline" });
+    }
+
+    const r = await q(
+      `
+      UPDATE proyectos
+         SET stage = $1,
+             categoria = $1,
+             updated_at = NOW()
+       WHERE id = $2
+       RETURNING id, nombre, stage, categoria
+      `,
+      [next, id]
+    );
+    if (!r.rowCount) return res.status(404).json({ message: "Proyecto no encontrado" });
+    res.json(r.rows[0]);
+  } catch (e) {
+    console.error("[PATCH /kanban/proyectos/:id/move]", e?.stack || e?.message || e);
+    res.status(500).json({ message: "Error moviendo proyecto" });
+  }
+});
+
+/* ====================== Kanban de CLIENTES (compat) ===================== */
 /**
  * Devuelve columnas del pipeline con tarjetas ricas para la UI:
  *  - id, nombre, email, telefono
@@ -208,7 +326,7 @@ router.get("/clientes", authenticateToken, async (req, res) => {
       const key =
         PIPELINE_SET.has(row.stage) ? row.stage
         : PIPELINE_SET.has(row.categoria) ? row.categoria
-        : "Lost"; // fallback sólido para no mezclar "Uncategorized" en la demo
+        : "Lost"; // fallback sólido
 
       const estimateChip = !!(row.estimate_url || row.estimate_file);
       bucket.get(key)?.push({
@@ -242,7 +360,7 @@ router.get("/clientes", authenticateToken, async (req, res) => {
 });
 
 /**
- * Move one-click del pipeline
+ * Move one-click del pipeline (CLIENTES)
  * Body: { stage: "Qualified" }  (acepta "categoria" por compat)
  * Espeja stage <-> categoria para evitar inconsistencias con instalaciones viejas.
  */

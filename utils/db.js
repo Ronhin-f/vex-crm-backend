@@ -3,8 +3,10 @@ import pg from "pg";
 const { Pool } = pg;
 
 export const CANON_CATS = [
+  "Unqualified",
   "Incoming Leads",
   "Qualified",
+  "Follow-up Missed",
   "Bid/Estimate Sent",
   "Won",
   "Lost",
@@ -47,6 +49,9 @@ async function ensureOrgText(table) {
 }
 
 export async function initDB() {
+  // ===== Extensiones útiles (idempotente) =====
+  await q(`CREATE EXTENSION IF NOT EXISTS "uuid-ossp";`);
+
   // ===== Tablas base (no pisa existentes) =====
   await q(`
     CREATE TABLE IF NOT EXISTS usuarios (
@@ -78,7 +83,8 @@ export async function initDB() {
       -- tracking
       usuario_email TEXT,
       organizacion_id TEXT,
-      created_at TIMESTAMPTZ DEFAULT NOW()
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      updated_at TIMESTAMPTZ DEFAULT NOW()
     );
 
     -- Legacy comercial (dejamos para compat, pero el MVP usará /compras)
@@ -103,7 +109,7 @@ export async function initDB() {
     -- Compras (para el módulo /compras del MVP)
     CREATE TABLE IF NOT EXISTS compras (
       id SERIAL PRIMARY KEY,
-      proveedor TEXT,            -- o usar cliente_id si compras a clientes; lo dejo simple para MVP
+      proveedor TEXT,            -- simple para MVP
       cliente_id INTEGER,        -- opcional si la compra está asociada a un cliente
       numero TEXT,               -- nro de orden / factura
       estado TEXT DEFAULT 'draft', -- draft | submitted | received | cancelled
@@ -177,6 +183,41 @@ export async function initDB() {
     );
   `);
 
+  // ===== NUEVO: PROYECTOS & PROVEEDORES =====
+  await q(`
+    CREATE TABLE IF NOT EXISTS proyectos (
+      id SERIAL PRIMARY KEY,
+      nombre TEXT NOT NULL,
+      descripcion TEXT,
+      cliente_id INTEGER,
+      stage TEXT DEFAULT 'Incoming Leads',
+      categoria TEXT,
+      estimate_amount NUMERIC(14,2),
+      estimate_currency TEXT,
+      prob_win NUMERIC(5,2),             -- 0..100
+      fecha_cierre_estimada DATE,
+      usuario_email TEXT,
+      organizacion_id TEXT,
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      updated_at TIMESTAMPTZ DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS proveedores (
+      id SERIAL PRIMARY KEY,
+      nombre TEXT NOT NULL,
+      contacto TEXT,
+      telefono TEXT,
+      email TEXT,
+      rubro TEXT,
+      notas TEXT,
+      activo BOOLEAN DEFAULT TRUE,
+      usuario_email TEXT,
+      organizacion_id TEXT,
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      updated_at TIMESTAMPTZ DEFAULT NOW()
+    );
+  `);
+
   // ===== Columnas que pueden faltar (migraciones idempotentes) =====
   await q(`ALTER TABLE clientes ADD COLUMN IF NOT EXISTS email TEXT;`);
   await q(`ALTER TABLE clientes ADD COLUMN IF NOT EXISTS categoria TEXT;`);
@@ -189,25 +230,33 @@ export async function initDB() {
   await q(`ALTER TABLE clientes ADD COLUMN IF NOT EXISTS estimate_file TEXT;`);
   await q(`ALTER TABLE clientes ADD COLUMN IF NOT EXISTS estimate_uploaded_at TIMESTAMPTZ;`);
   await q(`ALTER TABLE clientes ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW();`);
+  await q(`ALTER TABLE clientes ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW();`);
 
-  await q(`ALTER TABLE tareas ADD COLUMN IF NOT EXISTS completada BOOLEAN DEFAULT FALSE;`);
-  await q(`ALTER TABLE tareas ADD COLUMN IF NOT EXISTS vence_en TIMESTAMPTZ;`);
-  await q(`ALTER TABLE tareas ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW();`);
-  await q(`ALTER TABLE tareas ADD COLUMN IF NOT EXISTS estado TEXT DEFAULT 'todo';`);
-  await q(`ALTER TABLE tareas ADD COLUMN IF NOT EXISTS orden INTEGER DEFAULT 0;`);
+  // Proyectos: asegurar todas las columnas (si la tabla existía con otra forma)
+  await q(`ALTER TABLE proyectos ADD COLUMN IF NOT EXISTS descripcion TEXT;`);
+  await q(`ALTER TABLE proyectos ADD COLUMN IF NOT EXISTS cliente_id INTEGER;`);
+  await q(`ALTER TABLE proyectos ADD COLUMN IF NOT EXISTS stage TEXT DEFAULT 'Incoming Leads';`);
+  await q(`ALTER TABLE proyectos ADD COLUMN IF NOT EXISTS categoria TEXT;`);
+  await q(`ALTER TABLE proyectos ADD COLUMN IF NOT EXISTS estimate_amount NUMERIC(14,2);`);
+  await q(`ALTER TABLE proyectos ADD COLUMN IF NOT EXISTS estimate_currency TEXT;`);
+  await q(`ALTER TABLE proyectos ADD COLUMN IF NOT EXISTS prob_win NUMERIC(5,2);`);
+  await q(`ALTER TABLE proyectos ADD COLUMN IF NOT EXISTS fecha_cierre_estimada DATE;`);
+  await q(`ALTER TABLE proyectos ADD COLUMN IF NOT EXISTS usuario_email TEXT;`);
+  await q(`ALTER TABLE proyectos ADD COLUMN IF NOT EXISTS organizacion_id TEXT;`);
+  await q(`ALTER TABLE proyectos ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW();`);
+  await q(`ALTER TABLE proyectos ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW();`);
 
-  await q(`ALTER TABLE compras ADD COLUMN IF NOT EXISTS proveedor TEXT;`);
-  await q(`ALTER TABLE compras ADD COLUMN IF NOT EXISTS cliente_id INTEGER;`);
-  await q(`ALTER TABLE compras ADD COLUMN IF NOT EXISTS numero TEXT;`);
-  await q(`ALTER TABLE compras ADD COLUMN IF NOT EXISTS estado TEXT DEFAULT 'draft';`);
-  await q(`ALTER TABLE compras ADD COLUMN IF NOT EXISTS total NUMERIC(14,2);`);
-  await q(`ALTER TABLE compras ADD COLUMN IF NOT EXISTS moneda TEXT DEFAULT 'ARS';`);
-  await q(`ALTER TABLE compras ADD COLUMN IF NOT EXISTS notas TEXT;`);
-  await q(`ALTER TABLE compras ADD COLUMN IF NOT EXISTS fecha TIMESTAMPTZ DEFAULT NOW();`);
-  await q(`ALTER TABLE compras ADD COLUMN IF NOT EXISTS usuario_email TEXT;`);
-  await q(`ALTER TABLE compras ADD COLUMN IF NOT EXISTS organizacion_id TEXT;`);
-  await q(`ALTER TABLE compras ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW();`);
-  await q(`ALTER TABLE compras ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW();`);
+  // Proveedores: asegurar columnas
+  await q(`ALTER TABLE proveedores ADD COLUMN IF NOT EXISTS contacto TEXT;`);
+  await q(`ALTER TABLE proveedores ADD COLUMN IF NOT EXISTS telefono TEXT;`);
+  await q(`ALTER TABLE proveedores ADD COLUMN IF NOT EXISTS email TEXT;`);
+  await q(`ALTER TABLE proveedores ADD COLUMN IF NOT EXISTS rubro TEXT;`);
+  await q(`ALTER TABLE proveedores ADD COLUMN IF NOT EXISTS notas TEXT;`);
+  await q(`ALTER TABLE proveedores ADD COLUMN IF NOT EXISTS activo BOOLEAN DEFAULT TRUE;`);
+  await q(`ALTER TABLE proveedores ADD COLUMN IF NOT EXISTS usuario_email TEXT;`);
+  await q(`ALTER TABLE proveedores ADD COLUMN IF NOT EXISTS organizacion_id TEXT;`);
+  await q(`ALTER TABLE proveedores ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW();`);
+  await q(`ALTER TABLE proveedores ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW();`);
 
   // ===== Normalizo tipo de org a TEXT =====
   const ORG_TABLES = [
@@ -220,7 +269,9 @@ export async function initDB() {
     "categorias",
     "compras",
     "compra_items",
-    "pedido_items"
+    "pedido_items",
+    "proyectos",
+    "proveedores"
   ];
   for (const t of ORG_TABLES) {
     await ensureOrgText(t).catch(() => {});
@@ -229,6 +280,7 @@ export async function initDB() {
   // ===== Índices =====
   await q(`CREATE INDEX IF NOT EXISTS idx_clientes_org       ON clientes(organizacion_id);`);
   await q(`CREATE INDEX IF NOT EXISTS idx_clientes_created   ON clientes(created_at);`);
+  await q(`CREATE INDEX IF NOT EXISTS idx_clientes_updated   ON clientes(updated_at);`);
   await q(`CREATE INDEX IF NOT EXISTS idx_clientes_stage     ON clientes(stage);`);
   await q(`CREATE INDEX IF NOT EXISTS idx_clientes_categoria ON clientes(categoria);`);
   await q(`CREATE INDEX IF NOT EXISTS idx_clientes_assignee  ON clientes(assignee);`);
@@ -245,6 +297,15 @@ export async function initDB() {
   await q(`CREATE INDEX IF NOT EXISTS idx_compras_fecha      ON compras(fecha);`);
   await q(`CREATE INDEX IF NOT EXISTS idx_compras_estado     ON compras(estado);`);
   await q(`CREATE INDEX IF NOT EXISTS idx_compra_items_cid   ON compra_items(compra_id);`);
+
+  await q(`CREATE INDEX IF NOT EXISTS idx_proyectos_org      ON proyectos(organizacion_id);`);
+  await q(`CREATE INDEX IF NOT EXISTS idx_proyectos_updated  ON proyectos(updated_at);`);
+  await q(`CREATE INDEX IF NOT EXISTS idx_proyectos_stage    ON proyectos(stage);`);
+  await q(`CREATE INDEX IF NOT EXISTS idx_proyectos_cliente  ON proyectos(cliente_id);`);
+
+  await q(`CREATE INDEX IF NOT EXISTS idx_proveedores_org    ON proveedores(organizacion_id);`);
+  await q(`CREATE INDEX IF NOT EXISTS idx_proveedores_activo ON proveedores(activo);`);
+  await q(`CREATE INDEX IF NOT EXISTS idx_proveedores_updated ON proveedores(updated_at);`);
 
   await q(`
     CREATE UNIQUE INDEX IF NOT EXISTS categorias_org_nombre_lower_uniq
@@ -271,6 +332,8 @@ export async function initDB() {
   }
 
   // ===== Backfill de coherencia stage/categoria (para instalaciones viejas) =====
-  await q(`UPDATE clientes SET stage = categoria WHERE stage IS NULL AND categoria IS NOT NULL;`);
-  await q(`UPDATE clientes SET categoria = stage WHERE categoria IS NULL AND stage IS NOT NULL;`);
+  await q(`UPDATE clientes  SET stage = categoria WHERE stage IS NULL AND categoria IS NOT NULL;`);
+  await q(`UPDATE clientes  SET categoria = stage WHERE categoria IS NULL AND stage IS NOT NULL;`);
+  await q(`UPDATE proyectos SET stage = COALESCE(stage, 'Incoming Leads');`);
+  await q(`UPDATE proyectos SET categoria = COALESCE(categoria, stage);`);
 }
