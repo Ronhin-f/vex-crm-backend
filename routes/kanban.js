@@ -50,56 +50,74 @@ router.get("/kpis", authenticateToken, async (req, res) => {
   try {
     const { organizacion_id } = getUserFromReq(req);
 
-    // ---- Clientes por STAGE (compat)
-    const p1 = [];
-    const w1 = [];
+    /* ---------- PROYECTOS por stage (principal en v2) ---------- */
+    const pProj = [];
+    const wProj = [];
     if (organizacion_id) {
-      p1.push(organizacion_id);
-      w1.push(`organizacion_id = $${p1.length}`);
+      pProj.push(organizacion_id);
+      wProj.push(`organizacion_id = $${pProj.length}`);
+    }
+    const proyectosPorStage = await q(
+      `
+      SELECT COALESCE(stage,'Uncategorized') AS stage, COUNT(*)::int AS total
+        FROM proyectos
+       ${wProj.length ? "WHERE " + wProj.join(" AND ") : ""}
+       GROUP BY stage
+       ORDER BY total DESC
+      `,
+      pProj
+    );
+
+    /* ---------- Compat: CLIENTES por stage/categoría ---------- */
+    const pCli = [];
+    const wCli = [];
+    if (organizacion_id) {
+      pCli.push(organizacion_id);
+      wCli.push(`organizacion_id = $${pCli.length}`);
     }
     const clientesPorStage = await q(
       `
       SELECT COALESCE(stage,'Uncategorized') AS stage, COUNT(*)::int AS total
         FROM clientes
-       ${w1.length ? "WHERE " + w1.join(" AND ") : ""}
+       ${wCli.length ? "WHERE " + wCli.join(" AND ") : ""}
        GROUP BY stage
        ORDER BY total DESC
       `,
-      p1
+      pCli
     );
 
-    // ---- Compat: Clientes por CATEGORÍA
     const clientesPorCat = await q(
       `
       SELECT COALESCE(categoria,'Uncategorized') AS categoria, COUNT(*)::int AS total
         FROM clientes
-       ${w1.length ? "WHERE " + w1.join(" AND ") : ""}
+       ${wCli.length ? "WHERE " + wCli.join(" AND ") : ""}
        GROUP BY categoria
        ORDER BY total DESC
       `,
-      p1
+      pCli
     );
 
-    // ---- Tareas por estado
-    const p2 = [];
-    const w2 = [];
+    /* ---------- TAREAS por estado ---------- */
+    const pTask = [];
+    const wTask = [];
     if (organizacion_id) {
-      p2.push(organizacion_id);
-      w2.push(`organizacion_id = $${p2.length}`);
+      pTask.push(organizacion_id);
+      wTask.push(`organizacion_id = $${pTask.length}`);
     }
     const tareasPorEstado = await q(
       `
       SELECT COALESCE(estado,'todo') AS estado, COUNT(*)::int AS total
         FROM tareas
-       ${w2.length ? "WHERE " + w2.join(" AND ") : ""}
+       ${wTask.length ? "WHERE " + wTask.join(" AND ") : ""}
        GROUP BY estado
        ORDER BY total DESC
       `,
-      p2
+      pTask
     );
 
-    // ---- Tareas que vencen en <= 7 días (incompletas)
-    const vencen7 = await q(
+    /* ---------- Próximos 7 días ---------- */
+    // Tareas (incompletas)
+    const vencen7T = await q(
       `
       SELECT COUNT(*)::int AS total
         FROM tareas
@@ -111,18 +129,35 @@ router.get("/kpis", authenticateToken, async (req, res) => {
       organizacion_id ? [organizacion_id] : []
     );
 
-    const prox7 = vencen7.rows?.[0]?.total ?? 0;
+    // Proyectos (por due_date)
+    const vencen7P = await q(
+      `
+      SELECT COUNT(*)::int AS total
+        FROM proyectos
+       WHERE due_date IS NOT NULL
+         AND due_date <= NOW() + INTERVAL '7 days'
+         ${organizacion_id ? "AND organizacion_id = $1" : ""}
+      `,
+      organizacion_id ? [organizacion_id] : []
+    );
 
     res.json({
+      // v2 (proyectos)
+      proyectosPorStage: proyectosPorStage.rows || [],
+      proximos7d_proyectos: vencen7P.rows?.[0]?.total ?? 0,
+
+      // compat (clientes + tareas)
       clientesPorStage: clientesPorStage.rows || [],
       clientesPorCat: clientesPorCat.rows || [],
       tareasPorEstado: tareasPorEstado.rows || [],
-      proximos7d: prox7,
-      proximos_7d: prox7,
+      proximos7d: vencen7T.rows?.[0]?.total ?? 0,
+      proximos_7d: vencen7T.rows?.[0]?.total ?? 0,
     });
   } catch (e) {
     console.error("[GET /kanban/kpis]", e?.stack || e?.message || e);
     res.json({
+      proyectosPorStage: [],
+      proximos7d_proyectos: 0,
       clientesPorStage: [],
       clientesPorCat: [],
       tareasPorEstado: [],
@@ -186,7 +221,7 @@ router.get("/proyectos", authenticateToken, async (req, res) => {
       SELECT
         p.id, p.cliente_id,
         p.nombre,
-        COALESCE(p.email, c.email)    AS email,
+        COALESCE(p.email, c.email)       AS email,
         COALESCE(p.telefono, c.telefono) AS telefono,
         p.stage, p.categoria, p.source, p.assignee, p.due_date,
         p.estimate_url, p.estimate_file, p.created_at,
