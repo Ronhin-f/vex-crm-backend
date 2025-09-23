@@ -1,4 +1,4 @@
-// routes/kanban.js
+// backend/routes/kanban.js
 import { Router } from "express";
 import { q, CANON_CATS } from "../utils/db.js";
 import { authenticateToken } from "../middleware/auth.js";
@@ -46,30 +46,21 @@ const ORDER = [
 const PIPELINE_SET = new Set(ORDER);
 
 /* ============================ KPIs ============================ */
-/**
- * KPIs para dashboard (basados en PROYECTOS):
- *  - clientesPorStage  -> ahora se calcula desde proyectos.stage (compat FE)
- *  - clientesPorCat    -> ahora se calcula desde proyectos.categoria (compat FE)
- *  - tareasPorEstado
- *  - proximos7d (tareas con due en <= 7 días, incompletas)
- *
- * Debe devolver zeros/arrays vacíos si no hay datos (no 500).
- */
 router.get("/kpis", authenticateToken, async (req, res) => {
   try {
     const { organizacion_id } = getUserFromReq(req);
 
-    // ---- Proyectos por STAGE  (compat key name: clientesPorStage)
+    // ---- Clientes por STAGE (compat)
     const p1 = [];
     const w1 = [];
     if (organizacion_id) {
       p1.push(organizacion_id);
       w1.push(`organizacion_id = $${p1.length}`);
     }
-    const proyectosPorStage = await q(
+    const clientesPorStage = await q(
       `
       SELECT COALESCE(stage,'Uncategorized') AS stage, COUNT(*)::int AS total
-        FROM proyectos
+        FROM clientes
        ${w1.length ? "WHERE " + w1.join(" AND ") : ""}
        GROUP BY stage
        ORDER BY total DESC
@@ -77,11 +68,11 @@ router.get("/kpis", authenticateToken, async (req, res) => {
       p1
     );
 
-    // ---- Compat: Proyectos por CATEGORÍA (compat key name: clientesPorCat)
-    const proyectosPorCat = await q(
+    // ---- Compat: Clientes por CATEGORÍA
+    const clientesPorCat = await q(
       `
       SELECT COALESCE(categoria,'Uncategorized') AS categoria, COUNT(*)::int AS total
-        FROM proyectos
+        FROM clientes
        ${w1.length ? "WHERE " + w1.join(" AND ") : ""}
        GROUP BY categoria
        ORDER BY total DESC
@@ -123,9 +114,8 @@ router.get("/kpis", authenticateToken, async (req, res) => {
     const prox7 = vencen7.rows?.[0]?.total ?? 0;
 
     res.json({
-      // Compat keys para FE existente:
-      clientesPorStage: proyectosPorStage.rows || [],
-      clientesPorCat: proyectosPorCat.rows || [],
+      clientesPorStage: clientesPorStage.rows || [],
+      clientesPorCat: clientesPorCat.rows || [],
       tareasPorEstado: tareasPorEstado.rows || [],
       proximos7d: prox7,
       proximos_7d: prox7,
@@ -142,20 +132,18 @@ router.get("/kpis", authenticateToken, async (req, res) => {
   }
 });
 
-/* ===================== Kanban de PROYECTOS ===================== */
+/* ====================== Kanban de PROYECTOS ===================== */
 /**
- * Devuelve columnas del pipeline con tarjetas para la UI:
- *  - id, nombre, cliente_id
- *  - stage, categoria
- *  - estimate_amount, estimate_currency, prob_win, fecha_cierre_estimada
- *  - created_at
+ * Tarjetas enriquecidas con datos del cliente:
+ * - p.* y fallback a c.email / c.telefono / c.contacto_nombre
+ * - cliente_id, cliente_nombre
  *
- * Filtros: q, stage
+ * Filtros: q, source, assignee ("Sin asignar"), stage, only_due=1|true
  */
 router.get("/proyectos", authenticateToken, async (req, res) => {
   try {
     const { organizacion_id } = getUserFromReq(req);
-    const { q: qtext, stage } = req.query || {};
+    const { q: qtext, source, assignee, stage, only_due } = req.query || {};
 
     const params = [];
     const where = [];
@@ -168,23 +156,46 @@ router.get("/proyectos", authenticateToken, async (req, res) => {
       params.push(String(stage));
       where.push(`p.stage = $${params.length}`);
     }
+    if (source) {
+      params.push(String(source));
+      where.push(`p.source = $${params.length}`);
+    }
+    if (assignee) {
+      if (/^(sin asignar|unassigned)$/i.test(String(assignee))) {
+        where.push(`(p.assignee IS NULL OR TRIM(p.assignee) = '')`);
+      } else {
+        params.push(String(assignee));
+        where.push(`p.assignee = $${params.length}`);
+      }
+    }
     if (qtext) {
       const qval = `%${String(qtext).trim()}%`;
       params.push(qval);
       const idx = params.length;
-      where.push(`(p.nombre ILIKE $${idx} OR p.descripcion ILIKE $${idx})`);
+      where.push(
+        `(p.nombre ILIKE $${idx}
+          OR COALESCE(p.email, c.email) ILIKE $${idx}
+          OR COALESCE(p.telefono, c.telefono) ILIKE $${idx}
+          OR c.nombre ILIKE $${idx})`
+      );
     }
+    if (isTruthy(only_due)) where.push(`p.due_date IS NOT NULL`);
 
     const rs = await q(
       `
       SELECT
-        p.id, p.nombre, p.descripcion, p.cliente_id,
-        p.stage, p.categoria,
-        p.estimate_amount, p.estimate_currency, p.prob_win, p.fecha_cierre_estimada,
-        p.created_at, p.updated_at
+        p.id, p.cliente_id,
+        p.nombre,
+        COALESCE(p.email, c.email)    AS email,
+        COALESCE(p.telefono, c.telefono) AS telefono,
+        p.stage, p.categoria, p.source, p.assignee, p.due_date,
+        p.estimate_url, p.estimate_file, p.created_at,
+        c.nombre AS cliente_nombre,
+        COALESCE(p.contacto_nombre, c.contacto_nombre) AS contacto_nombre
       FROM proyectos p
+      LEFT JOIN clientes c ON c.id = p.cliente_id
       ${where.length ? "WHERE " + where.join(" AND ") : ""}
-      ORDER BY p.updated_at DESC NULLS LAST, p.id DESC
+      ORDER BY p.created_at DESC NULLS LAST, p.id DESC
       `,
       params
     );
@@ -194,20 +205,25 @@ router.get("/proyectos", authenticateToken, async (req, res) => {
       const key =
         PIPELINE_SET.has(row.stage) ? row.stage
         : PIPELINE_SET.has(row.categoria) ? row.categoria
-        : "Lost"; // fallback estable
+        : "Lost";
 
+      const estimateChip = !!(row.estimate_url || row.estimate_file);
       bucket.get(key)?.push({
         id: row.id,
-        nombre: row.nombre,
         cliente_id: row.cliente_id,
+        cliente_nombre: row.cliente_nombre || null,
+        nombre: row.nombre,
+        empresa: row.cliente_nombre || null, // se muestra bajo el título
+        email: row.email,
+        telefono: row.telefono,
         stage: row.stage,
-        categoria: row.categoria,
-        estimate_amount: row.estimate_amount,
-        estimate_currency: row.estimate_currency,
-        prob_win: row.prob_win,
-        fecha_cierre_estimada: row.fecha_cierre_estimada,
+        source: row.source,
+        assignee: row.assignee,
+        assignee_email: row.assignee,
+        due_date: row.due_date,
+        estimate_url: row.estimate_url,
+        estimate: estimateChip,
         created_at: row.created_at,
-        updated_at: row.updated_at,
       });
     }
 
@@ -225,11 +241,7 @@ router.get("/proyectos", authenticateToken, async (req, res) => {
   }
 });
 
-/**
- * Move one-click del pipeline (PROYECTOS)
- * Body: { stage: "Qualified" } (acepta "categoria" por compat)
- * Espeja stage <-> categoria.
- */
+/** Move de proyecto */
 router.patch("/proyectos/:id/move", authenticateToken, async (req, res) => {
   try {
     const id = Number(req.params.id);
@@ -244,8 +256,7 @@ router.patch("/proyectos/:id/move", authenticateToken, async (req, res) => {
       `
       UPDATE proyectos
          SET stage = $1,
-             categoria = $1,
-             updated_at = NOW()
+             categoria = $1
        WHERE id = $2
        RETURNING id, nombre, stage, categoria
       `,
@@ -260,14 +271,6 @@ router.patch("/proyectos/:id/move", authenticateToken, async (req, res) => {
 });
 
 /* ====================== Kanban de CLIENTES (compat) ===================== */
-/**
- * Devuelve columnas del pipeline con tarjetas ricas para la UI:
- *  - id, nombre, email, telefono
- *  - stage, source, assignee(+alias assignee_email), due_date
- *  - estimate_url (y flag si hay file), created_at
- *
- * Acepta filtros: q, source, assignee ("Sin asignar"), stage, only_due=1|true
- */
 router.get("/clientes", authenticateToken, async (req, res) => {
   try {
     const { organizacion_id } = getUserFromReq(req);
@@ -304,9 +307,7 @@ router.get("/clientes", authenticateToken, async (req, res) => {
         `(c.nombre ILIKE $${idx} OR c.email ILIKE $${idx} OR c.telefono ILIKE $${idx})`
       );
     }
-    if (isTruthy(only_due)) {
-      where.push(`c.due_date IS NOT NULL`);
-    }
+    if (isTruthy(only_due)) where.push(`c.due_date IS NOT NULL`);
 
     const rs = await q(
       `
@@ -326,7 +327,7 @@ router.get("/clientes", authenticateToken, async (req, res) => {
       const key =
         PIPELINE_SET.has(row.stage) ? row.stage
         : PIPELINE_SET.has(row.categoria) ? row.categoria
-        : "Lost"; // fallback sólido
+        : "Lost";
 
       const estimateChip = !!(row.estimate_url || row.estimate_file);
       bucket.get(key)?.push({
@@ -337,10 +338,10 @@ router.get("/clientes", authenticateToken, async (req, res) => {
         stage: row.stage,
         source: row.source,
         assignee: row.assignee,
-        assignee_email: row.assignee, // alias para FE
+        assignee_email: row.assignee,
         due_date: row.due_date,
         estimate_url: row.estimate_url,
-        estimate: estimateChip,       // flag para mostrar chip en UI
+        estimate: estimateChip,
         created_at: row.created_at,
       });
     }
@@ -359,18 +360,12 @@ router.get("/clientes", authenticateToken, async (req, res) => {
   }
 });
 
-/**
- * Move one-click del pipeline (CLIENTES)
- * Body: { stage: "Qualified" }  (acepta "categoria" por compat)
- * Espeja stage <-> categoria para evitar inconsistencias con instalaciones viejas.
- */
 router.patch("/clientes/:id/move", authenticateToken, async (req, res) => {
   try {
     const id = Number(req.params.id);
     let next = coerceText(req.body?.stage ?? req.body?.categoria);
     if (!Number.isInteger(id)) return res.status(400).json({ message: "ID inválido" });
     if (!next) return res.status(400).json({ message: "stage requerido" });
-    // Permitimos también las columnas extra del ORDER
     if (!PIPELINE_SET.has(next) && !CANON_CATS.includes(next)) {
       return res.status(400).json({ message: "stage fuera del pipeline" });
     }
@@ -456,7 +451,6 @@ router.patch("/tareas/:id/move", authenticateToken, async (req, res) => {
     if (!estado || !valid.includes(estado))
       return res.status(400).json({ message: "Estado inválido" });
 
-    // si no envían orden, lo pongo al final del carril
     if (orden == null) {
       const mr = await q(
         `SELECT COALESCE(MAX(orden),0) AS m FROM tareas WHERE estado=$1`,
