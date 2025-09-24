@@ -51,6 +51,17 @@ async function pickPipelineTable() {
   return r.rows?.[0]?.ok ? "proyectos" : "clientes";
 }
 
+// No-cache per-request (evita 304/ETag y caching en navegador/CDN)
+function nocache(_req, res, next) {
+  res.set("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+  res.set("Pragma", "no-cache");
+  res.set("Expires", "0");
+  res.set("Surrogate-Control", "no-store");
+  res.set("CDN-Cache-Control", "no-store");
+  res.set("Vary", "Authorization");
+  next();
+}
+
 /* ============================ KPIs ============================ */
 /**
  * GET /analytics/kpis?from=YYYY-MM-DD&to=YYYY-MM-DD&stalled_days=7
@@ -61,10 +72,10 @@ async function pickPipelineTable() {
  *   contacts: { total, new_by_day, contactability_pct, first_touch:{...} },
  *   tasks: { overdue, due_next_7d },
  *   pipeline: { by_source:[], by_owner:[], summary:{ won, lost, win_rate, stages:[{stage,total}] } },
- *   qualification: { ... }   // (se mantiene igual)
+ *   qualification: { ... }
  * }
  */
-router.get("/kpis", authenticateToken, async (req, res) => {
+router.get("/kpis", authenticateToken, nocache, async (req, res) => {
   try {
     const { organizacion_id } = getUserFromReq(req);
     const { fromISO, toISO } = parseRange(req.query);
@@ -73,7 +84,7 @@ router.get("/kpis", authenticateToken, async (req, res) => {
     // ---------- Tabla de pipeline (proyectos ► default / clientes ► compat)
     const PIPE = await pickPipelineTable();
 
-    /* ---------- CONTACTS (se mantiene basado en CLIENTES para que el widget “Clients” siga igual) ---------- */
+    /* ---------- CONTACTS (basado en CLIENTES) ---------- */
     const contactsTotal = await q(
       `
       SELECT COUNT(*)::int AS total
@@ -95,7 +106,7 @@ router.get("/kpis", authenticateToken, async (req, res) => {
       [organizacion_id, fromISO, toISO]
     );
 
-    /* ---------- CONTACTABILITY (primer contacto vía tareas sobre clientes) ---------- */
+    /* ---------- CONTACTABILITY (primer contacto vía tareas) ---------- */
     const contactability = await q(
       `
       WITH touched AS (
@@ -120,7 +131,7 @@ router.get("/kpis", authenticateToken, async (req, res) => {
       [organizacion_id, fromISO, toISO]
     );
 
-    /* ---------- FIRST TOUCH SLA (p50/p90/avg en min) sobre clientes ---------- */
+    /* ---------- FIRST TOUCH SLA (p50/p90/avg en min) ---------- */
     const firstTouch = await q(
       `
       WITH first_task AS (
@@ -173,7 +184,6 @@ router.get("/kpis", authenticateToken, async (req, res) => {
     );
 
     /* ---------- PIPELINE (sobre PROYECTOS si existen) ---------- */
-    // Win/Loss por source (en el rango por created_at; sin updated_at no podemos fechar cambios de etapa)
     const bySource = await q(
       `
       WITH agg AS (
@@ -196,7 +206,6 @@ router.get("/kpis", authenticateToken, async (req, res) => {
       [organizacion_id, fromISO, toISO]
     );
 
-    // Win/Loss por owner/assignee
     const byOwner = await q(
       `
       WITH agg AS (
@@ -219,7 +228,6 @@ router.get("/kpis", authenticateToken, async (req, res) => {
       [organizacion_id, fromISO, toISO]
     );
 
-    // Resumen simple por etapas (incluye Unqualified y Follow-up Missed)
     const stagesAgg = await q(
       `
       SELECT COALESCE(stage,'Uncategorized') AS stage, COUNT(*)::int AS total
@@ -234,7 +242,7 @@ router.get("/kpis", authenticateToken, async (req, res) => {
     const lostTotal = stagesAgg.rows?.find?.((r) => r.stage === "Lost")?.total ?? 0;
     const win_rate  = (wonTotal + lostTotal) > 0 ? Math.round((wonTotal * 100) / (wonTotal + lostTotal)) : 0;
 
-    /* ---------- QUALIFICATION (mantiene definición histórica; usa clientes) ---------- */
+    /* ---------- QUALIFICATION (sobre clientes) ---------- */
     const canonLower = CANON_CATS.map((s) => s.toLowerCase());
 
     const leadsRange = await q(
@@ -356,7 +364,7 @@ router.get("/kpis", authenticateToken, async (req, res) => {
           lost: lostTotal,
           win_rate,
           stages: stagesAgg.rows || [],
-          table: PIPE, // para debug/telemetría en FE si se quiere mostrar “source”
+          table: PIPE,
         },
       },
       qualification: {
