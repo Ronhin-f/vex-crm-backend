@@ -27,17 +27,27 @@ const UPLOAD_DIR = process.env.UPLOAD_DIR || path.join(process.cwd(), "uploads")
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 app.use("/uploads", express.static(UPLOAD_DIR));
 
-// Migraciones mínimas + catálogo
-await initDB();
-
-// Health de respaldo (aunque /health falle al montar)
+/* ───────── Health & readiness ───────── */
+let dbReady = false;
 app.get("/healthz", (_req, res) => res.status(200).json({ ok: true, minimal: true }));
+app.get("/readyz", (_req, res) =>
+  dbReady ? res.json({ ok: true }) : res.status(503).json({ ok: false, dbReady })
+);
 
-// ===== Helper para montaje tolerante a fallos =====
+/* ───────── Migraciones mínimas + catálogo ───────── */
+try {
+  await initDB();
+  dbReady = true;
+} catch (e) {
+  console.error("💥 initDB() falló:", e?.stack || e?.message || e);
+  // seguimos levantando el server; /readyz devolverá 503 hasta que esté OK
+}
+
+/* ───────── Helper de montaje tolerante ───────── */
 async function mount(pathname, modulePath) {
   try {
     const mod = await import(modulePath);
-    const router = mod.default || mod.router || mod;
+    const router = mod.default || mod.router || mod; // soporta default/named
     if (router && typeof router === "function") {
       app.use(pathname, router);
       console.log(`✅ Ruta montada: ${pathname} <- ${modulePath}`);
@@ -51,37 +61,37 @@ async function mount(pathname, modulePath) {
   }
 }
 
-// ===== Montaje de rutas (CRM v2) =====
-await mount("/clientes",       "./routes/clientes.js");      // datos puros de cliente
-await mount("/proyectos",      "./routes/proyectos.js");     // NUEVO: pipeline basado en proyectos/oportunidades
-await mount("/proveedores",    "./routes/proveedores.js");   // NUEVO: proveedores/subcontratistas
+/* ───────── Montaje de rutas ───────── */
+await mount("/clientes",       "./routes/clientes.js");
+await mount("/proyectos",      "./routes/proyectos.js");   // pipeline basado en proyectos
+await mount("/proveedores",    "./routes/proveedores.js"); // proveedores/subcontratistas
 
-// Legacy/compat (apagamos después de migrar FE)
-await mount("/compras",        "./routes/compras.js");       // dejar montado por ahora
+// Legacy/compat
+await mount("/compras",        "./routes/compras.js");
 
 // CRM utilidades
 await mount("/categorias",     "./routes/categorias.js");
-await mount("/kanban",         "./routes/kanban.js");        // Kanban + KPIs (proyectos + compat clientes)
+await mount("/kanban",         "./routes/kanban.js");      // Kanban + KPIs
 await mount("/tareas",         "./routes/tareas.js");
 await mount("/dashboard",      "./routes/dashboard.js");
 
 // KPIs consolidados
-await mount("/analytics",      "./routes/analytics.js");     // /analytics/kpis
+await mount("/analytics",      "./routes/analytics.js");
 
 // Integraciones y otros
-await mount("/upload",         "./routes/upload.js");        // Upload de estimates
-await mount("/modulos",        "./routes/modulos.js");       // Proxy resiliente a Core
+await mount("/upload",         "./routes/upload.js");
+await mount("/modulos",        "./routes/modulos.js");
 await mount("/integraciones",  "./routes/integraciones.js");
-await mount("/recordatorios",  "./routes/recordatorios.js");
-await mount("/jobs",           "./routes/job.js");
+// Ojo con el nombre del archivo real:
+await mount("/jobs",           "./routes/job.js");         // <- si tu archivo es jobs.js, cambiá este path
 await mount("/ai",             "./routes/ai.js");
 await mount("/health",         "./routes/health.js");
 
-// ===== Home / 404 =====
+/* ───────── Home / 404 / errores ───────── */
 app.get("/", (_req, res) => res.json({ ok: true, service: "vex-crm-backend" }));
 app.use((_req, res) => res.status(404).json({ error: "Not found" }));
 
-// ===== Handler global de errores =====
+// Handler global
 /* eslint-disable no-unused-vars */
 app.use((err, _req, res, _next) => {
   console.error("🔥 Unhandled error:", err?.stack || err?.message || err);
@@ -89,10 +99,10 @@ app.use((err, _req, res, _next) => {
 });
 /* eslint-enable no-unused-vars */
 
-// ===== Hardening =====
+// Hardening
 process.on("unhandledRejection", (e) => console.error("UNHANDLED REJECTION:", e));
 process.on("uncaughtException",  (e) => console.error("UNCAUGHT EXCEPTION:", e));
 
-// ===== Start =====
+// Start
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`✅ VEX CRM en :${PORT}`));
+app.listen(PORT, () => console.log(`✅ VEX CRM en :${PORT} | dbReady=${dbReady}`));

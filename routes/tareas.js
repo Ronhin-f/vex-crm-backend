@@ -27,7 +27,6 @@ function coerceText(v) {
   const s = String(v).trim();
   return s.length ? s : null;
 }
-
 function coerceDate(v) {
   if (!v) return null;
   const d = new Date(v);
@@ -35,38 +34,52 @@ function coerceDate(v) {
 }
 
 const VALID_ESTADOS = ["todo", "doing", "waiting", "done"];
+const ESTADO_ORDER_SQL = `
+  CASE t.estado
+    WHEN 'todo'    THEN 1
+    WHEN 'doing'   THEN 2
+    WHEN 'waiting' THEN 3
+    WHEN 'done'    THEN 4
+    ELSE 99
+  END
+`;
 
 /* =========================== GET =========================== */
 /**
  * Lista tareas de la organización, con join a cliente.
- * Query opcionales: estado, q (busca en título/descr), cliente_id
+ * Query: estado, q (título/descr), cliente_id
  */
 router.get("/", authenticateToken, async (req, res) => {
   try {
     const { organizacion_id } = getUserFromReq(req);
-    const { estado, q: qtext, cliente_id } = req.query || {};
+    let { estado, q: qtext, cliente_id } = req.query || {};
 
     const params = [];
     const where = [];
 
-    if (organizacion_id) {
+    if (organizacion_id != null) {
       params.push(organizacion_id);
       where.push(`t.organizacion_id = $${params.length}`);
     }
-    if (estado) {
+
+    // solo aceptar estados válidos; si no, ignorar filtro
+    if (estado && VALID_ESTADOS.includes(String(estado))) {
       params.push(String(estado));
       where.push(`t.estado = $${params.length}`);
     }
+
     if (cliente_id) {
       params.push(parseInt(cliente_id, 10));
       where.push(`t.cliente_id = $${params.length}`);
     }
+
     if (qtext) {
-      const like = `%${String(qtext).toLowerCase()}%`;
+      const like = `%${String(qtext).trim().toLowerCase()}%`;
+      // usamos COALESCE para evitar nulls en descripcion
       params.push(like, like);
-      where.push(
-        `(lower(t.titulo) LIKE $${params.length - 1} OR lower(t.descripcion) LIKE $${params.length})`
-      );
+      const i1 = params.length - 1;
+      const i2 = params.length;
+      where.push(`(lower(t.titulo) LIKE $${i1} OR lower(COALESCE(t.descripcion,'')) LIKE $${i2})`);
     }
 
     const r = await q(
@@ -78,7 +91,7 @@ router.get("/", authenticateToken, async (req, res) => {
       FROM tareas t
       LEFT JOIN clientes c ON c.id = t.cliente_id
       ${where.length ? "WHERE " + where.join(" AND ") : ""}
-      ORDER BY t.estado ASC, t.orden ASC, t.created_at DESC, t.id DESC
+      ORDER BY ${ESTADO_ORDER_SQL}, t.orden ASC, t.created_at DESC, t.id DESC
       `,
       params
     );
@@ -95,7 +108,7 @@ router.get("/", authenticateToken, async (req, res) => {
  * Crea una tarea.
  * Body mínimo: { titulo }
  * Opcionales: descripcion, cliente_id, vence_en, estado
- * - Si no envían estado, se usa 'todo'
+ * - Si no envían estado, 'todo'
  * - Si no envían orden, se coloca al final del carril
  */
 router.post("/", authenticateToken, async (req, res) => {
@@ -121,11 +134,13 @@ router.post("/", authenticateToken, async (req, res) => {
     vence_en = coerceDate(vence_en);
     cliente_id = cliente_id != null ? parseInt(cliente_id, 10) : null;
 
-    // Si no envían orden, lo coloco al final del carril
+    // Si no envían orden, lo coloco al final del carril (scoped a la org)
     if (orden == null) {
       const r = await q(
-        `SELECT COALESCE(MAX(orden),0) AS m FROM tareas WHERE estado = $1 AND organizacion_id = $2`,
-        [estado, organizacion_id]
+        `SELECT COALESCE(MAX(orden),0) AS m
+           FROM tareas
+          WHERE estado = $1 AND (${organizacion_id != null ? "organizacion_id = $2" : "organizacion_id IS NULL"})`,
+        organizacion_id != null ? [estado, organizacion_id] : [estado]
       );
       orden = (r.rows?.[0]?.m ?? 0) + 1;
     }
@@ -177,14 +192,15 @@ async function updateTaskGeneric(req, res, { emptyAsComplete = false } = {}) {
       }
     }
 
-    // Si no vino nada y se permite "marcar como hecha" por defecto (PATCH vacío desde el front)
+    // Compat: PATCH vacío = marcar hecha y mover al final de 'done'
     if (!fields.length && emptyAsComplete) {
-      // mover a 'done' y marcar completada, colocando al final del carril
-      const ordenQ = await q(
-        `SELECT COALESCE(MAX(orden),0) AS m FROM tareas WHERE estado='done' AND organizacion_id=$1`,
-        [organizacion_id]
+      const rOrden = await q(
+        `SELECT COALESCE(MAX(orden),0) AS m
+           FROM tareas
+          WHERE estado='done' AND (${organizacion_id != null ? "organizacion_id = $1" : "organizacion_id IS NULL"})`,
+        organizacion_id != null ? [organizacion_id] : []
       );
-      const nextOrden = (ordenQ.rows?.[0]?.m ?? 0) + 1;
+      const nextOrden = (rOrden.rows?.[0]?.m ?? 0) + 1;
 
       const rDone = await q(
         `
@@ -192,10 +208,10 @@ async function updateTaskGeneric(req, res, { emptyAsComplete = false } = {}) {
            SET estado='done',
                completada=TRUE,
                orden=$1
-         WHERE id=$2 AND organizacion_id=$3
+         WHERE id=$2 AND (${organizacion_id != null ? "organizacion_id = $3" : "organizacion_id IS NULL"})
          RETURNING id, titulo, descripcion, cliente_id, estado, orden, vence_en, completada, created_at, usuario_email
         `,
-        [nextOrden, id, organizacion_id]
+        organizacion_id != null ? [nextOrden, id, organizacion_id] : [nextOrden, id]
       );
 
       if (!rDone.rowCount) return res.status(404).json({ message: "Tarea no encontrada" });
@@ -205,13 +221,14 @@ async function updateTaskGeneric(req, res, { emptyAsComplete = false } = {}) {
     if (!fields.length) return res.status(400).json({ message: "Nada para actualizar" });
 
     values.push(id);
-    values.push(organizacion_id);
+    if (organizacion_id != null) values.push(organizacion_id);
 
     const r = await q(
       `
       UPDATE tareas
          SET ${fields.join(", ")}
-       WHERE id = $${idx++} AND organizacion_id = $${idx}
+       WHERE id = $${idx++}
+         AND (${organizacion_id != null ? "organizacion_id = $"+idx : "organizacion_id IS NULL"})
        RETURNING id, titulo, descripcion, cliente_id, estado, orden, vence_en, completada, created_at, usuario_email
       `,
       values
@@ -238,10 +255,7 @@ router.put("/:id", authenticateToken, (req, res) =>
 );
 
 /* =================== PATCH /complete (toggle) =================== */
-/**
- * Marca/desmarca completada. Body: { completada: boolean }
- * (El Kanban /kanban/tareas/:id/move ya actualiza completada cuando estado='done')
- */
+/** Marca/desmarca completada. Body: { completada: boolean } */
 router.patch("/:id/complete", authenticateToken, async (req, res) => {
   try {
     const { organizacion_id } = getUserFromReq(req);
@@ -254,10 +268,11 @@ router.patch("/:id/complete", authenticateToken, async (req, res) => {
       `
       UPDATE tareas
          SET completada = $1
-       WHERE id = $2 AND organizacion_id = $3
+       WHERE id = $2
+         AND (${organizacion_id != null ? "organizacion_id = $3" : "organizacion_id IS NULL"})
        RETURNING id, titulo, descripcion, cliente_id, estado, orden, vence_en, completada, created_at, usuario_email
       `,
-      [completada, id, organizacion_id]
+      organizacion_id != null ? [completada, id, organizacion_id] : [completada, id]
     );
 
     if (!r.rowCount) return res.status(404).json({ message: "Tarea no encontrada" });
@@ -276,8 +291,12 @@ router.delete("/:id", authenticateToken, async (req, res) => {
     if (!Number.isInteger(id)) return res.status(400).json({ message: "ID inválido" });
 
     const r = await q(
-      `DELETE FROM tareas WHERE id = $1 AND organizacion_id = $2`,
-      [id, organizacion_id]
+      `
+      DELETE FROM tareas
+       WHERE id = $1
+         AND (${organizacion_id != null ? "organizacion_id = $2" : "organizacion_id IS NULL"})
+      `,
+      organizacion_id != null ? [id, organizacion_id] : [id]
     );
 
     if (!r.rowCount) return res.status(404).json({ message: "Tarea no encontrada" });
