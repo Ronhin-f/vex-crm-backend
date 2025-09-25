@@ -34,6 +34,8 @@ function coerceDate(v) {
   return isNaN(d.getTime()) ? null : d.toISOString();
 }
 
+const VALID_ESTADOS = ["todo", "doing", "waiting", "done"];
+
 /* =========================== GET =========================== */
 /**
  * Lista tareas de la organización, con join a cliente.
@@ -62,14 +64,16 @@ router.get("/", authenticateToken, async (req, res) => {
     if (qtext) {
       const like = `%${String(qtext).toLowerCase()}%`;
       params.push(like, like);
-      where.push(`(lower(t.titulo) LIKE $${params.length - 1} OR lower(t.descripcion) LIKE $${params.length})`);
+      where.push(
+        `(lower(t.titulo) LIKE $${params.length - 1} OR lower(t.descripcion) LIKE $${params.length})`
+      );
     }
 
     const r = await q(
       `
       SELECT
         t.id, t.titulo, t.descripcion, t.estado, t.orden, t.completada,
-        t.vence_en, t.created_at, t.cliente_id,
+        t.vence_en, t.created_at, t.cliente_id, t.usuario_email,
         c.nombre AS cliente_nombre
       FROM tareas t
       LEFT JOIN clientes c ON c.id = t.cliente_id
@@ -113,7 +117,7 @@ router.post("/", authenticateToken, async (req, res) => {
 
     titulo = titulo.trim();
     descripcion = coerceText(descripcion);
-    estado = ["todo", "doing", "waiting", "done"].includes(estado) ? estado : "todo";
+    estado = VALID_ESTADOS.includes(estado) ? estado : "todo";
     vence_en = coerceDate(vence_en);
     cliente_id = cliente_id != null ? parseInt(cliente_id, 10) : null;
 
@@ -134,7 +138,7 @@ router.post("/", authenticateToken, async (req, res) => {
       VALUES
         ($1,$2,$3,$4,$5,$6,
          FALSE, $7, $8, NOW())
-      RETURNING id, titulo, descripcion, cliente_id, estado, orden, vence_en, completada, created_at
+      RETURNING id, titulo, descripcion, cliente_id, estado, orden, vence_en, completada, created_at, usuario_email
       `,
       [titulo, descripcion, cliente_id, estado, orden, vence_en, usuario_email, organizacion_id]
     );
@@ -146,12 +150,8 @@ router.post("/", authenticateToken, async (req, res) => {
   }
 });
 
-/* =========================== PATCH ========================= */
-/**
- * Update parcial de una tarea.
- * Campos permitidos: titulo, descripcion, cliente_id, vence_en, estado, orden, completada
- */
-router.patch("/:id", authenticateToken, async (req, res) => {
+/* ========== UPDATE genérico: PATCH y PUT comparten lógica ========== */
+async function updateTaskGeneric(req, res, { emptyAsComplete = false } = {}) {
   try {
     const { organizacion_id } = getUserFromReq(req);
     const id = Number(req.params.id);
@@ -163,18 +163,43 @@ router.patch("/:id", authenticateToken, async (req, res) => {
     let idx = 1;
 
     for (const k of allowed) {
-      if (k in req.body) {
+      if (k in (req.body || {})) {
         let v = req.body[k];
         if (k === "titulo" || k === "descripcion") v = coerceText(v);
         if (k === "vence_en") v = coerceDate(v);
         if (k === "cliente_id") v = v != null ? parseInt(v, 10) : null;
-        if (k === "estado" && v) v = ["todo","doing","waiting","done"].includes(v) ? v : "todo";
+        if (k === "estado" && v) v = VALID_ESTADOS.includes(v) ? v : "todo";
         if (k === "orden" && v != null) v = parseInt(v, 10);
         if (k === "completada") v = !!v;
 
         fields.push(`${k} = $${idx++}`);
         values.push(v);
       }
+    }
+
+    // Si no vino nada y se permite "marcar como hecha" por defecto (PATCH vacío desde el front)
+    if (!fields.length && emptyAsComplete) {
+      // mover a 'done' y marcar completada, colocando al final del carril
+      const ordenQ = await q(
+        `SELECT COALESCE(MAX(orden),0) AS m FROM tareas WHERE estado='done' AND organizacion_id=$1`,
+        [organizacion_id]
+      );
+      const nextOrden = (ordenQ.rows?.[0]?.m ?? 0) + 1;
+
+      const rDone = await q(
+        `
+        UPDATE tareas
+           SET estado='done',
+               completada=TRUE,
+               orden=$1
+         WHERE id=$2 AND organizacion_id=$3
+         RETURNING id, titulo, descripcion, cliente_id, estado, orden, vence_en, completada, created_at, usuario_email
+        `,
+        [nextOrden, id, organizacion_id]
+      );
+
+      if (!rDone.rowCount) return res.status(404).json({ message: "Tarea no encontrada" });
+      return res.json(rDone.rows[0]);
     }
 
     if (!fields.length) return res.status(400).json({ message: "Nada para actualizar" });
@@ -187,18 +212,30 @@ router.patch("/:id", authenticateToken, async (req, res) => {
       UPDATE tareas
          SET ${fields.join(", ")}
        WHERE id = $${idx++} AND organizacion_id = $${idx}
-       RETURNING id, titulo, descripcion, cliente_id, estado, orden, vence_en, completada, created_at
+       RETURNING id, titulo, descripcion, cliente_id, estado, orden, vence_en, completada, created_at, usuario_email
       `,
       values
     );
 
     if (!r.rowCount) return res.status(404).json({ message: "Tarea no encontrada" });
-    res.json(r.rows[0]);
+    return res.json(r.rows[0]);
   } catch (e) {
-    console.error("[PATCH /tareas/:id]", e?.stack || e?.message || e);
-    res.status(500).json({ message: "Error al editar tarea" });
+    console.error("[UPDATE /tareas/:id]", e?.stack || e?.message || e);
+    return res.status(500).json({ message: "Error al editar tarea" });
   }
-});
+}
+
+/* =========================== PATCH ========================= */
+// PATCH vacío = marcar como hecha (compat con front viejo)
+router.patch("/:id", authenticateToken, (req, res) =>
+  updateTaskGeneric(req, res, { emptyAsComplete: true })
+);
+
+/* ============================ PUT ========================== */
+// PUT = update (el front lo usa para editar y para reabrir)
+router.put("/:id", authenticateToken, (req, res) =>
+  updateTaskGeneric(req, res, { emptyAsComplete: false })
+);
 
 /* =================== PATCH /complete (toggle) =================== */
 /**
@@ -218,7 +255,7 @@ router.patch("/:id/complete", authenticateToken, async (req, res) => {
       UPDATE tareas
          SET completada = $1
        WHERE id = $2 AND organizacion_id = $3
-       RETURNING id, titulo, estado, orden, vence_en, completada
+       RETURNING id, titulo, descripcion, cliente_id, estado, orden, vence_en, completada, created_at, usuario_email
       `,
       [completada, id, organizacion_id]
     );
