@@ -221,11 +221,10 @@ export async function initDB() {
   `);
 
   /* ============================================================
-   *  MIGRACIONES IDEMPOTENTES PARA INSTALACIONES VIEJAS
-   *  (esto es lo que te faltaba y causaba los 500)
+   *  MIGRACIONES IDEMPOTENTES (evitan 500 por columnas faltantes)
    * ============================================================ */
 
-  // ---- TAREAS: asegurar todas las columnas (si la tabla ya existía distinta)
+  // ---- TAREAS: asegurar columnas
   await q(`ALTER TABLE public.tareas
     ADD COLUMN IF NOT EXISTS cliente_id      INTEGER,
     ADD COLUMN IF NOT EXISTS estado          TEXT        DEFAULT 'todo',
@@ -251,12 +250,13 @@ export async function initDB() {
     END$$;
   `);
 
-  // ---- INTEGRACIONES: asegurar columnas nuevas
+  // ---- INTEGRACIONES: asegurar columnas (y org_id)
   await q(`ALTER TABLE public.integraciones
-    ADD COLUMN IF NOT EXISTS slack_webhook_url   TEXT,
+    ADD COLUMN IF NOT EXISTS organizacion_id    TEXT,
+    ADD COLUMN IF NOT EXISTS slack_webhook_url  TEXT,
     ADD COLUMN IF NOT EXISTS whatsapp_meta_token TEXT,
-    ADD COLUMN IF NOT EXISTS whatsapp_phone_id   TEXT,
-    ADD COLUMN IF NOT EXISTS updated_at          TIMESTAMPTZ DEFAULT NOW();`);
+    ADD COLUMN IF NOT EXISTS whatsapp_phone_id  TEXT,
+    ADD COLUMN IF NOT EXISTS updated_at         TIMESTAMPTZ DEFAULT NOW();`);
 
   // ===== Columnas que pueden faltar en otras tablas =====
   await q(`ALTER TABLE clientes    ADD COLUMN IF NOT EXISTS email TEXT;`);
@@ -272,7 +272,6 @@ export async function initDB() {
   await q(`ALTER TABLE clientes    ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW();`);
   await q(`ALTER TABLE clientes    ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW();`);
 
-  // Proyectos: asegurar todas las columnas (por compat)
   await q(`ALTER TABLE proyectos   ADD COLUMN IF NOT EXISTS descripcion TEXT;`);
   await q(`ALTER TABLE proyectos   ADD COLUMN IF NOT EXISTS cliente_id INTEGER;`);
   await q(`ALTER TABLE proyectos   ADD COLUMN IF NOT EXISTS stage TEXT DEFAULT 'Incoming Leads';`);
@@ -286,7 +285,6 @@ export async function initDB() {
   await q(`ALTER TABLE proyectos   ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW();`);
   await q(`ALTER TABLE proyectos   ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW();`);
 
-  // Proveedores: asegurar columnas
   await q(`ALTER TABLE proveedores ADD COLUMN IF NOT EXISTS contacto TEXT;`);
   await q(`ALTER TABLE proveedores ADD COLUMN IF NOT EXISTS telefono TEXT;`);
   await q(`ALTER TABLE proveedores ADD COLUMN IF NOT EXISTS email TEXT;`);
@@ -351,6 +349,20 @@ export async function initDB() {
   await q(`
     CREATE UNIQUE INDEX IF NOT EXISTS categorias_org_nombre_lower_uniq
       ON categorias (organizacion_id, lower(nombre));
+  `);
+
+  // Evita duplicar si ya hay un UNIQUE implícito del CREATE TABLE
+  await q(`
+    DO $$
+    BEGIN
+      IF NOT EXISTS (
+        SELECT 1 FROM pg_indexes 
+         WHERE schemaname='public' AND tablename='integraciones'
+           AND (indexname='integraciones_org_unique' OR indexname='integraciones_organizacion_id_key')
+      ) THEN
+        CREATE UNIQUE INDEX integraciones_org_unique ON integraciones(organizacion_id);
+      END IF;
+    END$$;
   `);
 
   // ===== Seed/Upsert del pipeline canónico (global NULL) =====
