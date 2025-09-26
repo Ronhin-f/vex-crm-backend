@@ -7,6 +7,12 @@ import path from "node:path";
 import { applySecurity } from "./middleware/security.js";
 import { initDB } from "./utils/db.js";
 
+// ✅ Defaults útiles (no pisan Railway)
+process.env.SLACK_WEBHOOK_FALLBACK_CHANNEL ??= "#reminders-and-follow-ups";
+process.env.REMINDER_CRON ??= "*/10 * * * *";
+
+import { scheduleReminders } from "./workers/reminders.worker.js";
+
 const app = express();
 app.set("trust proxy", true);
 
@@ -63,8 +69,9 @@ async function mount(pathname, modulePath) {
 
 /* ───────── Montaje de rutas ───────── */
 await mount("/clientes",       "./routes/clientes.js");
-await mount("/proyectos",      "./routes/proyectos.js");   // pipeline basado en proyectos
-await mount("/proveedores",    "./routes/proveedores.js"); // proveedores/subcontratistas
+await mount("/proyectos",      "./routes/proyectos.js");          // pipeline basado en proyectos
+await mount("/proyectos",      "./routes/proyectos.assign.js");   // reasignación + follow-up
+await mount("/proveedores",    "./routes/proveedores.js");        // proveedores/subcontratistas
 
 // Legacy/compat
 await mount("/compras",        "./routes/compras.js");
@@ -87,6 +94,9 @@ await mount("/jobs",           "./routes/job.js");         // <- si tu archivo e
 await mount("/ai",             "./routes/ai.js");
 await mount("/health",         "./routes/health.js");
 
+// 🔌 Endpoint público (funnel web → leads)
+await mount("/web",            "./routes/web.js");
+
 /* ───────── Home / 404 / errores ───────── */
 app.get("/", (_req, res) => res.json({ ok: true, service: "vex-crm-backend" }));
 app.use((_req, res) => res.status(404).json({ error: "Not found" }));
@@ -102,6 +112,12 @@ app.use((err, _req, res, _next) => {
 // Hardening
 process.on("unhandledRejection", (e) => console.error("UNHANDLED REJECTION:", e));
 process.on("uncaughtException",  (e) => console.error("UNCAUGHT EXCEPTION:", e));
+
+/* ───────── Schedulers ───────── */
+scheduleReminders();
+console.log(
+  `🕒 Reminders ON cron=${process.env.REMINDER_CRON} tz=America/Argentina/Mendoza | fallbackChannel=${process.env.SLACK_WEBHOOK_FALLBACK_CHANNEL || "(none)"}`
+);
 
 // Start
 const PORT = process.env.PORT || 3000;

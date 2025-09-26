@@ -148,11 +148,12 @@ export async function initDB() {
       created_at TIMESTAMPTZ DEFAULT NOW()
     );
 
-    /* ===== INTEGRACIONES (forma “ideal”) ===== */
+    /* ===== INTEGRACIONES (tabla por org) ===== */
     CREATE TABLE IF NOT EXISTS integraciones (
       id SERIAL PRIMARY KEY,
       organizacion_id TEXT UNIQUE,
       slack_webhook_url TEXT,
+      slack_default_channel TEXT,
       whatsapp_meta_token TEXT,
       whatsapp_phone_id TEXT,
       ios_push_key_id TEXT,
@@ -161,6 +162,7 @@ export async function initDB() {
       updated_at TIMESTAMPTZ DEFAULT NOW()
     );
 
+    /* ===== RECORDATORIOS ===== */
     CREATE TABLE IF NOT EXISTS recordatorios (
       id SERIAL PRIMARY KEY,
       organizacion_id TEXT NOT NULL,
@@ -252,11 +254,23 @@ export async function initDB() {
 
   // ---- INTEGRACIONES: asegurar columnas (y org_id)
   await q(`ALTER TABLE public.integraciones
-    ADD COLUMN IF NOT EXISTS organizacion_id    TEXT,
-    ADD COLUMN IF NOT EXISTS slack_webhook_url  TEXT,
-    ADD COLUMN IF NOT EXISTS whatsapp_meta_token TEXT,
-    ADD COLUMN IF NOT EXISTS whatsapp_phone_id  TEXT,
-    ADD COLUMN IF NOT EXISTS updated_at         TIMESTAMPTZ DEFAULT NOW();`);
+    ADD COLUMN IF NOT EXISTS organizacion_id      TEXT,
+    ADD COLUMN IF NOT EXISTS slack_webhook_url    TEXT,
+    ADD COLUMN IF NOT EXISTS slack_default_channel TEXT,
+    ADD COLUMN IF NOT EXISTS whatsapp_meta_token  TEXT,
+    ADD COLUMN IF NOT EXISTS whatsapp_phone_id    TEXT,
+    ADD COLUMN IF NOT EXISTS updated_at           TIMESTAMPTZ DEFAULT NOW();`);
+
+  // ---- SLACK USERS: tabla de mapeo email → slack_user_id
+  await q(`
+    CREATE TABLE IF NOT EXISTS slack_users (
+      id SERIAL PRIMARY KEY,
+      organizacion_id TEXT NOT NULL,
+      email TEXT NOT NULL,
+      slack_user_id TEXT NOT NULL,
+      UNIQUE (organizacion_id, email)
+    );
+  `);
 
   // ===== Columnas que pueden faltar en otras tablas =====
   await q(`ALTER TABLE clientes    ADD COLUMN IF NOT EXISTS email TEXT;`);
@@ -310,6 +324,7 @@ export async function initDB() {
     "pedido_items",
     "proyectos",
     "proveedores",
+    "slack_users",
   ];
   for (const t of ORG_TABLES) {
     await ensureOrgText(t).catch(() => {});
@@ -331,6 +346,8 @@ export async function initDB() {
   await q(`CREATE INDEX IF NOT EXISTS idx_tareas_vence        ON tareas(vence_en);`);
   await q(`CREATE INDEX IF NOT EXISTS idx_tareas_compl        ON tareas(completada);`);
   await q(`CREATE INDEX IF NOT EXISTS idx_tareas_cliente      ON tareas(cliente_id);`);
+  // índice útil para follow-ups
+  await q(`CREATE INDEX IF NOT EXISTS idx_tareas_usuario_vence ON tareas(usuario_email, vence_en);`);
 
   await q(`CREATE INDEX IF NOT EXISTS idx_compras_org         ON compras(organizacion_id);`);
   await q(`CREATE INDEX IF NOT EXISTS idx_compras_fecha       ON compras(fecha);`);
@@ -363,6 +380,13 @@ export async function initDB() {
         CREATE UNIQUE INDEX integraciones_org_unique ON integraciones(organizacion_id);
       END IF;
     END$$;
+  `);
+
+  // Índice parcial para recordatorios pendientes (cron más eficiente)
+  await q(`
+    CREATE INDEX IF NOT EXISTS idx_recordatorios_pend
+      ON recordatorios(enviar_en)
+      WHERE estado = 'pendiente';
   `);
 
   // ===== Seed/Upsert del pipeline canónico (global NULL) =====
