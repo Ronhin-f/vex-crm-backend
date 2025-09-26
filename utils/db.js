@@ -26,6 +26,9 @@ function buildPoolConfig() {
 }
 
 export const db = new Pool(buildPoolConfig());
+// 👇 compat: algunos módulos esperan `{ pool }`
+export const pool = db;
+
 export async function q(text, params = []) {
   // console.log("[SQL]", text, params);
   return db.query(text, params);
@@ -346,7 +349,6 @@ export async function initDB() {
   await q(`CREATE INDEX IF NOT EXISTS idx_tareas_vence        ON tareas(vence_en);`);
   await q(`CREATE INDEX IF NOT EXISTS idx_tareas_compl        ON tareas(completada);`);
   await q(`CREATE INDEX IF NOT EXISTS idx_tareas_cliente      ON tareas(cliente_id);`);
-  // índice útil para follow-ups
   await q(`CREATE INDEX IF NOT EXISTS idx_tareas_usuario_vence ON tareas(usuario_email, vence_en);`);
 
   await q(`CREATE INDEX IF NOT EXISTS idx_compras_org         ON compras(organizacion_id);`);
@@ -368,7 +370,6 @@ export async function initDB() {
       ON categorias (organizacion_id, lower(nombre));
   `);
 
-  // Evita duplicar si ya hay un UNIQUE implícito del CREATE TABLE
   await q(`
     DO $$
     BEGIN
@@ -382,7 +383,6 @@ export async function initDB() {
     END$$;
   `);
 
-  // Índice parcial para recordatorios pendientes (cron más eficiente)
   await q(`
     CREATE INDEX IF NOT EXISTS idx_recordatorios_pend
       ON recordatorios(enviar_en)
@@ -414,7 +414,6 @@ export async function initDB() {
   await q(`UPDATE proyectos SET stage = COALESCE(stage, 'Incoming Leads');`);
   await q(`UPDATE proyectos SET categoria = COALESCE(categoria, stage);`);
 
-  // Backfill en tareas para evitar NULLs molestos
   await q(`UPDATE tareas SET estado = COALESCE(NULLIF(TRIM(estado), ''), 'todo')
            WHERE estado IS NULL OR TRIM(estado) = '';`);
   await q(`UPDATE tareas SET completada = COALESCE(completada, FALSE) WHERE completada IS NULL;`);
