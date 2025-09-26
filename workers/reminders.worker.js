@@ -1,54 +1,63 @@
-// workers/reminders.worker.js
+// routes/workers/reminders.worker.js (ACTUALIZADO)
 import cron from "node-cron";
-import { pool } from "../utils/db.js";
-import { postSlack } from "../services/slack.service.js";
+import { q } from "../../utils/db.js";        // ← usamos q(), no pool
+import { postSlack } from "../../services/slack.service.js";
 
-async function runReminders() {
-  // Tomamos hasta 100 por tanda para no saturar
-  const { rows } = await pool.query(`
-    SELECT r.id, r.tarea_id, r.payload, r.motivo,
-           t.usuario_email, t.vence_en, t.titulo,
-           COALESCE(c.org_id, o.id) AS org_id
+/**
+ * Busca recordatorios vencidos (estado='pendiente') y los envía a Slack
+ * usando la integración de la organización (tabla integraciones).
+ */
+async function runRemindersOnce() {
+  const { rows } = await q(`
+    SELECT
+      r.id,
+      COALESCE(r.mensaje, r.titulo, t.titulo, 'Recordatorio') AS body,
+      r.enviar_en,
+      COALESCE(r.organizacion_id, c.organizacion_id)          AS org_id,
+      t.usuario_email,
+      t.vence_en
     FROM recordatorios r
-    JOIN tareas t ON t.id = r.tarea_id
+    LEFT JOIN tareas   t ON t.id = r.tarea_id
     LEFT JOIN clientes c ON c.id = t.cliente_id
-    LEFT JOIN organizaciones o ON o.id = c.org_id -- fallback por si hiciera falta
-    WHERE r.enviado = FALSE
+    WHERE r.estado = 'pendiente'
       AND r.enviar_en <= NOW()
     ORDER BY r.enviar_en ASC
-    LIMIT 100
+    LIMIT 100;
   `);
 
-  for (const row of rows) {
-    const fechaFmt = new Date(row.vence_en).toLocaleString("es-AR");
-    const link = row.payload?.link || "(sin link)";
+  for (const r of rows) {
+    try {
+      const due = r.vence_en ? new Date(r.vence_en).toLocaleString("es-AR") : null;
+      const text = due ? `🔔 ${r.body} (vence ${due})` : `🔔 ${r.body}`;
 
-    const text =
-      row.motivo === "followup_reminder"
-        ? `⏰ Recordatorio follow-up: ${row.titulo} – ${link} – vence ${fechaFmt}`
-        : `🔔 Recordatorio: ${row.titulo} – ${link} – vence ${fechaFmt}`;
+      if (!r.org_id) throw new Error("org_id no resuelto para el recordatorio");
 
-    await postSlack({
-      orgId: row.org_id,
-      text,
-      emailAsignado: row.usuario_email,
-    });
+      await postSlack({ orgId: r.org_id, text, emailAsignado: r.usuario_email });
 
-    await pool.query(
-      `UPDATE recordatorios
-       SET enviado = TRUE, enviado_en = NOW()
-       WHERE id = $1`,
-      [row.id]
-    );
+      await q(
+        `UPDATE recordatorios
+           SET estado='enviado', sent_at=NOW(), last_error=NULL
+         WHERE id=$1`,
+        [r.id]
+      );
+      console.log("[reminders] enviado id", r.id);
+    } catch (e) {
+      console.error("[reminders] fallo id", r.id, e.message);
+      await q(
+        `UPDATE recordatorios
+            SET intento_count = COALESCE(intento_count,0)+1,
+                last_error=$2
+          WHERE id=$1`,
+        [r.id, String(e?.message || e)]
+      );
+    }
   }
 }
 
 export function scheduleReminders() {
-  const expr = process.env.REMINDER_CRON || "*/10 * * * *";
-  cron.schedule(expr, runReminders, {
-    timezone: "America/Argentina/Mendoza",
-  });
-
-  // Opcional: disparar al boot para limpiar pendientes
-  // runReminders().catch(() => {});
+  // Para probar rápido, cada 1 min. Podés pasar REMINDER_CRON en Railway.
+  const expr = process.env.REMINDER_CRON || "*/1 * * * *";
+  cron.schedule(expr, runRemindersOnce, { timezone: "UTC" });
+  // Ejecuta 1 vez al boot para limpiar pendientes
+  runRemindersOnce().catch(() => {});
 }
