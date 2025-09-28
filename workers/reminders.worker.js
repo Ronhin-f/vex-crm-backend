@@ -1,6 +1,6 @@
 // workers/reminders.worker.js — ESM
 import cron from "node-cron";
-import { db, q } from "../utils/db.js"; // <- ¡import relativo!
+import { pool } from "../utils/db.js"; // <- ¡import relativo!
 
 const CRON = process.env.REMINDER_CRON || "*/10 * * * *";
 const TZ = process.env.TZ || "America/Argentina/Mendoza";
