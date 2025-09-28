@@ -1,6 +1,6 @@
 // workers/reminders.worker.js — ESM
 import cron from "node-cron";
-import { pool } from "../utils/db.js"; // <- ¡import relativo!
+import { pool } from "../utils/db.js"; // <- import correcto
 
 const CRON = process.env.REMINDER_CRON || "*/10 * * * *";
 const TZ = process.env.TZ || "America/Argentina/Mendoza";
@@ -13,6 +13,9 @@ const FALLBACK_CHANNEL =
 // Si usabas un org “por defecto”, ahora como TEXT:
 const FALLBACK_ORG_ID = (process.env.FALLBACK_ORG_ID || "10").toString();
 
+// Helper simple para queries fuera de la transacción
+const q = (text, params = []) => pool.query(text, params);
+
 /**
  * Corre una pasada:
  * - Toma hasta 100 recordatorios vencidos con FOR UPDATE SKIP LOCKED
@@ -21,7 +24,7 @@ const FALLBACK_ORG_ID = (process.env.FALLBACK_ORG_ID || "10").toString();
  * - Marca enviado / reprograma con backoff simple si falla
  */
 export async function runRemindersOnce() {
-  const client = await db.connect();
+  const client = await pool.connect(); // <- corregido
   let grabbed = [];
   try {
     await client.query("BEGIN");
@@ -70,6 +73,8 @@ export async function runRemindersOnce() {
   }
 
   // 2) Envío uno por uno (fuera de la transacción)
+  if (!grabbed.length) return;
+
   for (const r of grabbed) {
     const ok = await sendToSlack(r).catch(() => false);
 
