@@ -232,6 +232,17 @@ export async function initDB() {
     );
   `);
 
+  /* ====== 🔧 Backfill de columnas faltantes en proyectos (alinear con rutas) ====== */
+  await q(`
+    ALTER TABLE public.proyectos
+      ADD COLUMN IF NOT EXISTS source           TEXT,
+      ADD COLUMN IF NOT EXISTS assignee         TEXT,
+      ADD COLUMN IF NOT EXISTS due_date         TIMESTAMPTZ,
+      ADD COLUMN IF NOT EXISTS estimate_url     TEXT,
+      ADD COLUMN IF NOT EXISTS estimate_file    TEXT,
+      ADD COLUMN IF NOT EXISTS contacto_nombre  TEXT;
+  `);
+
   /* =========================================================
    *  Migraciones idempotentes (columnas que podrían faltar)
    * ========================================================= */
@@ -327,10 +338,19 @@ export async function initDB() {
   await q(`CREATE INDEX IF NOT EXISTS idx_proyectos_updated    ON proyectos(updated_at);`);
   await q(`CREATE INDEX IF NOT EXISTS idx_proyectos_stage      ON proyectos(stage);`);
   await q(`CREATE INDEX IF NOT EXISTS idx_proyectos_cliente    ON proyectos(cliente_id);`);
+  await q(`CREATE INDEX IF NOT EXISTS idx_proyectos_assignee   ON proyectos(assignee);`);
+  await q(`CREATE INDEX IF NOT EXISTS idx_proyectos_source     ON proyectos(source);`);
+  await q(`CREATE INDEX IF NOT EXISTS idx_proyectos_due        ON proyectos(due_date);`);
 
-  await q(`CREATE INDEX IF NOT EXISTS idx_proveedores_org      ON proveedores(organizacion_id);`);
-  await q(`CREATE INDEX IF NOT EXISTS idx_proveedores_activo   ON proveedores(activo);`);
-  await q(`CREATE INDEX IF NOT EXISTS idx_proveedores_updated  ON proveedores(updated_at);`);
+  await q(`
+    CREATE INDEX IF NOT EXISTS idx_proveedores_org      ON proveedores(organizacion_id);
+  `);
+  await q(`
+    CREATE INDEX IF NOT EXISTS idx_proveedores_activo   ON proveedores(activo);
+  `);
+  await q(`
+    CREATE INDEX IF NOT EXISTS idx_proveedores_updated  ON proveedores(updated_at);
+  `);
 
   await q(`
     CREATE UNIQUE INDEX IF NOT EXISTS categorias_org_nombre_lower_uniq
