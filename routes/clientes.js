@@ -1,4 +1,4 @@
-// routes/clientes.js — CRUD de clientes + contactos (múltiples)
+// routes/clientes.js — CRUD de clientes + contactos (múltiples) + status (active|bid|inactive)
 import { Router } from "express";
 import { q, pool } from "../utils/db.js";
 import { authenticateToken } from "../middleware/auth.js";
@@ -22,10 +22,16 @@ const T = (v) => {
 /* ===================== CLIENTES ===================== */
 
 /* ============== GET /clientes ============== */
+/**
+ * Soporta:
+ *   - ?status=active|bid|inactive|all  (default: active)
+ *   - ?q=texto                         (nombre/email/teléfono)
+ */
 router.get("/", authenticateToken, async (req, res) => {
   try {
     const { organizacion_id } = getUserFromReq(req);
-    const { q: qtext } = req.query || {};
+    const { q: qtext, status = "active" } = req.query || {};
+
     const params = [];
     const where = [];
 
@@ -33,18 +39,28 @@ router.get("/", authenticateToken, async (req, res) => {
       params.push(organizacion_id);
       where.push(`c.organizacion_id = $${params.length}`);
     }
+
+    // Filtro por estado (oculta BID e Inactivos por default)
+    const allowed = new Set(["active", "bid", "inactive", "all"]);
+    const statusNorm = allowed.has(String(status)) ? String(status) : "active";
+    if (statusNorm !== "all") {
+      params.push(statusNorm);
+      where.push(`COALESCE(c.status, 'active') = $${params.length}`);
+    }
+
     if (qtext) {
       const qv = `%${String(qtext).trim()}%`;
       params.push(qv);
       const i = params.length;
-      where.push(`(c.nombre ILIKE $${i} OR c.email ILIKE $${i} OR CAST(c.telefono AS TEXT) ILIKE $${i})`);
+      where.push(
+        `(c.nombre ILIKE $${i} OR c.email ILIKE $${i} OR CAST(c.telefono AS TEXT) ILIKE $${i})`
+      );
     }
 
     const sql = `
       SELECT
         c.id,
         c.nombre,
-        -- compat: si no hay c.contacto_nombre, usamos el principal
         COALESCE(c.contacto_nombre, pc.nombre)       AS contacto_nombre,
         COALESCE(c.email, pc.email)                  AS email,
         COALESCE(c.telefono, pc.telefono)            AS telefono,
@@ -52,8 +68,9 @@ router.get("/", authenticateToken, async (req, res) => {
         c.observacion,
         c.usuario_email,
         c.organizacion_id,
+        COALESCE(c.status, 'active')                 AS status,
         c.created_at,
-        -- opcional: devolvemos un JSON resumido del principal (no rompe FE)
+        c.updated_at,
         CASE WHEN pc.id IS NULL THEN NULL ELSE jsonb_build_object(
           'id', pc.id,
           'nombre', pc.nombre,
@@ -76,6 +93,7 @@ router.get("/", authenticateToken, async (req, res) => {
     res.json(r.rows || []);
   } catch (e) {
     console.error("[GET /clientes]", e?.stack || e?.message || e);
+    // para no romper el FE, devolvemos array vacío si falla
     res.status(200).json([]);
   }
 });
@@ -85,19 +103,44 @@ router.post("/", authenticateToken, async (req, res) => {
   const client = await pool.connect();
   try {
     const { organizacion_id, email: usuario_email } = getUserFromReq(req);
-    let { nombre, contacto_nombre, email, telefono, direccion, observacion } = req.body || {};
-    if (!nombre || !String(nombre).trim()) return res.status(400).json({ message: "Nombre requerido" });
+    let {
+      nombre,
+      contacto_nombre,
+      email,
+      telefono,
+      direccion,
+      observacion,
+      status = "active",
+    } = req.body || {};
+
+    if (!nombre || !String(nombre).trim()) {
+      return res.status(400).json({ message: "Nombre requerido" });
+    }
+
+    // normalizamos status
+    status = ["active", "bid", "inactive"].includes(status) ? status : "active";
 
     await client.query("BEGIN");
 
-    // 1) Crear cliente (guardamos campos contacto por compatibilidad FE)
+    // 1) Crear cliente (con status)
     const rCli = await client.query(
       `INSERT INTO clientes
-        (nombre, contacto_nombre, email, telefono, direccion, observacion, usuario_email, organizacion_id)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+        (nombre, contacto_nombre, email, telefono, direccion, observacion, status,
+         usuario_email, organizacion_id)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
        RETURNING id, nombre, contacto_nombre, email, telefono, direccion, observacion,
-                 usuario_email, organizacion_id, created_at`,
-      [String(nombre).trim(), T(contacto_nombre), T(email), T(telefono), T(direccion), T(observacion), usuario_email, organizacion_id]
+                 status, usuario_email, organizacion_id, created_at, updated_at`,
+      [
+        String(nombre).trim(),
+        T(contacto_nombre),
+        T(email),
+        T(telefono),
+        T(direccion),
+        T(observacion),
+        status,
+        usuario_email,
+        organizacion_id,
+      ]
     );
     const cli = rCli.rows[0];
 
@@ -130,28 +173,50 @@ router.patch("/:id", authenticateToken, async (req, res) => {
     if (!Number.isInteger(id)) return res.status(400).json({ message: "ID inválido" });
     const { email: usuario_email, organizacion_id } = getUserFromReq(req);
 
-    // Campos del cliente
-    const allowed = ["nombre","contacto_nombre","email","telefono","direccion","observacion"];
-    const fields = []; const values = []; let i = 1;
+    const allowed = [
+      "nombre",
+      "contacto_nombre",
+      "email",
+      "telefono",
+      "direccion",
+      "observacion",
+      "status",
+    ];
+    const fields = [];
+    const values = [];
+    let i = 1;
+
     for (const k of allowed) {
       if (k in (req.body || {})) {
-        fields.push(`${k}=$${i++}`);
-        values.push(T(req.body[k]));
+        if (k === "status") {
+          const val = ["active", "bid", "inactive"].includes(req.body.status)
+            ? req.body.status
+            : "active";
+          fields.push(`status=$${i++}`);
+          values.push(val);
+        } else {
+          fields.push(`${k}=$${i++}`);
+          values.push(T(req.body[k]));
+        }
       }
     }
-    if (!fields.length && !("contacto_nombre" in req.body || "email" in req.body || "telefono" in req.body)) {
+
+    if (
+      !fields.length &&
+      !("contacto_nombre" in req.body || "email" in req.body || "telefono" in req.body)
+    ) {
       return res.status(400).json({ message: "Nada para actualizar" });
     }
 
     await client.query("BEGIN");
 
-    // 1) Update cliente (si hay fields)
+    // 1) Update cliente
     if (fields.length) {
       values.push(id);
       const r = await client.query(
         `UPDATE clientes SET ${fields.join(", ")}, updated_at = NOW() WHERE id=$${i}
          RETURNING id, nombre, contacto_nombre, email, telefono, direccion, observacion,
-                   usuario_email, organizacion_id, created_at`,
+                   status, usuario_email, organizacion_id, created_at, updated_at`,
         values
       );
       if (!r.rowCount) {
@@ -161,25 +226,40 @@ router.patch("/:id", authenticateToken, async (req, res) => {
     }
 
     // 2) Upsert del contacto principal si llegaron campos de contacto
-    const anyContactField = ["contacto_nombre","email","telefono"].some(k => k in (req.body || {}));
+    const anyContactField = ["contacto_nombre", "email", "telefono"].some(
+      (k) => k in (req.body || {})
+    );
     if (anyContactField) {
       const rPC = await client.query(
         `SELECT id FROM contactos WHERE cliente_id = $1 AND COALESCE(es_principal, false) = true ORDER BY id ASC LIMIT 1`,
         [id]
       );
       const nuevoNombre = T(req.body?.contacto_nombre);
-      const nuevoEmail  = T(req.body?.email);
-      const nuevoTel    = T(req.body?.telefono);
+      const nuevoEmail = T(req.body?.email);
+      const nuevoTel = T(req.body?.telefono);
 
       if (rPC.rowCount) {
-        // update principal solo en campos provistos
-        const setC = []; const valC = []; let j = 1;
-        if ("contacto_nombre" in (req.body || {})) { setC.push(`nombre=$${j++}`); valC.push(nuevoNombre); }
-        if ("email" in (req.body || {}))          { setC.push(`email=$${j++}`);  valC.push(nuevoEmail); }
-        if ("telefono" in (req.body || {}))       { setC.push(`telefono=$${j++}`); valC.push(nuevoTel); }
+        const setC = [];
+        const valC = [];
+        let j = 1;
+        if ("contacto_nombre" in (req.body || {})) {
+          setC.push(`nombre=$${j++}`);
+          valC.push(nuevoNombre);
+        }
+        if ("email" in (req.body || {})) {
+          setC.push(`email=$${j++}`);
+          valC.push(nuevoEmail);
+        }
+        if ("telefono" in (req.body || {})) {
+          setC.push(`telefono=$${j++}`);
+          valC.push(nuevoTel);
+        }
         if (setC.length) {
           valC.push(rPC.rows[0].id);
-          await client.query(`UPDATE contactos SET ${setC.join(", ")}, updated_at=NOW() WHERE id=$${j}`, valC);
+          await client.query(
+            `UPDATE contactos SET ${setC.join(", ")}, updated_at=NOW() WHERE id=$${j}`,
+            valC
+          );
         }
       } else if (nuevoNombre || nuevoEmail || nuevoTel) {
         await client.query(
@@ -195,9 +275,9 @@ router.patch("/:id", authenticateToken, async (req, res) => {
 
     const rBack = await q(
       `SELECT id, nombre, contacto_nombre, email, telefono, direccion, observacion,
-              usuario_email, organizacion_id, created_at
+              status, usuario_email, organizacion_id, created_at, updated_at
          FROM clientes WHERE id=$1`,
-      [id]
+    [id]
     );
     res.json(rBack.rows[0]);
   } catch (e) {
@@ -206,6 +286,60 @@ router.patch("/:id", authenticateToken, async (req, res) => {
     res.status(500).json({ message: "Error actualizando cliente" });
   } finally {
     client.release();
+  }
+});
+
+/* ============== POST /clientes/:id/convertir-a-activo ============== */
+router.post("/:id/convertir-a-activo", authenticateToken, async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id)) return res.status(400).json({ message: "ID inválido" });
+
+    const r = await q(
+      `UPDATE clientes SET status='active', updated_at=NOW() WHERE id=$1 RETURNING *`,
+      [id]
+    );
+    if (!r.rowCount) return res.status(404).json({ message: "Cliente no encontrado" });
+    res.json(r.rows[0]);
+  } catch (e) {
+    console.error("[POST /clientes/:id/convertir-a-activo]", e?.stack || e?.message || e);
+    res.status(500).json({ message: "Error al convertir" });
+  }
+});
+
+/* ============== POST /clientes/:id/marcar-como-bid ============== */
+router.post("/:id/marcar-como-bid", authenticateToken, async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id)) return res.status(400).json({ message: "ID inválido" });
+
+    const r = await q(
+      `UPDATE clientes SET status='bid', updated_at=NOW() WHERE id=$1 RETURNING *`,
+      [id]
+    );
+    if (!r.rowCount) return res.status(404).json({ message: "Cliente no encontrado" });
+    res.json(r.rows[0]);
+  } catch (e) {
+    console.error("[POST /clientes/:id/marcar-como-bid]", e?.stack || e?.message || e);
+    res.status(500).json({ message: "Error al marcar como BID" });
+  }
+});
+
+/* ============== POST /clientes/:id/marcar-inactivo ============== */
+router.post("/:id/marcar-inactivo", authenticateToken, async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id)) return res.status(400).json({ message: "ID inválido" });
+
+    const r = await q(
+      `UPDATE clientes SET status='inactive', updated_at=NOW() WHERE id=$1 RETURNING *`,
+      [id]
+    );
+    if (!r.rowCount) return res.status(404).json({ message: "Cliente no encontrado" });
+    res.json(r.rows[0]);
+  } catch (e) {
+    console.error("[POST /clientes/:id/marcar-inactivo]", e?.stack || e?.message || e);
+    res.status(500).json({ message: "Error al marcar como inactivo" });
   }
 });
 
@@ -223,7 +357,6 @@ router.delete("/:id", authenticateToken, async (req, res) => {
     }
 
     await client.query("BEGIN");
-    // Si no tenés FK ON DELETE CASCADE, limpiamos contactos
     await client.query(`DELETE FROM contactos WHERE cliente_id = $1`, [id]);
     const r = await client.query(`DELETE FROM clientes WHERE id = $1`, [id]);
     await client.query("COMMIT");
@@ -276,9 +409,7 @@ router.post("/:id/contactos", authenticateToken, async (req, res) => {
     if (!Number.isInteger(cliente_id)) return res.status(400).json({ message: "ID inválido" });
     const { email: usuario_email, organizacion_id } = getUserFromReq(req);
 
-    const {
-      nombre, email, telefono, cargo, rol, notas, es_principal = false,
-    } = req.body || {};
+    const { nombre, email, telefono, cargo, rol, notas, es_principal = false } = req.body || {};
     if (!T(nombre) && !T(email) && !T(telefono)) {
       return res.status(400).json({ message: "Nombre, email o teléfono requerido" });
     }
@@ -287,7 +418,6 @@ router.post("/:id/contactos", authenticateToken, async (req, res) => {
 
     let makePrimary = !!es_principal;
 
-    // Si ya existe un principal y piden otro, bajamos el actual
     if (makePrimary) {
       await client.query(
         `UPDATE contactos SET es_principal = FALSE, updated_at = NOW()
@@ -363,7 +493,6 @@ router.patch("/contactos/:id", authenticateToken, async (req, res) => {
 
     await client.query("BEGIN");
 
-    // Si marcan como principal este contacto, quitar bandera del resto
     if ("es_principal" in (req.body || {}) && !!req.body.es_principal) {
       const rCli = await client.query(`SELECT cliente_id FROM contactos WHERE id = $1`, [id]);
       const cliente_id = rCli.rows?.[0]?.cliente_id;
