@@ -24,13 +24,32 @@ const T = (v) => {
 /* ============== GET /clientes ============== */
 /**
  * Soporta:
- *   - ?status=active|bid|inactive|all  (default: active)
+ *   - ?status=active,bid,inactive,all  (default: "active,bid")
  *   - ?q=texto                         (nombre/email/teléfono)
  */
 router.get("/", authenticateToken, async (req, res) => {
   try {
     const { organizacion_id } = getUserFromReq(req);
-    const { q: qtext, status = "active" } = req.query || {};
+
+    // Normalización de status: lista o "all"
+    const rawStatus = String(req.query?.status ?? "").trim().toLowerCase();
+    const VALID = new Set(["active", "bid", "inactive"]);
+    let statuses = null; // null = sin filtro (all)
+
+    if (rawStatus === "all") {
+      statuses = null; // trae todos
+    } else if (rawStatus) {
+      statuses = rawStatus
+        .split(",")
+        .map((s) => s.trim())
+        .filter((s) => VALID.has(s));
+      if (!statuses.length) statuses = ["active", "bid"];
+    } else {
+      // DEFAULT: lo más útil operativamente para Proyectos/Kanban
+      statuses = ["active", "bid"];
+    }
+
+    const qtext = String(req.query?.q ?? "").trim();
 
     const params = [];
     const where = [];
@@ -40,17 +59,14 @@ router.get("/", authenticateToken, async (req, res) => {
       where.push(`c.organizacion_id = $${params.length}`);
     }
 
-    // Filtro por estado (oculta BID e Inactivos por default)
-    const allowed = new Set(["active", "bid", "inactive", "all"]);
-    const statusNorm = allowed.has(String(status)) ? String(status) : "active";
-    if (statusNorm !== "all") {
-      params.push(statusNorm);
-      where.push(`COALESCE(c.status, 'active') = $${params.length}`);
+    if (statuses) {
+      params.push(statuses);
+      where.push(`COALESCE(c.status,'active') = ANY($${params.length})`);
     }
 
     if (qtext) {
-      const qv = `%${String(qtext).trim()}%`;
-      params.push(qv);
+      const like = `%${qtext}%`;
+      params.push(like);
       const i = params.length;
       where.push(
         `(c.nombre ILIKE $${i} OR c.email ILIKE $${i} OR CAST(c.telefono AS TEXT) ILIKE $${i})`
@@ -88,6 +104,7 @@ router.get("/", authenticateToken, async (req, res) => {
       ) pc ON TRUE
       ${where.length ? "WHERE " + where.join(" AND ") : ""}
       ORDER BY c.created_at DESC NULLS LAST, c.id DESC
+      LIMIT 1000
     `;
     const r = await q(sql, params);
     res.json(r.rows || []);
@@ -203,7 +220,7 @@ router.patch("/:id", authenticateToken, async (req, res) => {
 
     if (
       !fields.length &&
-      !("contacto_nombre" in req.body || "email" in req.body || "telefono" in req.body)
+      !("contacto_nombre" in (req.body || {}) || "email" in (req.body || {}) || "telefono" in (req.body || {}))
     ) {
       return res.status(400).json({ message: "Nada para actualizar" });
     }
@@ -276,8 +293,8 @@ router.patch("/:id", authenticateToken, async (req, res) => {
     const rBack = await q(
       `SELECT id, nombre, contacto_nombre, email, telefono, direccion, observacion,
               status, usuario_email, organizacion_id, created_at, updated_at
-         FROM clientes WHERE id=$1`,
-    [id]
+       FROM clientes WHERE id=$1`,
+      [id]
     );
     res.json(rBack.rows[0]);
   } catch (e) {
