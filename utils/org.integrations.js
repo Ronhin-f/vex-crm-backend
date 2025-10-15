@@ -1,31 +1,49 @@
-// utils/org.integrations.js (ESM)
-import { pool } from "./db.js";
+// backend/utils/org.integrations.js
+import { q } from "./db.js";
+import { coreListUsers } from "./core.client.js";
 
-export async function getOrgIntegrations(orgId) {
-  if (!orgId) return { webhookUrl: null, defaultChannel: null, overrides: {} };
-  const { rows } = await pool.query(
-    "SELECT integraciones FROM organizaciones WHERE id = $1",
-    [orgId]
-  );
-  const integ = rows[0]?.integraciones || {};
-  return {
-    webhookUrl: integ.slack_webhook_url || null,
-    defaultChannel: integ.slack_default_channel || null,
-    overrides: integ.slack_user_overrides || {},
-  };
+function envJson(name) {
+  try { return process.env[name] ? JSON.parse(process.env[name]) : null; } catch { return null; }
 }
 
-export async function getSlackIdForEmail(orgId, email) {
-  if (!orgId || !email) return null;
+export async function getOrgIntegrations(orgId) {
+  try {
+    const r = await q(
+      `select slack_webhook_url, slack_default_channel, slack_users_map
+         from org_integrations
+        where organizacion_id = $1
+        limit 1`,
+      [orgId]
+    );
+    const row = r.rows?.[0] || {};
+    return {
+      webhookUrl: row.slack_webhook_url || process.env.SLACK_WEBHOOK_URL || null,
+      defaultChannel: row.slack_default_channel || process.env.SLACK_DEFAULT_CHANNEL || null,
+      usersMap: row.slack_users_map || envJson("SLACK_USERS_MAP") || {}, // {"email":"UXXXX"}
+    };
+  } catch {
+    return {
+      webhookUrl: process.env.SLACK_WEBHOOK_URL || null,
+      defaultChannel: process.env.SLACK_DEFAULT_CHANNEL || null,
+      usersMap: envJson("SLACK_USERS_MAP") || {},
+    };
+  }
+}
 
-  // 1) overrides JSON en organizaciones
-  const { overrides } = await getOrgIntegrations(orgId);
-  if (overrides && overrides[email]) return overrides[email];
+export async function getSlackIdForEmail(orgId, email, bearerFromReq) {
+  if (!email) return null;
+  const norm = String(email).trim().toLowerCase();
 
-  // 2) tabla slack_users (opción A recomendada)
-  const { rows } = await pool.query(
-    "SELECT slack_user_id FROM slack_users WHERE org_id = $1 AND email = $2",
-    [orgId, email]
-  );
-  return rows[0]?.slack_user_id || null;
+  // 1) mapa local (DB/ENV)
+  const { usersMap } = await getOrgIntegrations(orgId);
+  if (usersMap && usersMap[norm]) return usersMap[norm];
+
+  // 2) directorio Core
+  try {
+    const list = await coreListUsers(orgId, bearerFromReq);
+    const u = list.find(x => (x.email || x.usuario_email || "").toLowerCase() === norm);
+    return u?.slack_id || u?.slack_user_id || u?.slack?.user_id || null;
+  } catch {
+    return null;
+  }
 }
