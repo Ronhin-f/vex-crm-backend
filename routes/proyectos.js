@@ -17,15 +17,33 @@ const T = (v) => { if (v == null) return null; const s = String(v).trim(); retur
 const N = (v) => (v == null || v === "" ? null : Number(v));
 const D = (v) => { if (!v) return null; const d = new Date(v); return isNaN(d.getTime()) ? null : d.toISOString(); };
 
+// Selección estándar (incluye alias "notas" para compat FE)
+const SELECT_PROJECT = `
+  SELECT
+    p.id, p.nombre,
+    p.descripcion,
+    p.descripcion AS notas,             -- alias de compatibilidad
+    p.cliente_id,
+    p.stage, p.categoria,
+    p.source, p.assignee, p.due_date,
+    p.estimate_url, p.estimate_file,
+    p.estimate_amount, p.estimate_currency,
+    p.prob_win, p.fecha_cierre_estimada,
+    p.contacto_nombre,
+    p.usuario_email, p.organizacion_id,
+    p.created_at, p.updated_at
+  FROM proyectos p
+`;
+
 /* ============== GET /proyectos ============== */
 /**
- * Filtros soportados: q (nombre/descripcion), stage, cliente_id
- * Compat con FE: orden por updated_at DESC (luego id DESC)
+ * Filtros: q (nombre/descripcion), stage, cliente_id, source, assignee, only_due(=1)
+ * Orden: updated_at DESC, id DESC
  */
 router.get("/", authenticateToken, async (req, res) => {
   try {
     const { organizacion_id } = getUserFromReq(req);
-    const { stage, cliente_id, q: qtext } = req.query || {};
+    const { stage, cliente_id, q: qtext, source, assignee, only_due } = req.query || {};
 
     const params = [];
     const where = [];
@@ -33,6 +51,10 @@ router.get("/", authenticateToken, async (req, res) => {
     if (organizacion_id) { params.push(organizacion_id); where.push(`p.organizacion_id = $${params.length}`); }
     if (stage)          { params.push(String(stage));     where.push(`p.stage = $${params.length}`); }
     if (cliente_id)     { params.push(Number(cliente_id)); where.push(`p.cliente_id = $${params.length}`); }
+    if (source)         { params.push(String(source));     where.push(`p.source = $${params.length}`); }
+    if (assignee)       { params.push(String(assignee));   where.push(`p.assignee = $${params.length}`); }
+    if (String(only_due) === "1") { where.push("p.due_date IS NOT NULL"); }
+
     if (qtext) {
       const qv = `%${String(qtext).trim()}%`;
       params.push(qv);
@@ -41,17 +63,7 @@ router.get("/", authenticateToken, async (req, res) => {
     }
 
     const sql = `
-      SELECT
-        p.id, p.nombre, p.descripcion, p.cliente_id,
-        p.stage, p.categoria,
-        p.source, p.assignee, p.due_date,
-        p.estimate_url, p.estimate_file,
-        p.estimate_amount, p.estimate_currency,
-        p.prob_win, p.fecha_cierre_estimada,
-        p.contacto_nombre,
-        p.usuario_email, p.organizacion_id,
-        p.created_at, p.updated_at
-      FROM proyectos p
+      ${SELECT_PROJECT}
       ${where.length ? "WHERE " + where.join(" AND ") : ""}
       ORDER BY p.updated_at DESC NULLS LAST, p.id DESC
       LIMIT 1000
@@ -60,7 +72,63 @@ router.get("/", authenticateToken, async (req, res) => {
     res.json({ ok: true, items: r.rows || [] });
   } catch (e) {
     console.error("[GET /proyectos]", e?.stack || e?.message || e);
+    // devolvemos vacío pero 200 para no romper el FE
     res.status(200).json({ ok: true, items: [] });
+  }
+});
+
+/* ============== GET /proyectos/kanban ============== */
+/**
+ * Devuelve columnas agrupadas por stage para el Kanban del FE:
+ * { order: string[], columns: [{ key, title, items[] }] }
+ * Acepta los mismos filtros que GET /proyectos
+ */
+router.get("/kanban", authenticateToken, async (req, res) => {
+  try {
+    const { organizacion_id } = getUserFromReq(req);
+    const { q: qtext, source, assignee, only_due } = req.query || {};
+
+    const params = [];
+    const where = [];
+
+    if (organizacion_id) { params.push(organizacion_id); where.push(`p.organizacion_id = $${params.length}`); }
+    if (source)          { params.push(String(source));   where.push(`p.source = $${params.length}`); }
+    if (assignee)        { params.push(String(assignee)); where.push(`p.assignee = $${params.length}`); }
+    if (String(only_due) === "1") { where.push("p.due_date IS NOT NULL"); }
+
+    if (qtext) {
+      const qv = `%${String(qtext).trim()}%`;
+      params.push(qv);
+      const i = params.length;
+      where.push(`(p.nombre ILIKE $${i} OR p.descripcion ILIKE $${i})`);
+    }
+
+    const sql = `
+      ${SELECT_PROJECT}
+      ${where.length ? "WHERE " + where.join(" AND ") : ""}
+      ORDER BY p.updated_at DESC NULLS LAST, p.id DESC
+      LIMIT 1500
+    `;
+    const r = await q(sql, params);
+    const rows = r.rows || [];
+
+    // Agrupar por stage usando pipeline canónico
+    const byStage = new Map(CANON_CATS.map((s) => [s, []]));
+    for (const it of rows) {
+      const key = CANON_CATS.includes(it.stage) ? it.stage : CANON_CATS[0];
+      byStage.get(key).push(it);
+    }
+    const columns = CANON_CATS.map((s) => ({
+      key: s,
+      title: s,
+      items: byStage.get(s),
+      count: byStage.get(s).length,
+    }));
+
+    res.json({ ok: true, order: CANON_CATS, columns });
+  } catch (e) {
+    console.error("[GET /proyectos/kanban]", e?.stack || e?.message || e);
+    res.json({ ok: true, order: CANON_CATS, columns: CANON_CATS.map((s) => ({ key: s, title: s, items: [], count: 0 })) });
   }
 });
 
@@ -68,7 +136,7 @@ router.get("/", authenticateToken, async (req, res) => {
 /**
  * Crea un proyecto (oportunidad).
  * Requeridos: nombre
- * Opcionales: descripcion, cliente_id, stage/categoria, source, assignee, due_date,
+ * Opcionales: descripcion|notas, cliente_id, stage/categoria, source, assignee, due_date,
  *             estimate_url/file, estimate_amount/currency, prob_win, fecha_cierre_estimada, contacto_nombre
  */
 router.post("/", authenticateToken, async (req, res) => {
@@ -77,6 +145,7 @@ router.post("/", authenticateToken, async (req, res) => {
     let {
       nombre,
       descripcion = null,
+      notas = null,                  // ⬅ compat: si viene "notas", la usamos
       cliente_id = null,
       stage = null,
       categoria = null,
@@ -96,8 +165,11 @@ router.post("/", authenticateToken, async (req, res) => {
       return res.status(400).json({ ok: false, message: "Nombre requerido" });
     }
 
-    const stageIn = T(stage) ?? T(categoria) ?? "Incoming Leads";
-    const finalStage = CANON_CATS.includes(stageIn) ? stageIn : "Incoming Leads";
+    // si solo vino "notas", la persistimos en descripcion
+    if (!T(descripcion) && T(notas)) descripcion = notas;
+
+    const stageIn = T(stage) ?? T(categoria) ?? CANON_CATS[0];
+    const finalStage = CANON_CATS.includes(stageIn) ? stageIn : CANON_CATS[0];
 
     const r = await q(
       `INSERT INTO proyectos
@@ -114,12 +186,13 @@ router.post("/", authenticateToken, async (req, res) => {
          $11,$12,
          $13,$14,$15,
          $16,$17)
-       RETURNING id, nombre, descripcion, cliente_id, stage, categoria,
-                 source, assignee, due_date,
-                 estimate_url, estimate_file,
-                 estimate_amount, estimate_currency,
-                 prob_win, fecha_cierre_estimada, contacto_nombre,
-                 usuario_email, organizacion_id, created_at, updated_at`,
+       RETURNING
+         id, nombre, descripcion, descripcion AS notas, cliente_id, stage, categoria,
+         source, assignee, due_date,
+         estimate_url, estimate_file,
+         estimate_amount, estimate_currency,
+         prob_win, fecha_cierre_estimada, contacto_nombre,
+         usuario_email, organizacion_id, created_at, updated_at`,
       [
         T(nombre),
         T(descripcion),
@@ -164,10 +237,13 @@ router.patch("/:id", authenticateToken, async (req, res) => {
       if (!CANON_CATS.includes(incomingStage)) {
         return res.status(400).json({ ok: false, message: "stage fuera del pipeline" });
       }
-      sets.push(`stage = $${i++}`);
-      values.push(incomingStage);
-      sets.push(`categoria = $${i++}`);
-      values.push(incomingStage);
+      sets.push(`stage = $${i++}`); values.push(incomingStage);
+      sets.push(`categoria = $${i++}`); values.push(incomingStage);
+    }
+
+    // ⚠ compat "notas": si vino, lo mapeamos a descripcion (sin pisar si también vino descripcion)
+    if (!("descripcion" in (req.body || {})) && "notas" in (req.body || {})) {
+      req.body.descripcion = req.body.notas;
     }
 
     // Resto de campos permitidos
@@ -196,7 +272,6 @@ router.patch("/:id", authenticateToken, async (req, res) => {
     }
 
     if (!sets.length) return res.status(400).json({ ok: false, message: "Nada para actualizar" });
-
     // updated_at
     sets.push(`updated_at = NOW()`);
 
@@ -208,12 +283,13 @@ router.patch("/:id", authenticateToken, async (req, res) => {
       UPDATE proyectos
          SET ${sets.join(", ")}
        WHERE id = $${i++} ${organizacion_id != null ? `AND organizacion_id = $${i}` : ""}
-       RETURNING id, nombre, descripcion, cliente_id, stage, categoria,
-                 source, assignee, due_date,
-                 estimate_url, estimate_file,
-                 estimate_amount, estimate_currency,
-                 prob_win, fecha_cierre_estimada, contacto_nombre,
-                 usuario_email, organizacion_id, created_at, updated_at
+       RETURNING
+         id, nombre, descripcion, descripcion AS notas, cliente_id, stage, categoria,
+         source, assignee, due_date,
+         estimate_url, estimate_file,
+         estimate_amount, estimate_currency,
+         prob_win, fecha_cierre_estimada, contacto_nombre,
+         usuario_email, organizacion_id, created_at, updated_at
       `,
       values
     );
@@ -244,12 +320,13 @@ router.patch("/:id/stage", authenticateToken, async (req, res) => {
       `UPDATE proyectos
           SET stage=$1, categoria=$1, updated_at=NOW()
         WHERE id=$2 ${organizacion_id != null ? "AND organizacion_id = $3" : ""}
-        RETURNING id, nombre, descripcion, cliente_id, stage, categoria,
-                  source, assignee, due_date,
-                  estimate_url, estimate_file,
-                  estimate_amount, estimate_currency,
-                  prob_win, fecha_cierre_estimada, contacto_nombre,
-                  usuario_email, organizacion_id, created_at, updated_at`,
+        RETURNING
+          id, nombre, descripcion, descripcion AS notas, cliente_id, stage, categoria,
+          source, assignee, due_date,
+          estimate_url, estimate_file,
+          estimate_amount, estimate_currency,
+          prob_win, fecha_cierre_estimada, contacto_nombre,
+          usuario_email, organizacion_id, created_at, updated_at`,
       organizacion_id != null ? [next, id, organizacion_id] : [next, id]
     );
     if (!r.rowCount) return res.status(404).json({ ok: false, message: "Proyecto no encontrado" });
@@ -277,12 +354,13 @@ router.patch("/:id/estimate", authenticateToken, async (req, res) => {
       `UPDATE proyectos
           SET estimate_amount=$1, estimate_currency=$2, updated_at=NOW()
         WHERE id=$3 ${organizacion_id != null ? "AND organizacion_id = $4" : ""}
-        RETURNING id, nombre, descripcion, cliente_id, stage, categoria,
-                  source, assignee, due_date,
-                  estimate_url, estimate_file,
-                  estimate_amount, estimate_currency,
-                  prob_win, fecha_cierre_estimada, contacto_nombre,
-                  usuario_email, organizacion_id, created_at, updated_at`,
+        RETURNING
+          id, nombre, descripcion, descripcion AS notas, cliente_id, stage, categoria,
+          source, assignee, due_date,
+          estimate_url, estimate_file,
+          estimate_amount, estimate_currency,
+          prob_win, fecha_cierre_estimada, contacto_nombre,
+          usuario_email, organizacion_id, created_at, updated_at`,
       organizacion_id != null ? [amount, currency, id, organizacion_id] : [amount, currency, id]
     );
     if (!r.rowCount) return res.status(404).json({ ok: false, message: "Proyecto no encontrado" });
