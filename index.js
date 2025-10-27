@@ -8,14 +8,15 @@ import axios from "axios";
 import cron from "node-cron";
 import { applySecurity } from "./middleware/security.js";
 import { initDB, q, pool } from "./utils/db.js";
-import { auth } from "./middleware/auth.js";
+// ⬇️ Import correcto del auth middleware y (opcional) requireRole
+import { authenticateToken as auth, requireRole } from "./middleware/auth.js";
+
+import { scheduleReminders } from "./workers/reminders.worker.js";
 
 // ✅ Defaults útiles (no pisan Railway)
 process.env.SLACK_WEBHOOK_FALLBACK_CHANNEL ??= "#reminders-and-follow-ups";
 process.env.REMINDER_CRON ??= "*/10 * * * *";
 process.env.INVOICE_REMINDER_CRON ??= "0 * * * *"; // cada hora
-
-import { scheduleReminders } from "./workers/reminders.worker.js";
 
 const app = express();
 app.set("trust proxy", true);
@@ -110,14 +111,14 @@ await mount("/health",         "./routes/health.js");
 await mount("/web",            "./routes/web.js");
 
 /* ───────── Invoices (inline router) ───────── */
-// middleware para resolver org multi-tenant
+// middleware multi-tenant (corrige req.user → req.usuario)
 function withOrg(req, res, next) {
-  // preferimos req.user (vía auth Core/JWT), si no header o query
   const org =
-    req.user?.organizacion_id ||
+    req.usuario?.organizacion_id ||   // ⬅️ clave correcta según auth.js
     req.headers["x-org-id"] ||
     req.query.organizacion_id ||
     null;
+
   if (!org) return res.status(400).json({ error: "organizacion_id requerido" });
   req.orgId = String(org);
   next();
@@ -142,7 +143,7 @@ async function notifyFlows(type, payload) {
 }
 
 // GET /invoices
-app.get("/invoices", auth(), withOrg, async (req, res) => {
+app.get("/invoices", auth, withOrg, async (req, res) => {
   const { rows } = await q(
     `
     SELECT i.*, c.nombre AS client_name, c.email AS client_email
@@ -157,7 +158,7 @@ app.get("/invoices", auth(), withOrg, async (req, res) => {
 });
 
 // POST /invoices
-app.post("/invoices", auth(), withOrg, async (req, res) => {
+app.post("/invoices", auth, withOrg, async (req, res) => {
   const b = req.body || {};
   const { rows } = await q(
     `
@@ -187,7 +188,7 @@ app.post("/invoices", auth(), withOrg, async (req, res) => {
 });
 
 // POST /invoices/:id/remind  → cola recordatorio vía Flows
-app.post("/invoices/:id/remind", auth(), withOrg, async (req, res) => {
+app.post("/invoices/:id/remind", auth, withOrg, async (req, res) => {
   const { id } = req.params;
   const { rows } = await q(
     `
