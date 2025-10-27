@@ -1,14 +1,17 @@
 // backend/middleware/security.js
 import helmet from "helmet";
 
+/* =========================
+ *  Helpers CORS
+ * ========================= */
 function parseOrigins() {
   const raw = process.env.CORS_ORIGIN || "*";
   return new Set(
-    raw.split(",").map(s => s.trim()).filter(Boolean)
+    raw.split(",").map((s) => s.trim()).filter(Boolean)
   );
 }
 
-// Soporte simple de comodines: "*.dominio.com" o "https://*.vercel.app"
+// Soporte de comodines: "*.dominio.com" o "https://*.vercel.app"
 function matchOrigin(origin, pat) {
   if (!origin || !pat) return false;
   if (pat === "*" || pat === origin) return true;
@@ -23,17 +26,21 @@ function matchOrigin(origin, pat) {
 export function applySecurity(app) {
   app.disable("x-powered-by");
 
-  // ---- CORS robusto (con preflight OK) ----
+  /* =========================
+   *  CORS robusto + preflight
+   * ========================= */
   const allowList = parseOrigins();
+
   app.use((req, res, next) => {
     const origin = req.headers.origin || "";
 
     let allowOrigin = "";
     if (allowList.has("*")) {
       allowOrigin = "*";
-    } else if ([...allowList].some(p => matchOrigin(origin, p))) {
+      // OJO: con "*" NO se puede mandar Allow-Credentials
+    } else if ([...allowList].some((p) => matchOrigin(origin, p))) {
       allowOrigin = origin; // eco del origin permitido
-      res.setHeader("Access-Control-Allow-Credentials", "true"); // solo si no usamos "*"
+      res.setHeader("Access-Control-Allow-Credentials", "true");
     }
 
     if (allowOrigin) {
@@ -41,7 +48,7 @@ export function applySecurity(app) {
       res.setHeader("Vary", "Origin");
     }
 
-    // Respeta lo que pide el navegador en el preflight si viene, si no usa defaults seguros
+    // Respeta lo que pide el preflight si viene; defaults seguros si no
     res.setHeader(
       "Access-Control-Allow-Headers",
       req.headers["access-control-request-headers"] ||
@@ -52,25 +59,30 @@ export function applySecurity(app) {
       req.headers["access-control-request-method"] ||
         "GET,POST,PUT,PATCH,DELETE,OPTIONS"
     );
-    // Útil para descargas y paginación
+    // Cachea el preflight 24h en el navegador
+    res.setHeader("Access-Control-Max-Age", "86400");
+
+    // Exponer headers útiles (descargas/paginación)
     res.setHeader("Access-Control-Expose-Headers", "Content-Disposition, X-Total-Count");
 
     if (req.method === "OPTIONS") return res.sendStatus(204);
     next();
   });
 
-  // ---- Helmet / hardening ----
+  /* =========================
+   *  Helmet / hardening
+   * ========================= */
   app.use(
     helmet({
       frameguard: { action: "deny" },
       referrerPolicy: { policy: "no-referrer" },
-      contentSecurityPolicy: false, // lo activamos luego si hace falta
+      contentSecurityPolicy: false, // si hace falta, se configura después
       crossOriginResourcePolicy: { policy: "cross-origin" }, // no bloquear /uploads
       crossOriginOpenerPolicy: { policy: "same-origin-allow-popups" },
     })
   );
 
-  // Extras compatibles
+  // Extra seguro y compatible
   app.use((_, res, next) => {
     res.setHeader("X-Content-Type-Options", "nosniff");
     next();
