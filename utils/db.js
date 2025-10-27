@@ -1,4 +1,4 @@
-// utils/db.js — VEX CRM
+// utils/db.js — VEX CRM (seguro para Railway/Postgres)
 import pg from "pg";
 const { Pool } = pg;
 
@@ -15,16 +15,40 @@ export const CANON_CATS = [
   "Lost",
 ];
 
+// normaliza booleanos desde env
+function envBool(name, def = "false") {
+  const v = (process.env[name] ?? def).toString().trim().toLowerCase();
+  return v === "1" || v === "true" || v === "yes";
+}
+
 function buildPoolConfig() {
   const cs = process.env.DATABASE_URL;
-  const sslRequired =
-    process.env.PGSSLMODE === "require" ||
-    (cs && !/sslmode=disable|sslmode=off/i.test(cs || ""));
+  if (!cs) {
+    throw new Error("DATABASE_URL no está definido");
+  }
+
+  // Detecta sslmode desde la cadena o desde env
+  const m = /sslmode=([^&]+)/i.exec(cs || "");
+  const urlSslMode = (m?.[1] || "").toLowerCase();
+  const envSslMode = (process.env.PGSSLMODE || "").toLowerCase();
+
+  // En producción, por defecto 'require'; en dev se puede desactivar.
+  const defaultSslMode = process.env.NODE_ENV === "production" ? "require" : "disable";
+  const sslMode = urlSslMode || envSslMode || defaultSslMode;
+
+  const sslRequired = !["disable", "off"].includes(sslMode);
+  // En prod: rejectUnauthorized=true por defecto; podés bajar a false explícitamente
+  const rejectUnauthorized = !envBool(
+    "PGSSL_REJECT_UNAUTHORIZED",
+    process.env.NODE_ENV === "production" ? "true" : "false"
+  );
+
   return {
     connectionString: cs,
-    ssl: sslRequired ? { rejectUnauthorized: false } : false,
+    ssl: sslRequired ? { rejectUnauthorized } : false,
     max: Number(process.env.PGPOOL_MAX || 10),
     idleTimeoutMillis: Number(process.env.PG_IDLE || 30000),
+    statement_timeout: Number(process.env.PG_STMT_TIMEOUT || 0), // 0 = sin timeout
   };
 }
 
@@ -60,6 +84,7 @@ async function ensureOrgText(table) {
 export async function initDB() {
   /* ---- Extensiones ---- */
   await q(`CREATE EXTENSION IF NOT EXISTS "uuid-ossp";`);
+  await q(`CREATE EXTENSION IF NOT EXISTS "pgcrypto";`); // para gen_random_uuid()
 
   /* ---- Tablas base ---- */
   await q(`
@@ -115,7 +140,7 @@ export async function initDB() {
       observacion TEXT
     );
 
-    -- Compras
+    -- Compras (será reemplazado por Invoices, pero mantenemos por compat)
     CREATE TABLE IF NOT EXISTS compras (
       id SERIAL PRIMARY KEY,
       proveedor TEXT,
@@ -342,15 +367,9 @@ export async function initDB() {
   await q(`CREATE INDEX IF NOT EXISTS idx_proyectos_source     ON proyectos(source);`);
   await q(`CREATE INDEX IF NOT EXISTS idx_proyectos_due        ON proyectos(due_date);`);
 
-  await q(`
-    CREATE INDEX IF NOT EXISTS idx_proveedores_org      ON proveedores(organizacion_id);
-  `);
-  await q(`
-    CREATE INDEX IF NOT EXISTS idx_proveedores_activo   ON proveedores(activo);
-  `);
-  await q(`
-    CREATE INDEX IF NOT EXISTS idx_proveedores_updated  ON proveedores(updated_at);
-  `);
+  await q(`CREATE INDEX IF NOT EXISTS idx_proveedores_org      ON proveedores(organizacion_id);`);
+  await q(`CREATE INDEX IF NOT EXISTS idx_proveedores_activo   ON proveedores(activo);`);
+  await q(`CREATE INDEX IF NOT EXISTS idx_proveedores_updated  ON proveedores(updated_at);`);
 
   await q(`
     CREATE UNIQUE INDEX IF NOT EXISTS categorias_org_nombre_lower_uniq
