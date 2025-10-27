@@ -1,4 +1,4 @@
-// utils/db.js — VEX CRM (seguro para Railway/Postgres)
+// utils/db.js — VEX CRM (Railway/Postgres, ESM)
 import pg from "pg";
 const { Pool } = pg;
 
@@ -23,21 +23,18 @@ function envBool(name, def = "false") {
 
 function buildPoolConfig() {
   const cs = process.env.DATABASE_URL;
-  if (!cs) {
-    throw new Error("DATABASE_URL no está definido");
-  }
+  if (!cs) throw new Error("DATABASE_URL no está definido");
 
   // Detecta sslmode desde la cadena o desde env
   const m = /sslmode=([^&]+)/i.exec(cs || "");
   const urlSslMode = (m?.[1] || "").toLowerCase();
   const envSslMode = (process.env.PGSSLMODE || "").toLowerCase();
 
-  // En producción, por defecto 'require'; en dev se puede desactivar.
+  // En producción, por defecto 'require'
   const defaultSslMode = process.env.NODE_ENV === "production" ? "require" : "disable";
   const sslMode = urlSslMode || envSslMode || defaultSslMode;
 
   const sslRequired = !["disable", "off"].includes(sslMode);
-  // En prod: rejectUnauthorized=true por defecto; podés bajar a false explícitamente
   const rejectUnauthorized = !envBool(
     "PGSSL_REJECT_UNAUTHORIZED",
     process.env.NODE_ENV === "production" ? "true" : "false"
@@ -53,16 +50,15 @@ function buildPoolConfig() {
 }
 
 export const db = new Pool(buildPoolConfig());
-// 👇 compat para módulos que esperan `{ pool }`
+// compat para módulos que esperan { pool }
 export const pool = db;
 
 export async function q(text, params = []) {
-  // console.log("[SQL]", text, params);
   return db.query(text, params);
 }
 
 /* ===========================
- *  Migraciones / bootstrap
+ *  Helpers de migración
  * =========================== */
 async function ensureOrgText(table) {
   const r = await q(
@@ -81,10 +77,13 @@ async function ensureOrgText(table) {
   }
 }
 
+/* ===========================
+ *  Migraciones / bootstrap
+ * =========================== */
 export async function initDB() {
   /* ---- Extensiones ---- */
   await q(`CREATE EXTENSION IF NOT EXISTS "uuid-ossp";`);
-  await q(`CREATE EXTENSION IF NOT EXISTS "pgcrypto";`); // para gen_random_uuid()
+  await q(`CREATE EXTENSION IF NOT EXISTS "pgcrypto";`);
 
   /* ---- Tablas base ---- */
   await q(`
@@ -140,7 +139,7 @@ export async function initDB() {
       observacion TEXT
     );
 
-    -- Compras (será reemplazado por Invoices, pero mantenemos por compat)
+    -- Compras (transitoria)
     CREATE TABLE IF NOT EXISTS compras (
       id SERIAL PRIMARY KEY,
       proveedor TEXT,
@@ -257,9 +256,11 @@ export async function initDB() {
     );
   `);
 
-  /* ====== 🔧 Backfill de columnas faltantes en proyectos (alinear con rutas) ====== */
+  /* ====== Compatibilidad con KPIs: closed_at & result ====== */
   await q(`
     ALTER TABLE public.proyectos
+      ADD COLUMN IF NOT EXISTS closed_at TIMESTAMPTZ,
+      ADD COLUMN IF NOT EXISTS result TEXT,
       ADD COLUMN IF NOT EXISTS source           TEXT,
       ADD COLUMN IF NOT EXISTS assignee         TEXT,
       ADD COLUMN IF NOT EXISTS due_date         TIMESTAMPTZ,
@@ -268,69 +269,78 @@ export async function initDB() {
       ADD COLUMN IF NOT EXISTS contacto_nombre  TEXT;
   `);
 
-  /* =========================================================
-   *  Migraciones idempotentes (columnas que podrían faltar)
-   * ========================================================= */
-  await q(`ALTER TABLE public.tareas
-    ADD COLUMN IF NOT EXISTS cliente_id      INTEGER,
-    ADD COLUMN IF NOT EXISTS estado          TEXT        DEFAULT 'todo',
-    ADD COLUMN IF NOT EXISTS orden           INTEGER     DEFAULT 0,
-    ADD COLUMN IF NOT EXISTS completada      BOOLEAN     DEFAULT FALSE,
-    ADD COLUMN IF NOT EXISTS vence_en        TIMESTAMPTZ,
-    ADD COLUMN IF NOT EXISTS created_at      TIMESTAMPTZ DEFAULT NOW(),
-    ADD COLUMN IF NOT EXISTS usuario_email   TEXT,
-    ADD COLUMN IF NOT EXISTS organizacion_id TEXT;`);
+  // Trigger: setea closed_at/result cuando stage pasa a Won/Lost
+  await q(`
+    CREATE OR REPLACE FUNCTION proyectos_on_close() RETURNS trigger AS $$
+    BEGIN
+      IF NEW.stage IN ('Won','Lost')
+         AND (OLD.stage IS DISTINCT FROM NEW.stage OR OLD.stage IS NULL) THEN
+        IF NEW.closed_at IS NULL THEN NEW.closed_at := NOW(); END IF;
+        NEW.result := lower(NEW.stage); -- 'won' | 'lost'
+      END IF;
+      RETURN NEW;
+    END; $$ LANGUAGE plpgsql;
+  `);
 
-  // FK a clientes (si faltara)
   await q(`
     DO $$
     BEGIN
-      IF NOT EXISTS (
-        SELECT 1 FROM pg_constraint WHERE conname = 'tareas_cliente_fk'
-      ) THEN
-        ALTER TABLE public.tareas
-          ADD CONSTRAINT tareas_cliente_fk
-          FOREIGN KEY (cliente_id) REFERENCES public.clientes(id)
-          ON DELETE SET NULL;
+      IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'tr_proyectos_on_close') THEN
+        CREATE TRIGGER tr_proyectos_on_close
+        BEFORE UPDATE ON public.proyectos
+        FOR EACH ROW EXECUTE FUNCTION proyectos_on_close();
       END IF;
     END$$;
   `);
 
-  // INTEGRACIONES columnas por si faltan
-  await q(`ALTER TABLE public.integraciones
-    ADD COLUMN IF NOT EXISTS organizacion_id       TEXT,
-    ADD COLUMN IF NOT EXISTS slack_webhook_url     TEXT,
-    ADD COLUMN IF NOT EXISTS slack_default_channel TEXT,
-    ADD COLUMN IF NOT EXISTS whatsapp_meta_token   TEXT,
-    ADD COLUMN IF NOT EXISTS whatsapp_phone_id     TEXT,
-    ADD COLUMN IF NOT EXISTS updated_at            TIMESTAMPTZ DEFAULT NOW();`);
-
-  // Mapeo email → slack_user_id
+  // Trigger genérico para updated_at
   await q(`
-    CREATE TABLE IF NOT EXISTS slack_users (
-      id SERIAL PRIMARY KEY,
-      organizacion_id TEXT NOT NULL,
-      email TEXT NOT NULL,
-      slack_user_id TEXT NOT NULL,
-      UNIQUE (organizacion_id, email)
-    );
+    CREATE OR REPLACE FUNCTION touch_updated_at() RETURNS trigger AS $$
+    BEGIN NEW.updated_at := NOW(); RETURN NEW; END; $$ LANGUAGE plpgsql;
+  `);
+
+  await q(`
+    DO $$
+    BEGIN
+      IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname='tr_proyectos_touch') THEN
+        CREATE TRIGGER tr_proyectos_touch
+        BEFORE UPDATE ON public.proyectos
+        FOR EACH ROW EXECUTE FUNCTION touch_updated_at();
+      END IF;
+    END$$;
+  `);
+
+  /* ===== Backfill suave (incluye tu caso ya "Won") ===== */
+  await q(`
+    UPDATE public.proyectos
+       SET result = lower(stage)
+     WHERE stage IN ('Won','Lost') AND (result IS NULL OR result NOT IN ('won','lost'));
+  `);
+
+  await q(`
+    UPDATE public.proyectos
+       SET closed_at = COALESCE(updated_at, created_at, NOW())
+     WHERE stage IN ('Won','Lost') AND closed_at IS NULL;
+  `);
+
+  /* ===== Vista de compatibilidad "projects" (inglés) ===== */
+  await q(`
+    CREATE OR REPLACE VIEW public.projects AS
+    SELECT
+      id,
+      organizacion_id AS org_id,
+      stage,
+      result,
+      closed_at,
+      created_at,
+      updated_at
+    FROM public.proyectos;
   `);
 
   /* ---- Normalización organizacion_id a TEXT ---- */
   const ORG_TABLES = [
-    "usuarios",
-    "clientes",
-    "pedidos",
-    "tareas",
-    "integraciones",
-    "recordatorios",
-    "categorias",
-    "compras",
-    "compra_items",
-    "pedido_items",
-    "proyectos",
-    "proveedores",
-    "slack_users",
+    "usuarios","clientes","pedidos","tareas","integraciones","recordatorios",
+    "categorias","compras","compra_items","pedido_items","proyectos","proveedores","slack_users"
   ];
   for (const t of ORG_TABLES) {
     await ensureOrgText(t).catch(() => {});
@@ -366,17 +376,15 @@ export async function initDB() {
   await q(`CREATE INDEX IF NOT EXISTS idx_proyectos_assignee   ON proyectos(assignee);`);
   await q(`CREATE INDEX IF NOT EXISTS idx_proyectos_source     ON proyectos(source);`);
   await q(`CREATE INDEX IF NOT EXISTS idx_proyectos_due        ON proyectos(due_date);`);
-
-  await q(`CREATE INDEX IF NOT EXISTS idx_proveedores_org      ON proveedores(organizacion_id);`);
-  await q(`CREATE INDEX IF NOT EXISTS idx_proveedores_activo   ON proveedores(activo);`);
-  await q(`CREATE INDEX IF NOT EXISTS idx_proveedores_updated  ON proveedores(updated_at);`);
+  await q(`CREATE INDEX IF NOT EXISTS idx_proyectos_result     ON proyectos(result);`);
+  await q(`CREATE INDEX IF NOT EXISTS idx_proyectos_closed_at  ON proyectos(closed_at);`);
 
   await q(`
     CREATE UNIQUE INDEX IF NOT EXISTS categorias_org_nombre_lower_uniq
       ON categorias (organizacion_id, lower(nombre));
   `);
 
-  // Integraciones: 1 fila por org (idempotente, soporta distintos nombres de índice)
+  // Integraciones: 1 fila por org (idempotente)
   await q(`
     DO $$
     BEGIN
@@ -421,8 +429,11 @@ export async function initDB() {
   await q(`UPDATE clientes  SET categoria = stage WHERE categoria IS NULL AND stage IS NOT NULL;`);
   await q(`UPDATE proyectos SET stage = COALESCE(stage, 'Incoming Leads');`);
   await q(`UPDATE proyectos SET categoria = COALESCE(categoria, stage);`);
-  await q(`UPDATE tareas    SET estado = COALESCE(NULLIF(TRIM(estado), ''), 'todo')
-           WHERE estado IS NULL OR TRIM(estado) = '';`);
-  await q(`UPDATE tareas    SET completada = COALESCE(completada, FALSE) WHERE completada IS NULL;`);
-  await q(`UPDATE tareas    SET orden = COALESCE(orden, 0) WHERE orden IS NULL;`);
+  await q(`
+    UPDATE tareas
+       SET estado = COALESCE(NULLIF(TRIM(estado), ''), 'todo')
+     WHERE estado IS NULL OR TRIM(estado) = '';
+  `);
+  await q(`UPDATE tareas SET completada = COALESCE(completada, FALSE) WHERE completada IS NULL;`);
+  await q(`UPDATE tareas SET orden = COALESCE(orden, 0) WHERE orden IS NULL;`);
 }
