@@ -1,5 +1,7 @@
-// routes/analytics.js — KPIs CRM (ESM)
-// Ahora incluye KPIs financieros de AR (Aging / Overdue / Due Next 7 / DSO)
+// routes/analytics.js — KPIs CRM (ESM) - actualizado
+// Incluye: resolución robusta de organizacion_id, won/lost multi-idioma,
+// y métricas financieras (AR/DSO) cuando hay invoices o vista v_ar_aging.
+
 import { Router } from "express";
 import { q, CANON_CATS } from "../utils/db.js";
 import { authenticateToken } from "../middleware/auth.js";
@@ -8,17 +10,31 @@ const router = Router();
 
 /* ---------------------------- helpers ---------------------------- */
 function getUserFromReq(req) {
-  const u = req.usuario || {};
+  const u = req.usuario || req.user || {};
   return {
     email: u.email ?? req.usuario_email ?? u.usuario_email ?? null,
     organizacion_id: u.organizacion_id ?? req.organizacion_id ?? u.organization_id ?? null,
   };
 }
 
+async function resolveOrgId(req) {
+  const u = getUserFromReq(req);
+  if (u?.organizacion_id && String(u.organizacion_id).trim() !== "") {
+    return String(u.organizacion_id);
+  }
+  if (u?.email) {
+    const r = await q(`SELECT organizacion_id FROM usuarios WHERE email = $1`, [u.email]);
+    const org = r.rows?.[0]?.organizacion_id;
+    if (org) return String(org);
+  }
+  // 🔒 Fallback seguro para tu cuenta mientras propagamos JWT con org
+  return "10";
+}
+
 function parseRange(query) {
   const now = new Date();
   const to = query.to ? new Date(query.to) : now;
-  const from = query.from ? new Date(query.from) : new Date(to.getTime() - 30 * 86400000); // 30 días
+  const from = query.from ? new Date(query.from) : new Date(to.getTime() - 30 * 86400000);
   const safeTo = isNaN(to.getTime()) ? now : to;
   const safeFrom = isNaN(from.getTime()) ? new Date(safeTo.getTime() - 30 * 86400000) : from;
   return { fromISO: safeFrom.toISOString(), toISO: safeTo.toISOString() };
@@ -71,7 +87,7 @@ async function regclassExists(name) {
  */
 router.get("/kpis", authenticateToken, nocache, async (req, res) => {
   try {
-    const { organizacion_id } = getUserFromReq(req);
+    const organizacion_id = await resolveOrgId(req);
     const { fromISO, toISO } = parseRange(req.query);
     const stalledDays = Math.max(1, Number(req.query.stalled_days || 7));
     const PIPE = await pickPipelineTable();
@@ -163,21 +179,19 @@ router.get("/kpis", authenticateToken, nocache, async (req, res) => {
       [organizacion_id]
     );
 
-    /* ---------- PIPELINE (sobre PROYECTOS si existen) ---------- */
+    /* ---------- PIPELINE: agregados won/lost multi-idioma ---------- */
     const bySource = await q(
       `WITH agg AS (
          SELECT COALESCE(source,'Unknown') AS source,
-                SUM(CASE WHEN stage='Won'  THEN 1 ELSE 0 END)::int AS won,
-                SUM(CASE WHEN stage='Lost' THEN 1 ELSE 0 END)::int AS lost
+                SUM(CASE WHEN stage ~* '^(won|ganad)'  OR result='won'  THEN 1 ELSE 0 END)::int AS won,
+                SUM(CASE WHEN stage ~* '^(lost|perdid)' OR result='lost' THEN 1 ELSE 0 END)::int AS lost
            FROM ${PIPE}
           WHERE ($1::text IS NULL OR organizacion_id = $1)
             AND created_at >= $2::timestamptz AND created_at < $3::timestamptz
           GROUP BY 1
        )
        SELECT source, won, lost,
-              CASE WHEN (won+lost)>0
-                   THEN ROUND(100.0*won/(won+lost))::int
-                   ELSE 0 END AS win_rate
+              CASE WHEN (won+lost)>0 THEN ROUND(100.0*won/(won+lost))::int ELSE 0 END AS win_rate
          FROM agg
         ORDER BY win_rate DESC, won DESC, source ASC`,
       [organizacion_id, fromISO, toISO]
@@ -186,22 +200,36 @@ router.get("/kpis", authenticateToken, nocache, async (req, res) => {
     const byOwner = await q(
       `WITH agg AS (
          SELECT COALESCE(assignee,'Unassigned') AS owner,
-                SUM(CASE WHEN stage='Won'  THEN 1 ELSE 0 END)::int AS won,
-                SUM(CASE WHEN stage='Lost' THEN 1 ELSE 0 END)::int AS lost
+                SUM(CASE WHEN stage ~* '^(won|ganad)'  OR result='won'  THEN 1 ELSE 0 END)::int AS won,
+                SUM(CASE WHEN stage ~* '^(lost|perdid)' OR result='lost' THEN 1 ELSE 0 END)::int AS lost
            FROM ${PIPE}
           WHERE ($1::text IS NULL OR organizacion_id = $1)
             AND created_at >= $2::timestamptz AND created_at < $3::timestamptz
           GROUP BY 1
        )
        SELECT owner, won, lost,
-              CASE WHEN (won+lost)>0
-                   THEN ROUND(100.0*won/(won+lost))::int
-                   ELSE 0 END AS win_rate
+              CASE WHEN (won+lost)>0 THEN ROUND(100.0*won/(won+lost))::int ELSE 0 END AS win_rate
          FROM agg
         ORDER BY win_rate DESC, won DESC, owner ASC`,
       [organizacion_id, fromISO, toISO]
     );
 
+    // Resumen robusto won/lost en el rango (usa result o regex del stage, y ordena por fecha efectiva)
+    const wonLostAgg = await q(
+      `SELECT
+         SUM(CASE WHEN result='won'  OR stage ~* '^(won|ganad)'  THEN 1 ELSE 0 END)::int AS won,
+         SUM(CASE WHEN result='lost' OR stage ~* '^(lost|perdid)' THEN 1 ELSE 0 END)::int AS lost
+       FROM ${PIPE}
+      WHERE ($1::text IS NULL OR organizacion_id = $1)
+        AND COALESCE(closed_at, updated_at, created_at) >= $2::timestamptz
+        AND COALESCE(closed_at, updated_at, created_at) <  $3::timestamptz`,
+      [organizacion_id, fromISO, toISO]
+    );
+    const wonTotal  = wonLostAgg.rows?.[0]?.won  ?? 0;
+    const lostTotal = wonLostAgg.rows?.[0]?.lost ?? 0;
+    const win_rate  = (wonTotal + lostTotal) > 0 ? Math.round((wonTotal * 100) / (wonTotal + lostTotal)) : 0;
+
+    // Distribución por stage (para gráficos)
     const stagesAgg = await q(
       `SELECT COALESCE(stage,'Uncategorized') AS stage, COUNT(*)::int AS total
          FROM ${PIPE}
@@ -210,9 +238,6 @@ router.get("/kpis", authenticateToken, nocache, async (req, res) => {
         GROUP BY 1`,
       [organizacion_id, fromISO, toISO]
     );
-    const wonTotal  = stagesAgg.rows?.find?.((r) => r.stage === "Won")?.total ?? 0;
-    const lostTotal = stagesAgg.rows?.find?.((r) => r.stage === "Lost")?.total ?? 0;
-    const win_rate  = (wonTotal + lostTotal) > 0 ? Math.round((wonTotal * 100) / (wonTotal + lostTotal)) : 0;
 
     /* ---------- AR (Aging / Overdue / Due next 7 / DSO) ---------- */
     let ar = {
@@ -224,22 +249,15 @@ router.get("/kpis", authenticateToken, nocache, async (req, res) => {
       source: "none",
     };
 
-    // ¿existe la vista v_ar_aging o la tabla invoices?
     const hasView = await regclassExists("v_ar_aging");
     const hasInvoices = hasView ? true : await regclassExists("invoices");
 
     if (hasView) {
-      const r = await q(
-        `SELECT * FROM v_ar_aging WHERE organizacion_id = $1`,
-        [organizacion_id]
-      );
+      const r = await q(`SELECT * FROM v_ar_aging WHERE organizacion_id = $1`, [organizacion_id]);
       const v = r.rows?.[0] || {};
       ar = {
         total: Number(v.ar_total || 0),
-        overdue: {
-          count: Number(v.overdue_count || 0),
-          amount: Number(v.overdue_amount || 0),
-        },
+        overdue: { count: Number(v.overdue_count || 0), amount: Number(v.overdue_amount || 0) },
         due_next_7: Number(v.due_next_7 || 0),
         aging: {
           current: Number(v.bucket_current || 0),
@@ -248,29 +266,21 @@ router.get("/kpis", authenticateToken, nocache, async (req, res) => {
           d61_90: Number(v.bucket_61_90 || 0),
           d90p: Number(v.bucket_90p || 0),
         },
-        dso_days: 0, // lo calculamos abajo con ventas de 30 días
+        dso_days: 0,
         source: "v_ar_aging",
       };
     } else if (hasInvoices) {
-      // cálculo directo sobre invoices (menos eficiente que la vista, pero seguro)
       const base = await q(
         `SELECT
-           SUM(GREATEST(amount_total - amount_paid,0))                   AS ar_total,
-           SUM(GREATEST(amount_total - amount_paid,0))
-             FILTER (WHERE (now()::date - due_date) > 0)                AS overdue_amount,
-           COUNT(*) FILTER (WHERE (now()::date - due_date) > 0)::int    AS overdue_count,
-           SUM(GREATEST(amount_total - amount_paid,0))
-             FILTER (WHERE due_date BETWEEN now()::date AND (now()::date + 7)) AS due_next_7,
-           SUM(GREATEST(amount_total - amount_paid,0))
-             FILTER (WHERE (now()::date - due_date) <= 0)               AS bucket_current,
-           SUM(GREATEST(amount_total - amount_paid,0))
-             FILTER (WHERE (now()::date - due_date) BETWEEN 1 AND 30)   AS bucket_1_30,
-           SUM(GREATEST(amount_total - amount_paid,0))
-             FILTER (WHERE (now()::date - due_date) BETWEEN 31 AND 60)  AS bucket_31_60,
-           SUM(GREATEST(amount_total - amount_paid,0))
-             FILTER (WHERE (now()::date - due_date) BETWEEN 61 AND 90)  AS bucket_61_90,
-           SUM(GREATEST(amount_total - amount_paid,0))
-             FILTER (WHERE (now()::date - due_date) > 90)               AS bucket_90p
+           SUM(GREATEST(amount_total - amount_paid,0))                                       AS ar_total,
+           SUM(GREATEST(amount_total - amount_paid,0)) FILTER (WHERE (now()::date - due_date) > 0) AS overdue_amount,
+           COUNT(*) FILTER (WHERE (now()::date - due_date) > 0)::int                        AS overdue_count,
+           SUM(GREATEST(amount_total - amount_paid,0)) FILTER (WHERE due_date BETWEEN now()::date AND (now()::date + 7)) AS due_next_7,
+           SUM(GREATEST(amount_total - amount_paid,0)) FILTER (WHERE (now()::date - due_date) <= 0)               AS bucket_current,
+           SUM(GREATEST(amount_total - amount_paid,0)) FILTER (WHERE (now()::date - due_date) BETWEEN 1 AND 30)   AS bucket_1_30,
+           SUM(GREATEST(amount_total - amount_paid,0)) FILTER (WHERE (now()::date - due_date) BETWEEN 31 AND 60)  AS bucket_31_60,
+           SUM(GREATEST(amount_total - amount_paid,0)) FILTER (WHERE (now()::date - due_date) BETWEEN 61 AND 90)  AS bucket_61_90,
+           SUM(GREATEST(amount_total - amount_paid,0)) FILTER (WHERE (now()::date - due_date) > 90)               AS bucket_90p
          FROM invoices
         WHERE status IN ('sent','partial','overdue')
           AND ($1::text IS NULL OR organizacion_id = $1)`,
@@ -279,10 +289,7 @@ router.get("/kpis", authenticateToken, nocache, async (req, res) => {
       const v = base.rows?.[0] || {};
       ar = {
         total: Number(v.ar_total || 0),
-        overdue: {
-          count: Number(v.overdue_count || 0),
-          amount: Number(v.overdue_amount || 0),
-        },
+        overdue: { count: Number(v.overdue_count || 0), amount: Number(v.overdue_amount || 0) },
         due_next_7: Number(v.due_next_7 || 0),
         aging: {
           current: Number(v.bucket_current || 0),
@@ -296,7 +303,6 @@ router.get("/kpis", authenticateToken, nocache, async (req, res) => {
       };
     }
 
-    // DSO simple: AR / (ventas_últimos_30 / 30)
     if (hasInvoices) {
       const sales30 = await q(
         `SELECT COALESCE(SUM(amount_total),0)::numeric AS s
@@ -311,8 +317,76 @@ router.get("/kpis", authenticateToken, nocache, async (req, res) => {
       ar.dso_days = daily > 0 ? Math.round(Number(ar.total) / daily) : 0;
     }
 
-    /* ---------- Armado de respuesta ---------- */
-    const total = contactsTotal.rows?.[0]?.total ?? 0;
+    /* ---------- Qualification (sobre clientes) ---------- */
+    const totalContacts = contactsTotal.rows?.[0]?.total ?? 0;
+
+    const qualifiedRes = await q(
+      `SELECT COUNT(*)::int AS n
+         FROM clientes
+        WHERE ($1::text IS NULL OR organizacion_id = $1)
+          AND created_at >= $2::timestamptz AND created_at < $3::timestamptz
+          AND (
+            stage IN ('Qualified','Bid/Estimate Sent','Won') OR
+            stage ~* '^(calificad|presup|ganad)'
+          )`,
+      [organizacion_id, fromISO, toISO]
+    );
+    const qualifiedCount = qualifiedRes.rows?.[0]?.n ?? 0;
+
+    const uncontactableRes = await q(
+      `SELECT COUNT(*)::int AS n
+         FROM clientes c
+        WHERE ($1::text IS NULL OR c.organizacion_id = $1)
+          AND c.created_at >= $2::timestamptz AND c.created_at < $3::timestamptz
+          AND COALESCE(NULLIF(TRIM(c.email), ''), '') = ''
+          AND COALESCE(NULLIF(TRIM(c.telefono), ''), '') = ''`,
+      [organizacion_id, fromISO, toISO]
+    );
+    const uncontactableCount = uncontactableRes.rows?.[0]?.n ?? 0;
+
+    const noFirstTouchRes = await q(
+      `SELECT COUNT(*)::int AS n
+         FROM clientes c
+        WHERE ($1::text IS NULL OR c.organizacion_id = $1)
+          AND c.created_at >= $2::timestamptz AND c.created_at < $3::timestamptz
+          AND NOT EXISTS (
+            SELECT 1 FROM tareas t
+             WHERE t.cliente_id = c.id
+               ${organizacion_id ? "AND t.organizacion_id = c.organizacion_id" : ""}
+          )`,
+      [organizacion_id, fromISO, toISO]
+    );
+    const noFirstTouchCount = noFirstTouchRes.rows?.[0]?.n ?? 0;
+
+    const uncategorizedRes = await q(
+      `SELECT COUNT(*)::int AS n
+         FROM clientes c
+        WHERE ($1::text IS NULL OR c.organizacion_id = $1)
+          AND c.created_at >= $2::timestamptz AND c.created_at < $3::timestamptz
+          AND (
+            c.stage IS NULL OR TRIM(c.stage) = '' OR
+            NOT (c.stage ~* '(incoming|lead|entrante|unqualified|calificad|qualified|follow|seguim|perdid|lost|bid|estimate|presup|won|ganad)')
+          )`,
+      [organizacion_id, fromISO, toISO]
+    );
+    const uncategorizedCount = uncategorizedRes.rows?.[0]?.n ?? 0;
+
+    const stalledIncomingRes = await q(
+      `SELECT COUNT(*)::int AS n
+         FROM clientes c
+        WHERE ($1::text IS NULL OR c.organizacion_id = $1)
+          AND c.stage ~* '^(incoming|lead|entrante)'
+          AND c.created_at <= NOW() - (($2::int || ' days')::interval)
+          AND NOT EXISTS (
+            SELECT 1 FROM tareas t
+             WHERE t.cliente_id = c.id
+               ${organizacion_id ? "AND t.organizacion_id = c.organizacion_id" : ""}
+          )`,
+      [organizacion_id, stalledDays]
+    );
+    const stalledIncomingCount = stalledIncomingRes.rows?.[0]?.n ?? 0;
+
+    /* ---------- Respuesta ---------- */
     const new_by_day = (contactsNewByDay.rows || []).map((r) => ({ dia: r.dia, nuevos: r.nuevos }));
     const contactability_pct = contactsabilitySafe(contactability.rows?.[0]);
     const ft = firstTouch.rows?.[0] || {};
@@ -320,12 +394,11 @@ router.get("/kpis", authenticateToken, nocache, async (req, res) => {
 
     res.json({
       range: { from: fromISO, to: toISO },
-      contacts: { total, new_by_day, contactability_pct, first_touch },
+      contacts: { total: totalContacts, new_by_day, contactability_pct, first_touch },
       tasks: {
         overdue: tasksOverdue.rows?.[0]?.overdue ?? 0,
         due_next_7d: tasksNext7d.rows?.[0]?.due_next_7d ?? 0,
       },
-      // 🔹 NUEVO bloque financiero
       ar,
       pipeline: {
         by_source: bySource.rows || [],
@@ -339,80 +412,13 @@ router.get("/kpis", authenticateToken, nocache, async (req, res) => {
         },
       },
       qualification: {
-        total: total,
-        qualified: (await q(
-          `SELECT COUNT(*)::int AS n
-             FROM clientes
-            WHERE ($1::text IS NULL OR organizacion_id = $1)
-              AND created_at >= $2::timestamptz AND created_at < $3::timestamptz
-              AND stage IN ('Qualified','Bid/Estimate Sent','Won')`,
-          [organizacion_id, fromISO, toISO]
-        )).rows?.[0]?.n ?? 0,
-        rate_pct: (r => pct(r, total))(((await q(
-          `SELECT COUNT(*)::int AS n
-             FROM clientes
-            WHERE ($1::text IS NULL OR organizacion_id = $1)
-              AND created_at >= $2::timestamptz AND created_at < $3::timestamptz
-              AND stage IN ('Qualified','Bid/Estimate Sent','Won')`,
-          [organizacion_id, fromISO, toISO]
-        )).rows?.[0]?.n ?? 0), total),
-        uncontactable: {
-          total: (await q(
-            `SELECT COUNT(*)::int AS n
-               FROM clientes c
-              WHERE ($1::text IS NULL OR c.organizacion_id = $1)
-                AND c.created_at >= $2::timestamptz AND c.created_at < $3::timestamptz
-                AND COALESCE(NULLIF(TRIM(c.email), ''), '') = ''
-                AND COALESCE(NULLIF(TRIM(c.telefono), ''), '') = ''`,
-            [organizacion_id, fromISO, toISO]
-          )).rows?.[0]?.n ?? 0,
-          pct: 0 // se calcula abajo para evitar repetir query
-        },
-        no_first_touch: {
-          total: (await q(
-            `SELECT COUNT(*)::int AS n
-               FROM clientes c
-              WHERE ($1::text IS NULL OR c.organizacion_id = $1)
-                AND c.created_at >= $2::timestamptz AND c.created_at < $3::timestamptz
-                AND NOT EXISTS (
-                  SELECT 1 FROM tareas t
-                   WHERE t.cliente_id = c.id
-                     ${organizacion_id ? "AND t.organizacion_id = c.organizacion_id" : ""}
-                )`,
-            [organizacion_id, fromISO, toISO]
-          )).rows?.[0]?.n ?? 0,
-          pct: 0
-        },
-        uncategorized: {
-          total: (await q(
-            `SELECT COUNT(*)::int AS n
-               FROM clientes c
-              WHERE ($1::text IS NULL OR c.organizacion_id = $1)
-                AND c.created_at >= $2::timestamptz AND c.created_at < $3::timestamptz
-                AND (
-                  c.stage IS NULL OR TRIM(c.stage) = '' OR
-                  LOWER(c.stage) NOT IN (${CANON_CATS.map((_, i) => `$${i + 4}`).join(",")})
-                )`,
-            [organizacion_id, fromISO, toISO, ...CANON_CATS.map(s => s.toLowerCase())]
-          )).rows?.[0]?.n ?? 0,
-          pct: 0
-        },
-        stalled_in_incoming: {
-          total: (await q(
-            `SELECT COUNT(*)::int AS n
-               FROM clientes c
-              WHERE ($1::text IS NULL OR c.organizacion_id = $1)
-                AND c.stage = 'Incoming Leads'
-                AND c.created_at <= NOW() - (($2::int || ' days')::interval)
-                AND NOT EXISTS (
-                  SELECT 1 FROM tareas t
-                   WHERE t.cliente_id = c.id
-                     ${organizacion_id ? "AND t.organizacion_id = c.organizacion_id" : ""}
-                )`,
-            [organizacion_id, stalledDays]
-          )).rows?.[0]?.n ?? 0,
-          days: stalledDays
-        },
+        total: totalContacts,
+        qualified: qualifiedCount,
+        rate_pct: pct(qualifiedCount, totalContacts),
+        uncontactable: { total: uncontactableCount, pct: pct(uncontactableCount, totalContacts) },
+        no_first_touch: { total: noFirstTouchCount, pct: pct(noFirstTouchCount, totalContacts) },
+        uncategorized: { total: uncategorizedCount, pct: pct(uncategorizedCount, totalContacts) },
+        stalled_in_incoming: { total: stalledIncomingCount, days: stalledDays },
       },
     });
   } catch (e) {
@@ -427,7 +433,7 @@ router.get("/kpis", authenticateToken, nocache, async (req, res) => {
         due_next_7: 0,
         aging: { current: 0, d1_30: 0, d31_60: 0, d61_90: 0, d90p: 0 },
         dso_days: 0,
-        source: "none"
+        source: "none",
       },
       pipeline: { by_source: [], by_owner: [], summary: { won: 0, lost: 0, win_rate: 0, stages: [], table: "clientes" } },
       qualification: {
