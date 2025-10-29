@@ -1,6 +1,14 @@
 // utils/db.js — VEX CRM (Railway/Postgres, ESM)
 import pg from "pg";
-const { Pool } = pg;
+const { Pool, types } = pg;
+
+/* ===========================
+ *  Parsers & defaults
+ * =========================== */
+// NUMERIC → Number (evita strings en totales/amounts)
+types.setTypeParser(1700, (v) => (v == null ? null : parseFloat(v))); // NUMERIC
+// INT8 → Number (si lo usáramos para counts)
+types.setTypeParser(20, (v) => (v == null ? null : parseInt(v, 10)));
 
 /* ===========================
  *  Constantes / helpers
@@ -15,37 +23,55 @@ export const CANON_CATS = [
   "Lost",
 ];
 
-// normaliza booleanos desde env
 function envBool(name, def = "false") {
   const v = (process.env[name] ?? def).toString().trim().toLowerCase();
   return v === "1" || v === "true" || v === "yes";
 }
+function envNum(name, def = 0) {
+  const v = (process.env[name] ?? "").toString().trim();
+  const n = Number(v);
+  return Number.isFinite(n) ? n : def;
+}
+function envStr(name, def = "") {
+  const v = process.env[name];
+  return (v == null || v === "") ? def : String(v);
+}
 
 function buildPoolConfig() {
-  const cs = process.env.DATABASE_URL;
+  let cs = process.env.DATABASE_URL;
   if (!cs) throw new Error("DATABASE_URL no está definido");
 
   // Detecta sslmode desde la cadena o desde env
   const m = /sslmode=([^&]+)/i.exec(cs || "");
   const urlSslMode = (m?.[1] || "").toLowerCase();
   const envSslMode = (process.env.PGSSLMODE || "").toLowerCase();
+  const dbSslFlag = envBool("DB_SSL", process.env.NODE_ENV === "production" ? "true" : "false");
 
   // En producción, por defecto 'require'
   const defaultSslMode = process.env.NODE_ENV === "production" ? "require" : "disable";
-  const sslMode = urlSslMode || envSslMode || defaultSslMode;
+  const sslMode = urlSslMode || envSslMode || (dbSslFlag ? "require" : defaultSslMode);
 
-  const sslRequired = !["disable", "off"].includes(sslMode);
+  const sslRequired = !["disable", "off", "allow"].includes(sslMode);
+
+  // Compat con entornos donde hay certificados self-signed
+  // Prioridad: PGSSL_REJECT_UNAUTHORIZED (explícito) > DB_SSL_NO_VERIFY > NODE_ENV
   const rejectUnauthorized = !envBool(
     "PGSSL_REJECT_UNAUTHORIZED",
-    process.env.NODE_ENV === "production" ? "true" : "false"
+    envBool("DB_SSL_NO_VERIFY", process.env.NODE_ENV === "production" ? "false" : "true") ? "false" : "true"
   );
 
   return {
     connectionString: cs,
     ssl: sslRequired ? { rejectUnauthorized } : false,
-    max: Number(process.env.PGPOOL_MAX || 10),
-    idleTimeoutMillis: Number(process.env.PG_IDLE || 30000),
-    statement_timeout: Number(process.env.PG_STMT_TIMEOUT || 0), // 0 = sin timeout
+    application_name: envStr("PG_APP_NAME", "vex-crm"),
+    max: envNum("PGPOOL_MAX", 10),
+    idleTimeoutMillis: envNum("PG_IDLE", 30_000),
+    connectionTimeoutMillis: envNum("PG_CONNECT_TIMEOUT", 10_000),
+    keepAlive: true,
+    keepAliveInitialDelayMillis: envNum("PG_KEEPALIVE_DELAY", 10_000),
+    statement_timeout: envNum("PG_STMT_TIMEOUT", 0), // 0 = sin timeout
+    query_timeout: envNum("PG_QUERY_TIMEOUT", 0),
+    allowExitOnIdle: envBool("PG_ALLOW_EXIT_ON_IDLE", "false"),
   };
 }
 
@@ -53,8 +79,18 @@ export const db = new Pool(buildPoolConfig());
 // compat para módulos que esperan { pool }
 export const pool = db;
 
+// Log minimal si el pool reporta error asíncrono
+db.on("error", (err) => {
+  console.error("[pg:pool error]", err?.message || err);
+});
+
 export async function q(text, params = []) {
-  return db.query(text, params);
+  try {
+    return await db.query(text, params);
+  } catch (e) {
+    console.error("[pg:q]", e?.message || e, { text });
+    throw e;
+  }
 }
 
 /* ===========================
@@ -219,6 +255,16 @@ export async function initDB() {
       created_at TIMESTAMPTZ DEFAULT NOW(),
       orden INTEGER DEFAULT 0
     );
+
+    /* ===== SLACK USERS (mínimo util) ===== */
+    CREATE TABLE IF NOT EXISTS slack_users (
+      id SERIAL PRIMARY KEY,
+      organizacion_id TEXT,
+      email TEXT,
+      slack_user_id TEXT,
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      updated_at TIMESTAMPTZ DEFAULT NOW()
+    );
   `);
 
   /* ---- Proyectos & Proveedores ---- */
@@ -299,18 +345,38 @@ export async function initDB() {
     BEGIN NEW.updated_at := NOW(); RETURN NEW; END; $$ LANGUAGE plpgsql;
   `);
 
+  // Aplica touch a tablas con updated_at
   await q(`
     DO $$
     BEGIN
       IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname='tr_proyectos_touch') THEN
-        CREATE TRIGGER tr_proyectos_touch
-        BEFORE UPDATE ON public.proyectos
+        CREATE TRIGGER tr_proyectos_touch BEFORE UPDATE ON public.proyectos
+        FOR EACH ROW EXECUTE FUNCTION touch_updated_at();
+      END IF;
+      IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='clientes' AND column_name='updated_at')
+         AND NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname='tr_clientes_touch') THEN
+        CREATE TRIGGER tr_clientes_touch BEFORE UPDATE ON public.clientes
+        FOR EACH ROW EXECUTE FUNCTION touch_updated_at();
+      END IF;
+      IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='compras' AND column_name='updated_at')
+         AND NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname='tr_compras_touch') THEN
+        CREATE TRIGGER tr_compras_touch BEFORE UPDATE ON public.compras
+        FOR EACH ROW EXECUTE FUNCTION touch_updated_at();
+      END IF;
+      IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='proveedores' AND column_name='updated_at')
+         AND NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname='tr_proveedores_touch') THEN
+        CREATE TRIGGER tr_proveedores_touch BEFORE UPDATE ON public.proveedores
+        FOR EACH ROW EXECUTE FUNCTION touch_updated_at();
+      END IF;
+      IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='slack_users' AND column_name='updated_at')
+         AND NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname='tr_slack_users_touch') THEN
+        CREATE TRIGGER tr_slack_users_touch BEFORE UPDATE ON public.slack_users
         FOR EACH ROW EXECUTE FUNCTION touch_updated_at();
       END IF;
     END$$;
   `);
 
-  /* ===== Backfill suave (incluye tu caso ya "Won") ===== */
+  /* ===== Backfill suave (incluye casos ya "Won") ===== */
   await q(`
     UPDATE public.proyectos
        SET result = lower(stage)
@@ -436,4 +502,11 @@ export async function initDB() {
   `);
   await q(`UPDATE tareas SET completada = COALESCE(completada, FALSE) WHERE completada IS NULL;`);
   await q(`UPDATE tareas SET orden = COALESCE(orden, 0) WHERE orden IS NULL;`);
+}
+
+/* ===========================
+ *  Shutdown limpio (opcional)
+ * =========================== */
+export async function closeDB() {
+  try { await db.end(); } catch {}
 }

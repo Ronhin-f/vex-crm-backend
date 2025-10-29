@@ -2,6 +2,7 @@
 import { Router } from "express";
 import { q, CANON_CATS } from "../utils/db.js";
 import { authenticateToken } from "../middleware/auth.js";
+import { emit as emitFlow } from "../services/flows.client.js";
 
 const router = Router();
 
@@ -16,6 +17,8 @@ function getUserFromReq(req) {
 const T = (v) => { if (v == null) return null; const s = String(v).trim(); return s.length ? s : null; };
 const N = (v) => (v == null || v === "" ? null : Number(v));
 const D = (v) => { if (!v) return null; const d = new Date(v); return isNaN(d.getTime()) ? null : d.toISOString(); };
+const toInt = (v) => { const n = Number(v); return Number.isInteger(n) ? n : null; };
+function getBearer(req) { return req.headers?.authorization || null; }
 
 // Selección estándar (incluye alias "notas" para compat FE)
 const SELECT_PROJECT = `
@@ -31,6 +34,7 @@ const SELECT_PROJECT = `
     p.prob_win, p.fecha_cierre_estimada,
     p.contacto_nombre,
     p.usuario_email, p.organizacion_id,
+    p.result, p.closed_at,
     p.created_at, p.updated_at
   FROM proyectos p
 `;
@@ -39,11 +43,13 @@ const SELECT_PROJECT = `
 /**
  * Filtros: q (nombre/descripcion), stage, cliente_id, source, assignee, only_due(=1)
  * Orden: updated_at DESC, id DESC
+ * Extras: limit, offset
  */
 router.get("/", authenticateToken, async (req, res) => {
   try {
     const { organizacion_id } = getUserFromReq(req);
     const { stage, cliente_id, q: qtext, source, assignee, only_due } = req.query || {};
+    let { limit = 1000, offset = 0 } = req.query || {};
 
     const params = [];
     const where = [];
@@ -62,27 +68,48 @@ router.get("/", authenticateToken, async (req, res) => {
       where.push(`(p.nombre ILIKE $${i} OR p.descripcion ILIKE $${i})`);
     }
 
+    limit = Math.max(1, Math.min(2000, Number(limit) || 1000));
+    offset = Math.max(0, Number(offset) || 0);
+    params.push(limit, offset);
+
     const sql = `
       ${SELECT_PROJECT}
       ${where.length ? "WHERE " + where.join(" AND ") : ""}
       ORDER BY p.updated_at DESC NULLS LAST, p.id DESC
-      LIMIT 1000
+      LIMIT $${params.length - 1} OFFSET $${params.length}
     `;
     const r = await q(sql, params);
     res.json({ ok: true, items: r.rows || [] });
   } catch (e) {
     console.error("[GET /proyectos]", e?.stack || e?.message || e);
-    // devolvemos vacío pero 200 para no romper el FE
-    res.status(200).json({ ok: true, items: [] });
+    res.status(200).json({ ok: true, items: [] }); // no romper FE
+  }
+});
+
+/* ============== GET /proyectos/:id ============== */
+router.get("/:id", authenticateToken, async (req, res) => {
+  try {
+    const { organizacion_id } = getUserFromReq(req);
+    const id = toInt(req.params.id);
+    if (id == null) return res.status(400).json({ ok: false, message: "ID inválido" });
+
+    const r = await q(
+      `
+      ${SELECT_PROJECT}
+      WHERE p.id = $1
+        AND (${organizacion_id != null ? "p.organizacion_id = $2" : "p.organizacion_id IS NULL"})
+      `,
+      organizacion_id != null ? [id, organizacion_id] : [id]
+    );
+    if (!r.rowCount) return res.status(404).json({ ok: false, message: "Proyecto no encontrado" });
+    res.json({ ok: true, item: r.rows[0] });
+  } catch (e) {
+    console.error("[GET /proyectos/:id]", e?.stack || e?.message || e);
+    res.status(500).json({ ok: false, message: "Error obteniendo proyecto" });
   }
 });
 
 /* ============== GET /proyectos/kanban ============== */
-/**
- * Devuelve columnas agrupadas por stage para el Kanban del FE:
- * { order: string[], columns: [{ key, title, items[] }] }
- * Acepta los mismos filtros que GET /proyectos
- */
 router.get("/kanban", authenticateToken, async (req, res) => {
   try {
     const { organizacion_id } = getUserFromReq(req);
@@ -112,7 +139,6 @@ router.get("/kanban", authenticateToken, async (req, res) => {
     const r = await q(sql, params);
     const rows = r.rows || [];
 
-    // Agrupar por stage usando pipeline canónico
     const byStage = new Map(CANON_CATS.map((s) => [s, []]));
     for (const it of rows) {
       const key = CANON_CATS.includes(it.stage) ? it.stage : CANON_CATS[0];
@@ -133,19 +159,14 @@ router.get("/kanban", authenticateToken, async (req, res) => {
 });
 
 /* ============== POST /proyectos ============== */
-/**
- * Crea un proyecto (oportunidad).
- * Requeridos: nombre
- * Opcionales: descripcion|notas, cliente_id, stage/categoria, source, assignee, due_date,
- *             estimate_url/file, estimate_amount/currency, prob_win, fecha_cierre_estimada, contacto_nombre
- */
 router.post("/", authenticateToken, async (req, res) => {
   try {
+    const bearer = getBearer(req);
     const { organizacion_id, email: usuario_email } = getUserFromReq(req);
     let {
       nombre,
       descripcion = null,
-      notas = null,                  // ⬅ compat: si viene "notas", la usamos
+      notas = null,
       cliente_id = null,
       stage = null,
       categoria = null,
@@ -165,7 +186,6 @@ router.post("/", authenticateToken, async (req, res) => {
       return res.status(400).json({ ok: false, message: "Nombre requerido" });
     }
 
-    // si solo vino "notas", la persistimos en descripcion
     if (!T(descripcion) && T(notas)) descripcion = notas;
 
     const stageIn = T(stage) ?? T(categoria) ?? CANON_CATS[0];
@@ -192,7 +212,7 @@ router.post("/", authenticateToken, async (req, res) => {
          estimate_url, estimate_file,
          estimate_amount, estimate_currency,
          prob_win, fecha_cierre_estimada, contacto_nombre,
-         usuario_email, organizacion_id, created_at, updated_at`,
+         usuario_email, organizacion_id, result, closed_at, created_at, updated_at`,
       [
         T(nombre),
         T(descripcion),
@@ -213,7 +233,30 @@ router.post("/", authenticateToken, async (req, res) => {
         organizacion_id,
       ]
     );
-    res.status(201).json({ ok: true, item: r.rows[0] });
+    const item = r.rows[0];
+
+    // Emit create
+    emitFlow(
+      "crm.lead.created",
+      {
+        org_id: String(organizacion_id || ""),
+        idempotency_key: `lead:${item.id}:created`,
+        lead: {
+          id: String(item.id),
+          name: item.nombre,
+          stage: item.stage,
+          assignee: item.assignee ? { email: item.assignee } : null,
+          client_id: item.cliente_id ? String(item.cliente_id) : null,
+          estimate: item.estimate_amount
+            ? { amount: Number(item.estimate_amount), currency: item.estimate_currency || null }
+            : null,
+        },
+        meta: { source: "vex-crm", version: "v1" },
+      },
+      { bearer }
+    ).catch((e) => console.warn("[Flows emit lead.created]", e?.message));
+
+    res.status(201).json({ ok: true, item });
   } catch (e) {
     console.error("[POST /proyectos]", e?.stack || e?.message || e);
     res.status(500).json({ ok: false, message: "Error creando proyecto" });
@@ -223,9 +266,10 @@ router.post("/", authenticateToken, async (req, res) => {
 /* ============== PATCH /proyectos/:id ============== */
 router.patch("/:id", authenticateToken, async (req, res) => {
   try {
+    const bearer = getBearer(req);
     const { organizacion_id } = getUserFromReq(req);
-    const id = Number(req.params.id);
-    if (!Number.isInteger(id)) return res.status(400).json({ ok: false, message: "ID inválido" });
+    const id = toInt(req.params.id);
+    if (id == null) return res.status(400).json({ ok: false, message: "ID inválido" });
 
     // Si viene stage/categoria, las espejamos y validamos
     const incomingStage = T(req.body?.stage ?? req.body?.categoria);
@@ -241,12 +285,11 @@ router.patch("/:id", authenticateToken, async (req, res) => {
       sets.push(`categoria = $${i++}`); values.push(incomingStage);
     }
 
-    // ⚠ compat "notas": si vino, lo mapeamos a descripcion (sin pisar si también vino descripcion)
+    // compat "notas" -> descripcion
     if (!("descripcion" in (req.body || {})) && "notas" in (req.body || {})) {
       req.body.descripcion = req.body.notas;
     }
 
-    // Resto de campos permitidos
     const allowed = {
       nombre: (v) => T(v),
       descripcion: (v) => T(v),
@@ -272,7 +315,6 @@ router.patch("/:id", authenticateToken, async (req, res) => {
     }
 
     if (!sets.length) return res.status(400).json({ ok: false, message: "Nada para actualizar" });
-    // updated_at
     sets.push(`updated_at = NOW()`);
 
     values.push(id);
@@ -289,12 +331,39 @@ router.patch("/:id", authenticateToken, async (req, res) => {
          estimate_url, estimate_file,
          estimate_amount, estimate_currency,
          prob_win, fecha_cierre_estimada, contacto_nombre,
-         usuario_email, organizacion_id, created_at, updated_at
+         usuario_email, organizacion_id, result, closed_at, created_at, updated_at
       `,
       values
     );
     if (!r.rowCount) return res.status(404).json({ ok: false, message: "Proyecto no encontrado" });
-    res.json({ ok: true, item: r.rows[0] });
+
+    const item = r.rows[0];
+
+    // Emit update / closed if corresponde
+    const isClosed = item.stage === "Won" || item.stage === "Lost";
+    const evt = isClosed ? "crm.lead.closed" : "crm.lead.updated";
+    emitFlow(
+      evt,
+      {
+        org_id: String(organizacion_id || ""),
+        idempotency_key: `lead:${item.id}:${isClosed ? "closed" : "updated"}:${Number(item.updated_at ? new Date(item.updated_at).getTime() : Date.now())}`,
+        lead: {
+          id: String(item.id),
+          name: item.nombre,
+          stage: item.stage,
+          result: item.result || (item.stage === "Won" ? "won" : item.stage === "Lost" ? "lost" : null),
+          closed_at: item.closed_at ? new Date(item.closed_at).toISOString() : null,
+          assignee: item.assignee ? { email: item.assignee } : null,
+          estimate: item.estimate_amount
+            ? { amount: Number(item.estimate_amount), currency: item.estimate_currency || null }
+            : null,
+        },
+        meta: { source: "vex-crm", version: "v1" },
+      },
+      { bearer }
+    ).catch((e) => console.warn("[Flows emit lead.update/closed]", e?.message));
+
+    res.json({ ok: true, item });
   } catch (e) {
     console.error("[PATCH /proyectos/:id]", e?.stack || e?.message || e);
     res.status(500).json({ ok: false, message: "Error actualizando proyecto" });
@@ -302,15 +371,12 @@ router.patch("/:id", authenticateToken, async (req, res) => {
 });
 
 /* ============== PATCH /proyectos/:id/stage ============== */
-/**
- * Body: { stage }  (acepta "categoria" por compat)
- * Espeja stage <-> categoria, con guardia por organización.
- */
 router.patch("/:id/stage", authenticateToken, async (req, res) => {
   try {
+    const bearer = getBearer(req);
     const { organizacion_id } = getUserFromReq(req);
-    const id = Number(req.params.id);
-    if (!Number.isInteger(id)) return res.status(400).json({ ok: false, message: "ID inválido" });
+    const id = toInt(req.params.id);
+    if (id == null) return res.status(400).json({ ok: false, message: "ID inválido" });
 
     const next = T(req.body?.stage ?? req.body?.categoria);
     if (!next) return res.status(400).json({ ok: false, message: "stage requerido" });
@@ -326,11 +392,33 @@ router.patch("/:id/stage", authenticateToken, async (req, res) => {
           estimate_url, estimate_file,
           estimate_amount, estimate_currency,
           prob_win, fecha_cierre_estimada, contacto_nombre,
-          usuario_email, organizacion_id, created_at, updated_at`,
+          usuario_email, organizacion_id, result, closed_at, created_at, updated_at`,
       organizacion_id != null ? [next, id, organizacion_id] : [next, id]
     );
     if (!r.rowCount) return res.status(404).json({ ok: false, message: "Proyecto no encontrado" });
-    res.json({ ok: true, item: r.rows[0] });
+
+    const item = r.rows[0];
+    const isClosed = item.stage === "Won" || item.stage === "Lost";
+
+    emitFlow(
+      isClosed ? "crm.lead.closed" : "crm.lead.stage_changed",
+      {
+        org_id: String(organizacion_id || ""),
+        idempotency_key: `lead:${item.id}:${isClosed ? "closed" : "stage"}:${item.stage}`,
+        lead: {
+          id: String(item.id),
+          name: item.nombre,
+          stage: item.stage,
+          result: item.result || (item.stage === "Won" ? "won" : item.stage === "Lost" ? "lost" : null),
+          closed_at: item.closed_at ? new Date(item.closed_at).toISOString() : null,
+          assignee: item.assignee ? { email: item.assignee } : null,
+        },
+        meta: { source: "vex-crm", version: "v1" },
+      },
+      { bearer }
+    ).catch((e) => console.warn("[Flows emit lead.stage/closed]", e?.message));
+
+    res.json({ ok: true, item });
   } catch (e) {
     console.error("[PATCH /proyectos/:id/stage]", e?.stack || e?.message || e);
     res.status(500).json({ ok: false, message: "Error moviendo de etapa" });
@@ -338,14 +426,12 @@ router.patch("/:id/stage", authenticateToken, async (req, res) => {
 });
 
 /* ============== PATCH /proyectos/:id/estimate ============== */
-/**
- * Body: { amount, currency }
- */
 router.patch("/:id/estimate", authenticateToken, async (req, res) => {
   try {
+    const bearer = getBearer(req);
     const { organizacion_id } = getUserFromReq(req);
-    const id = Number(req.params.id);
-    if (!Number.isInteger(id)) return res.status(400).json({ ok: false, message: "ID inválido" });
+    const id = toInt(req.params.id);
+    if (id == null) return res.status(400).json({ ok: false, message: "ID inválido" });
 
     const amount = N(req.body?.amount);
     const currency = T(req.body?.currency);
@@ -360,11 +446,32 @@ router.patch("/:id/estimate", authenticateToken, async (req, res) => {
           estimate_url, estimate_file,
           estimate_amount, estimate_currency,
           prob_win, fecha_cierre_estimada, contacto_nombre,
-          usuario_email, organizacion_id, created_at, updated_at`,
+          usuario_email, organizacion_id, result, closed_at, created_at, updated_at`,
       organizacion_id != null ? [amount, currency, id, organizacion_id] : [amount, currency, id]
     );
     if (!r.rowCount) return res.status(404).json({ ok: false, message: "Proyecto no encontrado" });
-    res.json({ ok: true, item: r.rows[0] });
+
+    const item = r.rows[0];
+
+    emitFlow(
+      "crm.lead.estimated",
+      {
+        org_id: String(organizacion_id || ""),
+        idempotency_key: `lead:${item.id}:estimate:${Number(item.updated_at ? new Date(item.updated_at).getTime() : Date.now())}`,
+        lead: {
+          id: String(item.id),
+          name: item.nombre,
+          stage: item.stage,
+          estimate: item.estimate_amount
+            ? { amount: Number(item.estimate_amount), currency: item.estimate_currency || null }
+            : null,
+        },
+        meta: { source: "vex-crm", version: "v1" },
+      },
+      { bearer }
+    ).catch((e) => console.warn("[Flows emit lead.estimated]", e?.message));
+
+    res.json({ ok: true, item });
   } catch (e) {
     console.error("[PATCH /proyectos/:id/estimate]", e?.stack || e?.message || e);
     res.status(500).json({ ok: false, message: "Error actualizando estimate" });
@@ -374,15 +481,47 @@ router.patch("/:id/estimate", authenticateToken, async (req, res) => {
 /* ============== DELETE /proyectos/:id ============== */
 router.delete("/:id", authenticateToken, async (req, res) => {
   try {
+    const bearer = getBearer(req);
     const { organizacion_id } = getUserFromReq(req);
-    const id = Number(req.params.id);
-    if (!Number.isInteger(id)) return res.status(400).json({ ok: false, message: "ID inválido" });
+    const id = toInt(req.params.id);
+    if (id == null) return res.status(400).json({ ok: false, message: "ID inválido" });
+
+    // Tomar datos para emitir antes de borrar
+    const prev = await q(
+      `
+      ${SELECT_PROJECT}
+      WHERE p.id=$1
+        AND (${organizacion_id != null ? "p.organizacion_id = $2" : "p.organizacion_id IS NULL"})
+      `,
+      organizacion_id != null ? [id, organizacion_id] : [id]
+    );
 
     const r = await q(
-      `DELETE FROM proyectos WHERE id = $1 ${organizacion_id != null ? "AND organizacion_id = $2" : ""}`,
+      `DELETE FROM proyectos
+        WHERE id = $1 ${organizacion_id != null ? "AND organizacion_id = $2" : ""}`,
       organizacion_id != null ? [id, organizacion_id] : [id]
     );
     if (!r.rowCount) return res.status(404).json({ ok: false, message: "Proyecto no encontrado" });
+
+    if (prev.rowCount) {
+      const p = prev.rows[0];
+      emitFlow(
+        "crm.lead.deleted",
+        {
+          org_id: String(p.organizacion_id || ""),
+          idempotency_key: `lead:${p.id}:deleted`,
+          lead: {
+            id: String(p.id),
+            name: p.nombre,
+            stage: p.stage,
+            assignee: p.assignee ? { email: p.assignee } : null,
+          },
+          meta: { source: "vex-crm", version: "v1" },
+        },
+        { bearer }
+      ).catch((e) => console.warn("[Flows emit lead.deleted]", e?.message));
+    }
+
     res.json({ ok: true });
   } catch (e) {
     console.error("[DELETE /proyectos/:id]", e?.stack || e?.message || e);
