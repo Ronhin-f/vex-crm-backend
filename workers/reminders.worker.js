@@ -1,6 +1,7 @@
 // workers/reminders.worker.js — ESM
 import cron from "node-cron";
 import { pool } from "../utils/db.js";
+import { emit as emitFlow } from "../services/flows.client.js"; // ⬅️ Flows (Bearer de Core)
 
 // Cron & TZ
 const CRON = process.env.REMINDER_CRON ?? "*/10 * * * *";
@@ -20,9 +21,9 @@ const q = (text, params) => pool.query(text, params);
 /**
  * Una pasada:
  * - Toma hasta 100 recordatorios vencidos (FOR UPDATE SKIP LOCKED)
- * - Los marca en_proceso y devuelve datos enriquecidos para Slack
- * - Envía a Slack
- * - Marca enviado o reprograma con backoff si falla
+ * - Los marca en_proceso y devuelve datos enriquecidos
+ * - Emite evento a Flows (Bearer de Core) + Slack fallback
+ * - Marca enviado o reprograma con backoff si falla Slack
  */
 export async function runRemindersOnce() {
   const client = await pool.connect();
@@ -57,13 +58,14 @@ export async function runRemindersOnce() {
       )
       SELECT
         u.id,
-        COALESCE(u.mensaje, u.titulo, t.titulo, 'Recordatorio')         AS body,
+        u.tarea_id,                                                     -- ⬅️ lo traemos para Flows
+        COALESCE(u.mensaje, u.titulo, t.titulo, 'Recordatorio') AS body,
         u.enviar_en,
-        COALESCE(u.organizacion_id, c.organizacion_id, $1::text)        AS org_id,
+        COALESCE(u.organizacion_id, c.organizacion_id, $1::text) AS org_id,
         t.usuario_email,
         t.vence_en,
-        COALESCE(i.slack_webhook_url, $2::text)                          AS webhook,
-        COALESCE(i.slack_default_channel, $3::text)                      AS channel
+        COALESCE(i.slack_webhook_url, $2::text) AS webhook,
+        COALESCE(i.slack_default_channel, $3::text) AS channel
       FROM upd u
       LEFT JOIN tareas   t ON t.id = u.tarea_id
       LEFT JOIN clientes c ON c.id = t.cliente_id
@@ -85,8 +87,32 @@ export async function runRemindersOnce() {
 
   if (!grabbed.length) return;
 
-  // 2) Envío fuera de la transacción
+  // 2) Emisión a Flows + Slack fuera de la transacción
   for (const r of grabbed) {
+    // Emit a Flows (no bloquea Slack; usa CORE_MACHINE_TOKEN en flows.client)
+    try {
+      await emitFlow("crm.reminder.due", {
+        org_id: String(r.org_id || ""),
+        idempotency_key: `reminder:${r.id}:${new Date(r.enviar_en).toISOString()}`,
+        reminder: {
+          id: String(r.id),
+          tarea_id: r.tarea_id != null ? String(r.tarea_id) : null,
+          body: r.body,
+          scheduled_at: new Date(r.enviar_en).toISOString(),
+        },
+        task: {
+          id: r.tarea_id != null ? String(r.tarea_id) : null,
+          due_at: r.vence_en ? new Date(r.vence_en).toISOString() : null,
+          assigned_to: { email: r.usuario_email || null },
+        },
+        notify: { channel: r.channel || null, provider: "slack" },
+        meta: { source: "vex-crm", version: "v1" },
+      });
+    } catch (e) {
+      console.warn("[Flows emit crm.reminder.due]", e?.message || e);
+    }
+
+    // Slack fallback
     const ok = await sendToSlack(r).catch(() => false);
 
     if (ok) {

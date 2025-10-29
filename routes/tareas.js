@@ -2,6 +2,7 @@
 import { Router } from "express";
 import { q } from "../utils/db.js";
 import { authenticateToken } from "../middleware/auth.js";
+import { emit as emitFlow } from "../services/flows.client.js";
 
 const router = Router();
 
@@ -20,6 +21,10 @@ function getUserFromReq(req) {
       u.organization_id ??
       null,
   };
+}
+
+function getBearer(req) {
+  return req.headers?.authorization || null;
 }
 
 function coerceText(v) {
@@ -75,7 +80,6 @@ router.get("/", authenticateToken, async (req, res) => {
 
     if (qtext) {
       const like = `%${String(qtext).trim().toLowerCase()}%`;
-      // usamos COALESCE para evitar nulls en descripcion
       params.push(like, like);
       const i1 = params.length - 1;
       const i2 = params.length;
@@ -107,13 +111,14 @@ router.get("/", authenticateToken, async (req, res) => {
 /**
  * Crea una tarea.
  * Body mínimo: { titulo }
- * Opcionales: descripcion, cliente_id, vence_en, estado
+ * Opcionales: descripcion, cliente_id, vence_en, estado, usuario_email | assignee_email, orden
  * - Si no envían estado, 'todo'
  * - Si no envían orden, se coloca al final del carril
  */
 router.post("/", authenticateToken, async (req, res) => {
   try {
-    const { email: usuario_email, organizacion_id } = getUserFromReq(req);
+    const bearer = getBearer(req);
+    const { email: creador_email, organizacion_id } = getUserFromReq(req);
 
     let {
       titulo,
@@ -122,11 +127,16 @@ router.post("/", authenticateToken, async (req, res) => {
       vence_en = null,
       estado = "todo",
       orden = null,
+      usuario_email: body_usuario_email,
+      assignee_email, // alias del FE
     } = req.body || {};
 
     if (!titulo || !titulo.trim()) {
       return res.status(400).json({ message: "Título requerido" });
     }
+
+    // asignado: prioridad body → creador
+    let usuario_email = coerceText(body_usuario_email || assignee_email) || creador_email || null;
 
     titulo = titulo.trim();
     descripcion = coerceText(descripcion);
@@ -158,7 +168,24 @@ router.post("/", authenticateToken, async (req, res) => {
       [titulo, descripcion, cliente_id, estado, orden, vence_en, usuario_email, organizacion_id]
     );
 
-    res.status(201).json(ins.rows[0]);
+    const t = ins.rows[0];
+
+    // Flows: task.created (no bloquea la respuesta)
+    emitFlow("crm.task.created", {
+      org_id: String(organizacion_id || ""),
+      idempotency_key: `task:${t.id}:created`,
+      task: {
+        id: String(t.id),
+        title: t.titulo,
+        description: t.descripcion || null,
+        status: t.estado,
+        due_at: t.vence_en ? new Date(t.vence_en).toISOString() : null,
+        assigned_to: { email: t.usuario_email || null },
+      },
+      meta: { source: "vex-crm", version: "v1" },
+    }, { bearer }).catch((e) => console.warn("[Flows emit task.created]", e?.message));
+
+    res.status(201).json(t);
   } catch (e) {
     console.error("[POST /tareas]", e?.stack || e?.message || e);
     res.status(500).json({ message: "Error al crear tarea" });
@@ -168,19 +195,27 @@ router.post("/", authenticateToken, async (req, res) => {
 /* ========== UPDATE genérico: PATCH y PUT comparten lógica ========== */
 async function updateTaskGeneric(req, res, { emptyAsComplete = false } = {}) {
   try {
+    const bearer = getBearer(req);
     const { organizacion_id } = getUserFromReq(req);
     const id = Number(req.params.id);
     if (!Number.isInteger(id)) return res.status(400).json({ message: "ID inválido" });
 
-    const allowed = ["titulo","descripcion","cliente_id","vence_en","estado","orden","completada"];
+    // permitimos cambiar asignado vía usuario_email/assignee_email
+    const allowed = ["titulo","descripcion","cliente_id","vence_en","estado","orden","completada","usuario_email"];
     const fields = [];
     const values = [];
     let idx = 1;
 
+    // alias → usuario_email
+    if ("assignee_email" in (req.body || {})) {
+      req.body.usuario_email = req.body.assignee_email;
+      delete req.body.assignee_email;
+    }
+
     for (const k of allowed) {
       if (k in (req.body || {})) {
         let v = req.body[k];
-        if (k === "titulo" || k === "descripcion") v = coerceText(v);
+        if (k === "titulo" || k === "descripcion" || k === "usuario_email") v = coerceText(v);
         if (k === "vence_en") v = coerceDate(v);
         if (k === "cliente_id") v = v != null ? parseInt(v, 10) : null;
         if (k === "estado" && v) v = VALID_ESTADOS.includes(v) ? v : "todo";
@@ -215,7 +250,22 @@ async function updateTaskGeneric(req, res, { emptyAsComplete = false } = {}) {
       );
 
       if (!rDone.rowCount) return res.status(404).json({ message: "Tarea no encontrada" });
-      return res.json(rDone.rows[0]);
+
+      const t = rDone.rows[0];
+      emitFlow("crm.task.completed", {
+        org_id: String(organizacion_id || ""),
+        idempotency_key: `task:${t.id}:completed`,
+        task: {
+          id: String(t.id),
+          status: t.estado,
+          due_at: t.vence_en ? new Date(t.vence_en).toISOString() : null,
+          assigned_to: { email: t.usuario_email || null },
+          completed: true,
+        },
+        meta: { source: "vex-crm", version: "v1" },
+      }, { bearer }).catch((e) => console.warn("[Flows emit task.completed]", e?.message));
+
+      return res.json(t);
     }
 
     if (!fields.length) return res.status(400).json({ message: "Nada para actualizar" });
@@ -235,7 +285,23 @@ async function updateTaskGeneric(req, res, { emptyAsComplete = false } = {}) {
     );
 
     if (!r.rowCount) return res.status(404).json({ message: "Tarea no encontrada" });
-    return res.json(r.rows[0]);
+
+    const t = r.rows[0];
+    emitFlow("crm.task.updated", {
+      org_id: String(organizacion_id || ""),
+      idempotency_key: `task:${t.id}:updated:${t.orden || 0}`,
+      task: {
+        id: String(t.id),
+        title: t.titulo,
+        status: t.estado,
+        due_at: t.vence_en ? new Date(t.vence_en).toISOString() : null,
+        completed: !!t.completada,
+        assigned_to: { email: t.usuario_email || null },
+      },
+      meta: { source: "vex-crm", version: "v1" },
+    }, { bearer }).catch((e) => console.warn("[Flows emit task.updated]", e?.message));
+
+    return res.json(t);
   } catch (e) {
     console.error("[UPDATE /tareas/:id]", e?.stack || e?.message || e);
     return res.status(500).json({ message: "Error al editar tarea" });
@@ -254,32 +320,50 @@ router.put("/:id", authenticateToken, (req, res) =>
   updateTaskGeneric(req, res, { emptyAsComplete: false })
 );
 
-/* =================== PATCH /complete (toggle) =================== */
-/** Marca/desmarca completada. Body: { completada: boolean } */
-router.patch("/:id/complete", authenticateToken, async (req, res) => {
+/* ================== PATCH /assign (cambiar asignado) ================== */
+/** Body: { usuario_email | assignee_email } */
+router.patch("/:id/assign", authenticateToken, async (req, res) => {
   try {
+    const bearer = getBearer(req);
     const { organizacion_id } = getUserFromReq(req);
     const id = Number(req.params.id);
-    const completada = !!req.body?.completada;
+    const usuario_email = coerceText(req.body?.usuario_email || req.body?.assignee_email);
 
     if (!Number.isInteger(id)) return res.status(400).json({ message: "ID inválido" });
+    if (!usuario_email) return res.status(400).json({ message: "usuario_email requerido" });
 
     const r = await q(
       `
       UPDATE tareas
-         SET completada = $1
+         SET usuario_email = $1
        WHERE id = $2
          AND (${organizacion_id != null ? "organizacion_id = $3" : "organizacion_id IS NULL"})
        RETURNING id, titulo, descripcion, cliente_id, estado, orden, vence_en, completada, created_at, usuario_email
       `,
-      organizacion_id != null ? [completada, id, organizacion_id] : [completada, id]
+      organizacion_id != null ? [usuario_email, id, organizacion_id] : [usuario_email, id]
     );
 
     if (!r.rowCount) return res.status(404).json({ message: "Tarea no encontrada" });
-    res.json(r.rows[0]);
+    const t = r.rows[0];
+
+    emitFlow("crm.task.updated", {
+      org_id: String(organizacion_id || ""),
+      idempotency_key: `task:${t.id}:updated:assignee`,
+      task: {
+        id: String(t.id),
+        title: t.titulo,
+        status: t.estado,
+        due_at: t.vence_en ? new Date(t.vence_en).toISOString() : null,
+        completed: !!t.completada,
+        assigned_to: { email: t.usuario_email || null },
+      },
+      meta: { source: "vex-crm", version: "v1" },
+    }, { bearer }).catch((e) => console.warn("[Flows emit task.updated/assign]", e?.message));
+
+    res.json(t);
   } catch (e) {
-    console.error("[PATCH /tareas/:id/complete]", e?.stack || e?.message || e);
-    res.status(500).json({ message: "Error al completar tarea" });
+    console.error("[PATCH /tareas/:id/assign]", e?.stack || e?.message || e);
+    res.status(500).json({ message: "Error al asignar tarea" });
   }
 });
 
