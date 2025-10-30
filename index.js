@@ -8,9 +8,7 @@ import axios from "axios";
 import cron from "node-cron";
 import { applySecurity } from "./middleware/security.js";
 import { initDB, q, pool } from "./utils/db.js";
-// ⬇️ Import correcto del auth middleware y (opcional) requireRole
 import { authenticateToken as auth, requireRole } from "./middleware/auth.js";
-
 import { scheduleReminders } from "./workers/reminders.worker.js";
 
 // ✅ Defaults útiles (no pisan Railway)
@@ -31,7 +29,12 @@ if (process.env.NODE_ENV !== "test") {
     morgan(process.env.LOG_FORMAT || "tiny", {
       stream: {
         write: (s) =>
-          console.log(s.trim().replace(/vex_token=[^&]+/g, "vex_token=REDACTED")),
+          console.log(
+            s
+              .trim()
+              .replace(/vex_token=[^&]+/g, "vex_token=REDACTED")
+              .replace(/Authorization:\s*Bearer\s+[A-Za-z0-9._-]+/gi, "Authorization: Bearer REDACTED")
+          ),
       },
     })
   );
@@ -66,7 +69,7 @@ try {
 async function mount(pathname, modulePath) {
   try {
     const mod = await import(modulePath);
-    const router = mod.default || mod.router || mod; // soporta default/named
+    const router = mod.default || mod.router || mod;
     if (router && typeof router === "function") {
       app.use(pathname, router);
       console.log(`✅ Ruta montada: ${pathname} <- ${modulePath}`);
@@ -91,7 +94,7 @@ await mount("/compras",        "./routes/compras.js");
 
 // CRM utilidades
 await mount("/categorias",     "./routes/categorias.js");
-await mount("/kanban",         "./routes/kanban.js");      // Kanban + KPIs
+await mount("/kanban",         "./routes/kanban.js");             // Kanban + KPIs
 await mount("/tareas",         "./routes/tareas.js");
 await mount("/dashboard",      "./routes/dashboard.js");
 
@@ -103,7 +106,7 @@ await mount("/upload",         "./routes/upload.js");
 await mount("/modulos",        "./routes/modulos.js");
 await mount("/integraciones",  "./routes/integraciones.js");
 // Ojo con el nombre del archivo real:
-await mount("/jobs",           "./routes/job.js");         // <- si tu archivo es jobs.js, cambiá este path
+await mount("/jobs",           "./routes/job.js");                // si es jobs.js, cambiá aquí a "./routes/jobs.js"
 await mount("/ai",             "./routes/ai.js");
 await mount("/health",         "./routes/health.js");
 
@@ -114,7 +117,7 @@ await mount("/web",            "./routes/web.js");
 // middleware multi-tenant (corrige req.user → req.usuario)
 function withOrg(req, res, next) {
   const org =
-    req.usuario?.organizacion_id ||   // ⬅️ clave correcta según auth.js
+    req.usuario?.organizacion_id ||
     req.headers["x-org-id"] ||
     req.query.organizacion_id ||
     null;
@@ -251,6 +254,9 @@ app.listen(PORT, () => console.log(`✅ VEX CRM en :${PORT} | dbReady=${dbReady}
  * Helpers locales: esquema invoices + worker reminders
  * =======================================================*/
 async function ensureInvoicesSchema() {
+  // indispensable para gen_random_uuid()
+  await q(`CREATE EXTENSION IF NOT EXISTS pgcrypto;`);
+
   await q(`DO $$ BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'invoice_status') THEN
       CREATE TYPE invoice_status AS ENUM ('draft','sent','partial','paid','overdue','void');
