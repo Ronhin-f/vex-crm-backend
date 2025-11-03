@@ -69,7 +69,7 @@ try {
 async function mount(pathname, modulePath) {
   try {
     const mod = await import(modulePath);
-    const router = mod.default || mod.router || mod;
+    const router = mod.default || mod.router || mod; // soporta default/named
     if (router && typeof router === "function") {
       app.use(pathname, router);
       console.log(`✅ Ruta montada: ${pathname} <- ${modulePath}`);
@@ -88,6 +88,10 @@ await mount("/clientes",       "./routes/clientes.js");
 await mount("/proyectos",      "./routes/proyectos.js");          // pipeline basado en proyectos
 await mount("/proyectos",      "./routes/proyectos.assign.js");   // reasignación + follow-up
 await mount("/proveedores",    "./routes/proveedores.js");        // proveedores/subcontratistas
+
+// 🔑 Usuarios (para "Asignado a" en Tareas)
+await mount("/users",          "./routes/users.js");              // principal
+await mount("/usuarios",       "./routes/users.js");              // alias de compat
 
 // Legacy/compat
 await mount("/compras",        "./routes/compras.js");
@@ -117,7 +121,7 @@ await mount("/web",            "./routes/web.js");
 // middleware multi-tenant (corrige req.user → req.usuario)
 function withOrg(req, res, next) {
   const org =
-    req.usuario?.organizacion_id ||
+    req.usuario?.organizacion_id ||   // ⬅️ clave correcta según auth.js
     req.headers["x-org-id"] ||
     req.query.organizacion_id ||
     null;

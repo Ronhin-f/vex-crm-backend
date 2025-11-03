@@ -10,7 +10,7 @@ const router = Router();
 function getUserFromReq(req) {
   const u = req.usuario || {};
   return {
-    email: u.email ?? req.usuario_email ?? u.usuario_email ?? null,
+    email: (u.email ?? req.usuario_email ?? u.usuario_email ?? null) || null,
     organizacion_id: u.organizacion_id ?? req.organizacion_id ?? u.organization_id ?? null,
   };
 }
@@ -18,7 +18,8 @@ const T = (v) => { if (v == null) return null; const s = String(v).trim(); retur
 const N = (v) => (v == null || v === "" ? null : Number(v));
 const D = (v) => { if (!v) return null; const d = new Date(v); return isNaN(d.getTime()) ? null : d.toISOString(); };
 const toInt = (v) => { const n = Number(v); return Number.isInteger(n) ? n : null; };
-function getBearer(req) { return req.headers?.authorization || null; }
+const getBearer = (req) => req.headers?.authorization || null;
+const emailNorm = (v) => (T(v) ? String(v).trim().toLowerCase() : null);
 
 // Selección estándar (incluye alias "notas" para compat FE)
 const SELECT_PROJECT = `
@@ -39,6 +40,63 @@ const SELECT_PROJECT = `
   FROM proyectos p
 `;
 
+/* ============== OPTIONS para dropdowns (antes de :id) ============== */
+/**
+ * GET /proyectos/options
+ * Devuelve { stages, sources, assignees }
+ * sources: unión de distintos en DB + defaults
+ * assignees: distintos en DB + usuario actual
+ */
+router.get("/options", authenticateToken, async (req, res) => {
+  try {
+    const { organizacion_id, email } = getUserFromReq(req);
+
+    const params = [];
+    const where = [];
+    if (organizacion_id) { params.push(organizacion_id); where.push(`p.organizacion_id = $${params.length}`); }
+
+    // Distinct sources
+    const srcSQL = `
+      SELECT DISTINCT p.source AS v
+      FROM proyectos p
+      ${where.length ? "WHERE " + where.join(" AND ") : ""}
+      AND p.source IS NOT NULL AND p.source <> ''
+      ORDER BY 1
+    `;
+    const srcQ = await q(srcSQL, params);
+    const dbSources = (srcQ.rows || []).map(r => r.v).filter(Boolean);
+
+    // Distinct assignees
+    const asgSQL = `
+      SELECT DISTINCT p.assignee AS v
+      FROM proyectos p
+      ${where.length ? "WHERE " + where.join(" AND ") : ""}
+      AND p.assignee IS NOT NULL AND p.assignee <> ''
+      ORDER BY 1
+    `;
+    const asgQ = await q(asgSQL, params);
+    const dbAssignees = (asgQ.rows || []).map(r => String(r.v).toLowerCase()).filter(Boolean);
+
+    const defaultSources = [
+      "Website","Referral","Email","WhatsApp","Phone",
+      "Instagram","Facebook","Google Ads","LinkedIn","Cold Outreach","Event","Walk-in"
+    ];
+
+    const sourcesSet = new Set([...defaultSources, ...dbSources]);
+    const assigneesSet = new Set([...(email ? [String(email).toLowerCase()] : []), ...dbAssignees]);
+
+    res.json({
+      ok: true,
+      stages: CANON_CATS,
+      sources: Array.from(sourcesSet),
+      assignees: Array.from(assigneesSet),
+    });
+  } catch (e) {
+    console.error("[GET /proyectos/options]", e?.stack || e?.message || e);
+    res.json({ ok: true, stages: CANON_CATS, sources: [], assignees: [] });
+  }
+});
+
 /* ============== GET /proyectos ============== */
 /**
  * Filtros: q (nombre/descripcion), stage, cliente_id, source, assignee, only_due(=1)
@@ -48,7 +106,12 @@ const SELECT_PROJECT = `
 router.get("/", authenticateToken, async (req, res) => {
   try {
     const { organizacion_id } = getUserFromReq(req);
-    const { stage, cliente_id, q: qtext, source, assignee, only_due } = req.query || {};
+    const { stage, cliente_id, q: qtext } = req.query || {};
+    // aceptar alias en filtros
+    const source = req.query?.source ?? req.query?.origen ?? null;
+    const assignee = req.query?.assignee ?? req.query?.responsable ?? null;
+    const only_due = req.query?.only_due;
+
     let { limit = 1000, offset = 0 } = req.query || {};
 
     const params = [];
@@ -113,7 +176,10 @@ router.get("/:id", authenticateToken, async (req, res) => {
 router.get("/kanban", authenticateToken, async (req, res) => {
   try {
     const { organizacion_id } = getUserFromReq(req);
-    const { q: qtext, source, assignee, only_due } = req.query || {};
+    const { q: qtext } = req.query || {};
+    const source = req.query?.source ?? req.query?.origen ?? null;
+    const assignee = req.query?.assignee ?? req.query?.responsable ?? null;
+    const only_due = req.query?.only_due;
 
     const params = [];
     const where = [];
@@ -163,6 +229,15 @@ router.post("/", authenticateToken, async (req, res) => {
   try {
     const bearer = getBearer(req);
     const { organizacion_id, email: usuario_email } = getUserFromReq(req);
+
+    // alias español → campos internos
+    if (!("assignee" in (req.body || {})) && "responsable" in (req.body || {})) {
+      req.body.assignee = req.body.responsable;
+    }
+    if (!("source" in (req.body || {})) && "origen" in (req.body || {})) {
+      req.body.source = req.body.origen;
+    }
+
     let {
       nombre,
       descripcion = null,
@@ -220,7 +295,7 @@ router.post("/", authenticateToken, async (req, res) => {
         finalStage,
         finalStage,
         T(source),
-        T(assignee),
+        emailNorm(assignee),
         D(due_date),
         T(estimate_url),
         T(estimate_file),
@@ -229,7 +304,7 @@ router.post("/", authenticateToken, async (req, res) => {
         N(prob_win),
         D(fecha_cierre_estimada),
         T(contacto_nombre),
-        usuario_email,
+        emailNorm(usuario_email),
         organizacion_id,
       ]
     );
@@ -271,6 +346,17 @@ router.patch("/:id", authenticateToken, async (req, res) => {
     const id = toInt(req.params.id);
     if (id == null) return res.status(400).json({ ok: false, message: "ID inválido" });
 
+    // alias español → internos
+    if (!("descripcion" in (req.body || {})) && "notas" in (req.body || {})) {
+      req.body.descripcion = req.body.notas;
+    }
+    if (!("assignee" in (req.body || {})) && "responsable" in (req.body || {})) {
+      req.body.assignee = req.body.responsable;
+    }
+    if (!("source" in (req.body || {})) && "origen" in (req.body || {})) {
+      req.body.source = req.body.origen;
+    }
+
     // Si viene stage/categoria, las espejamos y validamos
     const incomingStage = T(req.body?.stage ?? req.body?.categoria);
     const sets = [];
@@ -285,17 +371,12 @@ router.patch("/:id", authenticateToken, async (req, res) => {
       sets.push(`categoria = $${i++}`); values.push(incomingStage);
     }
 
-    // compat "notas" -> descripcion
-    if (!("descripcion" in (req.body || {})) && "notas" in (req.body || {})) {
-      req.body.descripcion = req.body.notas;
-    }
-
     const allowed = {
       nombre: (v) => T(v),
       descripcion: (v) => T(v),
       cliente_id: (v) => (v == null || v === "" ? null : Number(v)),
       source: (v) => T(v),
-      assignee: (v) => T(v),
+      assignee: (v) => emailNorm(v),
       due_date: (v) => D(v),
       estimate_url: (v) => T(v),
       estimate_file: (v) => T(v),
@@ -339,7 +420,7 @@ router.patch("/:id", authenticateToken, async (req, res) => {
 
     const item = r.rows[0];
 
-    // Emit update / closed if corresponde
+    // Emit update / closed si corresponde
     const isClosed = item.stage === "Won" || item.stage === "Lost";
     const evt = isClosed ? "crm.lead.closed" : "crm.lead.updated";
     emitFlow(
