@@ -48,6 +48,9 @@ const UPLOAD_DIR = process.env.UPLOAD_DIR || path.join(process.cwd(), "uploads")
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 app.use("/uploads", express.static(UPLOAD_DIR));
 
+// Silenciar 404 de favicon en consola
+app.get("/favicon.ico", (_req, res) => res.status(204).end());
+
 /* ───────── Health & readiness ───────── */
 let dbReady = false;
 app.get("/healthz", (_req, res) => res.status(200).json({ ok: true, minimal: true }));
