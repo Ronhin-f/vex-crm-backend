@@ -1,9 +1,11 @@
-// routes/analytics.js — KPIs CRM (ESM) - actualizado
-// Incluye: resolución robusta de organizacion_id, won/lost multi-idioma,
-// y métricas financieras (AR/DSO) cuando hay invoices o vista v_ar_aging.
+// routes/analytics.js — KPIs CRM (ESM) - actualizado y robusto
+// - org_id robusto (JWT → x-org-id → query/body → lookup por email → fallback)
+// - won/lost multi-idioma
+// - AR/DSO con detección de vista/tabla
+// - incluye GET /analytics/kpis y GET /analytics/tasks/kpis
 
 import { Router } from "express";
-import { q, CANON_CATS } from "../utils/db.js";
+import { q } from "../utils/db.js";
 import { authenticateToken } from "../middleware/auth.js";
 
 const router = Router();
@@ -13,28 +15,63 @@ function getUserFromReq(req) {
   const u = req.usuario || req.user || {};
   return {
     email: u.email ?? req.usuario_email ?? u.usuario_email ?? null,
-    organizacion_id: u.organizacion_id ?? req.organizacion_id ?? u.organization_id ?? null,
+    organizacion_id:
+      u.organizacion_id ??
+      req.organizacion_id ??
+      u.organization_id ??
+      null,
   };
 }
 
-async function resolveOrgId(req) {
-  const u = getUserFromReq(req);
-  if (u?.organizacion_id && String(u.organizacion_id).trim() !== "") {
-    return String(u.organizacion_id);
+function firstText(...vals) {
+  for (const v of vals) {
+    if (v == null) continue;
+    const s = String(v).trim();
+    if (s) return s;
   }
-  if (u?.email) {
-    const r = await q(`SELECT organizacion_id FROM usuarios WHERE email = $1`, [u.email]);
+  return null;
+}
+
+async function resolveOrgId(req) {
+  // 1) JWT / user object
+  const u = getUserFromReq(req);
+  const fromUser = firstText(u?.organizacion_id);
+  if (fromUser) return fromUser;
+
+  // 2) Header x-org-id
+  const fromHeader = firstText(req.headers?.["x-org-id"]);
+  if (fromHeader) return fromHeader;
+
+  // 3) Query/body fallbacks comunes
+  const fromQueryOrBody = firstText(
+    req.query?.organizacion_id,
+    req.query?.organization_id,
+    req.query?.org_id,
+    req.body?.organizacion_id,
+    req.body?.organization_id,
+    req.body?.org_id
+  );
+  if (fromQueryOrBody) return fromQueryOrBody;
+
+  // 4) Lookup por email (si hay)
+  const email = firstText(u?.email);
+  if (email) {
+    const r = await q(
+      `SELECT organizacion_id FROM usuarios WHERE email = $1 LIMIT 1`,
+      [email]
+    );
     const org = r.rows?.[0]?.organizacion_id;
     if (org) return String(org);
   }
-  // 🔒 Fallback seguro para tu cuenta mientras propagamos JWT con org
+
+  // 5) 🔒 Fallback seguro mientras propagamos JWT con org
   return "10";
 }
 
 function parseRange(query) {
   const now = new Date();
-  const to = query.to ? new Date(query.to) : now;
-  const from = query.from ? new Date(query.from) : new Date(to.getTime() - 30 * 86400000);
+  const to = query?.to ? new Date(query.to) : now;
+  const from = query?.from ? new Date(query.from) : new Date(to.getTime() - 30 * 86400000);
   const safeTo = isNaN(to.getTime()) ? now : to;
   const safeFrom = isNaN(from.getTime()) ? new Date(safeTo.getTime() - 30 * 86400000) : from;
   return { fromISO: safeFrom.toISOString(), toISO: safeTo.toISOString() };
@@ -47,6 +84,7 @@ function pct(n, d) {
 }
 
 async function pickPipelineTable() {
+  // Sólo devuelve valores fijos para evitar inyección
   const r = await q(
     `SELECT EXISTS (
        SELECT 1 FROM information_schema.tables
@@ -66,7 +104,7 @@ function nocache(_req, res, next) {
   next();
 }
 
-function contactsabilitySafe(row) {
+function contactabilitySafe(row) {
   if (!row) return 0;
   const p = Number(row.pct);
   return Number.isFinite(p) ? p : 0;
@@ -81,7 +119,7 @@ async function regclassExists(name) {
   }
 }
 
-/* ============================ KPIs ============================ */
+/* ============================ KPIs (CRM) ============================ */
 /**
  * GET /analytics/kpis?from=YYYY-MM-DD&to=YYYY-MM-DD&stalled_days=7
  */
@@ -179,7 +217,7 @@ router.get("/kpis", authenticateToken, nocache, async (req, res) => {
       [organizacion_id]
     );
 
-    /* ---------- PIPELINE: agregados won/lost multi-idioma ---------- */
+    /* ---------- PIPELINE: by source / by owner (regex won/lost multi-idioma) ---------- */
     const bySource = await q(
       `WITH agg AS (
          SELECT COALESCE(source,'Unknown') AS source,
@@ -197,14 +235,21 @@ router.get("/kpis", authenticateToken, nocache, async (req, res) => {
       [organizacion_id, fromISO, toISO]
     );
 
+    // COALESCE con múltiples posibles columnas de propietario (clientes podría no tener 'assignee')
     const byOwner = await q(
-      `WITH agg AS (
-         SELECT COALESCE(assignee,'Unassigned') AS owner,
+      `WITH base AS (
+         SELECT
+           COALESCE(NULLIF(assignee,''), NULLIF(owner,''), NULLIF(usuario_email,''), 'Unassigned') AS owner,
+           stage, result, created_at, organizacion_id
+         FROM ${PIPE}
+         WHERE ($1::text IS NULL OR organizacion_id = $1)
+           AND created_at >= $2::timestamptz AND created_at < $3::timestamptz
+       ),
+       agg AS (
+         SELECT owner,
                 SUM(CASE WHEN stage ~* '^(won|ganad)'  OR result='won'  THEN 1 ELSE 0 END)::int AS won,
                 SUM(CASE WHEN stage ~* '^(lost|perdid)' OR result='lost' THEN 1 ELSE 0 END)::int AS lost
-           FROM ${PIPE}
-          WHERE ($1::text IS NULL OR organizacion_id = $1)
-            AND created_at >= $2::timestamptz AND created_at < $3::timestamptz
+           FROM base
           GROUP BY 1
        )
        SELECT owner, won, lost,
@@ -229,7 +274,7 @@ router.get("/kpis", authenticateToken, nocache, async (req, res) => {
     const lostTotal = wonLostAgg.rows?.[0]?.lost ?? 0;
     const win_rate  = (wonTotal + lostTotal) > 0 ? Math.round((wonTotal * 100) / (wonTotal + lostTotal)) : 0;
 
-    // Distribución por stage (para gráficos)
+    // Distribución por stage
     const stagesAgg = await q(
       `SELECT COALESCE(stage,'Uncategorized') AS stage, COUNT(*)::int AS total
          FROM ${PIPE}
@@ -249,10 +294,10 @@ router.get("/kpis", authenticateToken, nocache, async (req, res) => {
       source: "none",
     };
 
-    const hasView = await regclassExists("v_ar_aging");
-    const hasInvoices = hasView ? true : await regclassExists("invoices");
+    const hasAgingView = await regclassExists("v_ar_aging");
+    const hasInvoicesTable = await regclassExists("invoices");
 
-    if (hasView) {
+    if (hasAgingView) {
       const r = await q(`SELECT * FROM v_ar_aging WHERE organizacion_id = $1`, [organizacion_id]);
       const v = r.rows?.[0] || {};
       ar = {
@@ -269,18 +314,18 @@ router.get("/kpis", authenticateToken, nocache, async (req, res) => {
         dso_days: 0,
         source: "v_ar_aging",
       };
-    } else if (hasInvoices) {
+    } else if (hasInvoicesTable) {
       const base = await q(
         `SELECT
-           SUM(GREATEST(amount_total - amount_paid,0))                                       AS ar_total,
+           SUM(GREATEST(amount_total - amount_paid,0)) AS ar_total,
            SUM(GREATEST(amount_total - amount_paid,0)) FILTER (WHERE (now()::date - due_date) > 0) AS overdue_amount,
-           COUNT(*) FILTER (WHERE (now()::date - due_date) > 0)::int                        AS overdue_count,
+           COUNT(*) FILTER (WHERE (now()::date - due_date) > 0)::int AS overdue_count,
            SUM(GREATEST(amount_total - amount_paid,0)) FILTER (WHERE due_date BETWEEN now()::date AND (now()::date + 7)) AS due_next_7,
-           SUM(GREATEST(amount_total - amount_paid,0)) FILTER (WHERE (now()::date - due_date) <= 0)               AS bucket_current,
-           SUM(GREATEST(amount_total - amount_paid,0)) FILTER (WHERE (now()::date - due_date) BETWEEN 1 AND 30)   AS bucket_1_30,
-           SUM(GREATEST(amount_total - amount_paid,0)) FILTER (WHERE (now()::date - due_date) BETWEEN 31 AND 60)  AS bucket_31_60,
-           SUM(GREATEST(amount_total - amount_paid,0)) FILTER (WHERE (now()::date - due_date) BETWEEN 61 AND 90)  AS bucket_61_90,
-           SUM(GREATEST(amount_total - amount_paid,0)) FILTER (WHERE (now()::date - due_date) > 90)               AS bucket_90p
+           SUM(GREATEST(amount_total - amount_paid,0)) FILTER (WHERE (now()::date - due_date) <= 0) AS bucket_current,
+           SUM(GREATEST(amount_total - amount_paid,0)) FILTER (WHERE (now()::date - due_date) BETWEEN 1 AND 30) AS bucket_1_30,
+           SUM(GREATEST(amount_total - amount_paid,0)) FILTER (WHERE (now()::date - due_date) BETWEEN 31 AND 60) AS bucket_31_60,
+           SUM(GREATEST(amount_total - amount_paid,0)) FILTER (WHERE (now()::date - due_date) BETWEEN 61 AND 90) AS bucket_61_90,
+           SUM(GREATEST(amount_total - amount_paid,0)) FILTER (WHERE (now()::date - due_date) > 90) AS bucket_90p
          FROM invoices
         WHERE status IN ('sent','partial','overdue')
           AND ($1::text IS NULL OR organizacion_id = $1)`,
@@ -303,7 +348,8 @@ router.get("/kpis", authenticateToken, nocache, async (req, res) => {
       };
     }
 
-    if (hasInvoices) {
+    // DSO sólo si hay tabla invoices
+    if (hasInvoicesTable) {
       const sales30 = await q(
         `SELECT COALESCE(SUM(amount_total),0)::numeric AS s
            FROM invoices
@@ -388,7 +434,7 @@ router.get("/kpis", authenticateToken, nocache, async (req, res) => {
 
     /* ---------- Respuesta ---------- */
     const new_by_day = (contactsNewByDay.rows || []).map((r) => ({ dia: r.dia, nuevos: r.nuevos }));
-    const contactability_pct = contactsabilitySafe(contactability.rows?.[0]);
+    const contactability_pct = contactabilitySafe(contactability.rows?.[0]);
     const ft = firstTouch.rows?.[0] || {};
     const first_touch = { p50_min: ft.p50_min ?? 0, p90_min: ft.p90_min ?? 0, avg_min: ft.avg_min ?? 0 };
 
@@ -446,6 +492,26 @@ router.get("/kpis", authenticateToken, nocache, async (req, res) => {
         stalled_in_incoming: { total: 0, days: Number(req?.query?.stalled_days || 7) },
       },
     });
+  }
+});
+
+/* =================== KPIs de tareas (vista materializada) =================== */
+/**
+ * GET /analytics/tasks/kpis
+ * Lee public.v_tareas_overview filtrada por organizacion_id
+ */
+router.get("/tasks/kpis", authenticateToken, nocache, async (req, res) => {
+  try {
+    const organizacion_id = await resolveOrgId(req);
+    const r = await q(
+      `SELECT * FROM public.v_tareas_overview WHERE organizacion_id = $1`,
+      [organizacion_id]
+    );
+    if (r.rows?.length === 1) return res.json(r.rows[0]);
+    return res.json(r.rows || []);
+  } catch (e) {
+    console.error("[GET /analytics/tasks/kpis]", e?.stack || e?.message || e);
+    res.status(200).json([]);
   }
 });
 

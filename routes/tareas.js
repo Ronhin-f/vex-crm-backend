@@ -32,7 +32,15 @@ function toInt(v) {
   return Number.isInteger(n) ? n : null;
 }
 
+/* ---------- dominios ---------- */
 const VALID_ESTADOS = ["todo", "doing", "waiting", "done"];
+const VALID_PRIORIDADES = ["alta", "media", "baja"];
+const normEstado = (v) => (VALID_ESTADOS.includes(String(v)) ? String(v) : "todo");
+const normPrioridad = (v) => {
+  const p = (coerceText(v) || "media").toLowerCase();
+  return VALID_PRIORIDADES.includes(p) ? p : "media";
+};
+
 const ESTADO_ORDER_SQL = `
   CASE t.estado
     WHEN 'todo'    THEN 1
@@ -42,28 +50,51 @@ const ESTADO_ORDER_SQL = `
     ELSE 99
   END
 `;
+const PRIORIDAD_ORDER_SQL = `
+  CASE t.prioridad
+    WHEN 'alta'  THEN 0
+    WHEN 'media' THEN 1
+    WHEN 'baja'  THEN 2
+    ELSE 9
+  END
+`;
 
 /* =========================== GET LIST =========================== */
 /**
  * Lista tareas de la organización.
- * Query: estado, q (título/descr), cliente_id, limit, offset
+ * Query: estado, prioridad, q (título/descr), cliente_id, limit, offset
  */
 router.get("/", authenticateToken, async (req, res) => {
   try {
     const { organizacion_id } = getUserFromReq(req);
-    let { estado, q: qtext, cliente_id, limit = 200, offset = 0 } = req.query || {};
+    let {
+      estado,
+      prioridad,
+      q: qtext,
+      cliente_id,
+      limit = 200,
+      offset = 0,
+    } = req.query || {};
 
     const params = [];
     const where = [];
 
+    // tenant: siempre filtra
     if (organizacion_id != null) {
       params.push(organizacion_id);
       where.push(`t.organizacion_id = $${params.length}`);
+    } else {
+      where.push(`t.organizacion_id IS NULL`);
     }
 
     if (estado && VALID_ESTADOS.includes(String(estado))) {
       params.push(String(estado));
       where.push(`t.estado = $${params.length}`);
+    }
+
+    if (prioridad && VALID_PRIORIDADES.includes(String(prioridad).toLowerCase())) {
+      params.push(String(prioridad).toLowerCase());
+      where.push(`t.prioridad = $${params.length}`);
     }
 
     const cid = toInt(cliente_id);
@@ -87,17 +118,21 @@ router.get("/", authenticateToken, async (req, res) => {
     const r = await q(
       `
       SELECT
-        t.id, t.titulo, t.descripcion, t.estado, t.orden, t.completada,
+        t.id, t.titulo, t.descripcion, t.estado, t.prioridad, t.orden, t.completada,
         t.vence_en, t.created_at, t.cliente_id, t.usuario_email,
         c.nombre AS cliente_nombre
       FROM tareas t
-      LEFT JOIN clientes c ON c.id = t.cliente_id
+      LEFT JOIN clientes c
+        ON c.id = t.cliente_id
+       AND c.organizacion_id = t.organizacion_id
       ${where.length ? "WHERE " + where.join(" AND ") : ""}
-      ORDER BY ${ESTADO_ORDER_SQL},
-               t.orden ASC,
-               COALESCE(t.vence_en, '2099-01-01') ASC,
-               t.created_at DESC,
-               t.id DESC
+      ORDER BY
+        ${ESTADO_ORDER_SQL},
+        ${PRIORIDAD_ORDER_SQL},
+        COALESCE(t.vence_en, '2099-01-01') ASC,
+        t.orden ASC,
+        t.created_at DESC,
+        t.id DESC
       LIMIT $${params.length - 1} OFFSET $${params.length}
       `,
       params
@@ -120,7 +155,7 @@ router.get("/:id", authenticateToken, async (req, res) => {
     const r = await q(
       `
       SELECT
-        t.id, t.titulo, t.descripcion, t.estado, t.orden, t.completada,
+        t.id, t.titulo, t.descripcion, t.estado, t.prioridad, t.orden, t.completada,
         t.vence_en, t.created_at, t.cliente_id, t.usuario_email
       FROM tareas t
       WHERE t.id = $1
@@ -140,7 +175,7 @@ router.get("/:id", authenticateToken, async (req, res) => {
 /* =========================== POST ========================== */
 /**
  * Crea una tarea.
- * Body: { titulo, descripcion?, cliente_id?, vence_en?, estado?, orden?, usuario_email?|assignee_email? }
+ * Body: { titulo, descripcion?, cliente_id?, vence_en?, estado?, prioridad?, orden?, usuario_email?|assignee_email? }
  */
 router.post("/", authenticateToken, async (req, res) => {
   try {
@@ -153,6 +188,7 @@ router.post("/", authenticateToken, async (req, res) => {
       cliente_id = null,
       vence_en = null,
       estado = "todo",
+      prioridad = "media",
       orden = null,
       usuario_email: body_usuario_email,
       assignee_email,
@@ -166,7 +202,8 @@ router.post("/", authenticateToken, async (req, res) => {
 
     titulo = titulo.trim();
     descripcion = coerceText(descripcion);
-    estado = VALID_ESTADOS.includes(estado) ? estado : "todo";
+    estado = normEstado(estado);
+    prioridad = normPrioridad(prioridad);
     vence_en = coerceDate(vence_en);
     cliente_id = cliente_id != null ? toInt(cliente_id) : null;
 
@@ -183,14 +220,14 @@ router.post("/", authenticateToken, async (req, res) => {
     const ins = await q(
       `
       INSERT INTO tareas
-        (titulo, descripcion, cliente_id, estado, orden, vence_en,
+        (titulo, descripcion, cliente_id, estado, prioridad, orden, vence_en,
          completada, usuario_email, organizacion_id, created_at)
       VALUES
-        ($1,$2,$3,$4,$5,$6,
-         FALSE, $7, $8, NOW())
-      RETURNING id, titulo, descripcion, cliente_id, estado, orden, vence_en, completada, created_at, usuario_email
+        ($1,$2,$3,$4,$5,$6,$7,
+         FALSE,$8,$9,NOW())
+      RETURNING id, titulo, descripcion, cliente_id, estado, prioridad, orden, vence_en, completada, created_at, usuario_email
       `,
-      [titulo, descripcion, cliente_id, estado, orden, vence_en, usuario_email, organizacion_id]
+      [titulo, descripcion, cliente_id, estado, prioridad, orden, vence_en, usuario_email, organizacion_id]
     );
 
     const t = ins.rows[0];
@@ -205,6 +242,7 @@ router.post("/", authenticateToken, async (req, res) => {
           title: t.titulo,
           description: t.descripcion || null,
           status: t.estado,
+          priority: t.prioridad || "media",
           due_at: t.vence_en ? new Date(t.vence_en).toISOString() : null,
           assigned_to: { email: t.usuario_email || null },
         },
@@ -228,7 +266,17 @@ async function updateTaskGeneric(req, res, { emptyAsComplete = false } = {}) {
     const id = toInt(req.params.id);
     if (id == null) return res.status(400).json({ message: "ID inválido" });
 
-    const allowed = ["titulo","descripcion","cliente_id","vence_en","estado","orden","completada","usuario_email"];
+    const allowed = [
+      "titulo",
+      "descripcion",
+      "cliente_id",
+      "vence_en",
+      "estado",
+      "prioridad",
+      "orden",
+      "completada",
+      "usuario_email",
+    ];
     const fields = [];
     const values = [];
     let idx = 1;
@@ -244,7 +292,8 @@ async function updateTaskGeneric(req, res, { emptyAsComplete = false } = {}) {
         if (k === "titulo" || k === "descripcion" || k === "usuario_email") v = coerceText(v);
         if (k === "vence_en") v = coerceDate(v);
         if (k === "cliente_id") v = v != null ? toInt(v) : null;
-        if (k === "estado" && v) v = VALID_ESTADOS.includes(v) ? v : "todo";
+        if (k === "estado" && v != null) v = normEstado(v);
+        if (k === "prioridad" && v != null) v = normPrioridad(v);
         if (k === "orden" && v != null) v = toInt(v);
         if (k === "completada") v = !!v;
 
@@ -253,7 +302,7 @@ async function updateTaskGeneric(req, res, { emptyAsComplete = false } = {}) {
       }
     }
 
-    // Compat: PATCH vacío = marcar hecha y mover al final de 'done'
+    // PATCH vacío = marcar hecha y mover al final de 'done'
     if (!fields.length && emptyAsComplete) {
       const rOrden = await q(
         `SELECT COALESCE(MAX(orden),0) AS m
@@ -270,7 +319,7 @@ async function updateTaskGeneric(req, res, { emptyAsComplete = false } = {}) {
                completada=TRUE,
                orden=$1
          WHERE id=$2 AND (${organizacion_id != null ? "organizacion_id = $3" : "organizacion_id IS NULL"})
-         RETURNING id, titulo, descripcion, cliente_id, estado, orden, vence_en, completada, created_at, usuario_email
+         RETURNING id, titulo, descripcion, cliente_id, estado, prioridad, orden, vence_en, completada, created_at, usuario_email
         `,
         organizacion_id != null ? [nextOrden, id, organizacion_id] : [nextOrden, id]
       );
@@ -286,6 +335,7 @@ async function updateTaskGeneric(req, res, { emptyAsComplete = false } = {}) {
           task: {
             id: String(t.id),
             status: t.estado,
+            priority: t.prioridad || "media",
             due_at: t.vence_en ? new Date(t.vence_en).toISOString() : null,
             assigned_to: { email: t.usuario_email || null },
             completed: true,
@@ -308,8 +358,8 @@ async function updateTaskGeneric(req, res, { emptyAsComplete = false } = {}) {
       UPDATE tareas
          SET ${fields.join(", ")}
        WHERE id = $${idx++}
-         AND (${organizacion_id != null ? "organizacion_id = $"+idx : "organizacion_id IS NULL"})
-       RETURNING id, titulo, descripcion, cliente_id, estado, orden, vence_en, completada, created_at, usuario_email
+         AND (${organizacion_id != null ? "organizacion_id = $" + idx : "organizacion_id IS NULL"})
+       RETURNING id, titulo, descripcion, cliente_id, estado, prioridad, orden, vence_en, completada, created_at, usuario_email
       `,
       values
     );
@@ -326,6 +376,7 @@ async function updateTaskGeneric(req, res, { emptyAsComplete = false } = {}) {
           id: String(t.id),
           title: t.titulo,
           status: t.estado,
+          priority: t.prioridad || "media",
           due_at: t.vence_en ? new Date(t.vence_en).toISOString() : null,
           completed: !!t.completada,
           assigned_to: { email: t.usuario_email || null },
@@ -369,7 +420,7 @@ router.patch("/:id/assign", authenticateToken, async (req, res) => {
          SET usuario_email = $1
        WHERE id = $2
          AND (${organizacion_id != null ? "organizacion_id = $3" : "organizacion_id IS NULL"})
-       RETURNING id, titulo, descripcion, cliente_id, estado, orden, vence_en, completada, created_at, usuario_email
+       RETURNING id, titulo, descripcion, cliente_id, estado, prioridad, orden, vence_en, completada, created_at, usuario_email
       `,
       organizacion_id != null ? [usuario_email, id, organizacion_id] : [usuario_email, id]
     );
@@ -386,6 +437,7 @@ router.patch("/:id/assign", authenticateToken, async (req, res) => {
           id: String(t.id),
           title: t.titulo,
           status: t.estado,
+          priority: t.prioridad || "media",
           due_at: t.vence_en ? new Date(t.vence_en).toISOString() : null,
           completed: !!t.completada,
           assigned_to: { email: t.usuario_email || null },
@@ -413,7 +465,7 @@ router.patch("/:id/toggle", authenticateToken, async (req, res) => {
     // lee estado actual
     const cur = await q(
       `
-      SELECT id, completada, estado, orden, vence_en, titulo, usuario_email
+      SELECT id, completada, estado, prioridad, orden, vence_en, titulo, usuario_email
         FROM tareas
        WHERE id=$1 AND (${organizacion_id != null ? "organizacion_id = $2" : "organizacion_id IS NULL"})
       `,
@@ -440,7 +492,7 @@ router.patch("/:id/toggle", authenticateToken, async (req, res) => {
              estado = $1,
              orden = $2
        WHERE id=$3 AND (${organizacion_id != null ? "organizacion_id = $4" : "organizacion_id IS NULL"})
-       RETURNING id, titulo, descripcion, cliente_id, estado, orden, vence_en, completada, created_at, usuario_email
+       RETURNING id, titulo, descripcion, cliente_id, estado, prioridad, orden, vence_en, completada, created_at, usuario_email
       `,
       organizacion_id != null
         ? [nuevoEstado, nuevaOrden, id, organizacion_id]
@@ -457,6 +509,7 @@ router.patch("/:id/toggle", authenticateToken, async (req, res) => {
           id: String(t.id),
           title: t.titulo,
           status: t.estado,
+          priority: t.prioridad || "media",
           due_at: t.vence_en ? new Date(t.vence_en).toISOString() : null,
           completed: !!t.completada,
           assigned_to: { email: t.usuario_email || null },
@@ -483,7 +536,7 @@ router.patch("/reorder", authenticateToken, async (req, res) => {
   try {
     const bearer = getBearer(req);
     const { organizacion_id } = getUserFromReq(req);
-    const estado = VALID_ESTADOS.includes(req.body?.estado) ? req.body.estado : "todo";
+    const estado = normEstado(req.body?.estado);
     const ids = Array.isArray(req.body?.ordered_ids)
       ? req.body.ordered_ids.map(toInt).filter((x) => x != null)
       : [];
@@ -512,14 +565,14 @@ router.patch("/reorder", authenticateToken, async (req, res) => {
              END
        WHERE id IN (${inHolders.join(", ")})
          AND (${organizacion_id != null ? "organizacion_id = $" + params.length : "organizacion_id IS NULL"})
-       RETURNING id, titulo, estado, orden, vence_en, usuario_email
+       RETURNING id, titulo, estado, prioridad, orden, vence_en, usuario_email
       `,
       params
     );
 
     const updated = r.rows || [];
 
-    // Emit por cada tarea (ligero, idempotency con nuevo orden)
+    // Emit por cada tarea (idempotency con nuevo orden)
     await Promise.all(
       updated.map((t) =>
         emitFlow(
@@ -531,6 +584,7 @@ router.patch("/reorder", authenticateToken, async (req, res) => {
               id: String(t.id),
               title: t.titulo,
               status: t.estado,
+              priority: t.prioridad || "media",
               due_at: t.vence_en ? new Date(t.vence_en).toISOString() : null,
               completed: false,
               assigned_to: { email: t.usuario_email || null },
@@ -560,7 +614,7 @@ router.delete("/:id", authenticateToken, async (req, res) => {
     // tomar datos para emitir antes de borrar
     const prev = await q(
       `
-      SELECT id, titulo, estado, vence_en, usuario_email
+      SELECT id, titulo, estado, prioridad, vence_en, usuario_email
         FROM tareas
        WHERE id=$1 AND (${organizacion_id != null ? "organizacion_id = $2" : "organizacion_id IS NULL"})
       `,
@@ -590,6 +644,7 @@ router.delete("/:id", authenticateToken, async (req, res) => {
             id: String(t.id),
             title: t.titulo,
             status: t.estado,
+            priority: t.prioridad || "media",
             due_at: t.vence_en ? new Date(t.vence_en).toISOString() : null,
             assigned_to: { email: t.usuario_email || null },
           },
