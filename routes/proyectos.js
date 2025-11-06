@@ -173,6 +173,7 @@ router.get("/:id", authenticateToken, async (req, res) => {
 });
 
 /* ============== GET /proyectos/kanban ============== */
+app.use('/proyectos/kanban', (req, res, next) => { req.url = '/kanban/proyectos'; next(); });
 router.get("/kanban", authenticateToken, async (req, res) => {
   try {
     const { organizacion_id } = getUserFromReq(req);

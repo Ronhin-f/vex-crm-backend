@@ -22,6 +22,7 @@ function getOrg(req) {
     null
   );
 }
+
 function signToken(u) {
   const secret = process.env.JWT_SECRET || "dev_jwt_secret_change_me";
   return jwt.sign(
@@ -35,6 +36,7 @@ function signToken(u) {
     { expiresIn: "30d" }
   );
 }
+
 const safeUser = (u) =>
   u
     ? {
@@ -74,20 +76,30 @@ async function emitFlow(type, payload) {
   }
 }
 
-/* -------------------- schema -------------------- */
+/* -------------------- schema (idempotente) -------------------- */
+/** Hace el schema resiliente aunque la migración no haya corrido todavía */
 async function ensureSchema() {
   await q(`
+    -- tabla base
     CREATE TABLE IF NOT EXISTS public.usuarios (
       id               SERIAL PRIMARY KEY,
       organizacion_id  TEXT NOT NULL,
       email            TEXT NOT NULL,
       password_hash    TEXT NOT NULL,
       nombre           TEXT,
-      rol              TEXT DEFAULT 'member',   -- owner | admin | member
+      rol              TEXT DEFAULT 'member',
       activo           BOOLEAN DEFAULT TRUE,
       created_at       TIMESTAMPTZ DEFAULT now(),
       updated_at       TIMESTAMPTZ DEFAULT now()
     );
+
+    -- columnas que tu migración agrega (por si la tabla ya existía sin ellas)
+    ALTER TABLE public.usuarios
+      ADD COLUMN IF NOT EXISTS nombre TEXT,
+      ADD COLUMN IF NOT EXISTS rol TEXT DEFAULT 'member',
+      ADD COLUMN IF NOT EXISTS activo BOOLEAN DEFAULT TRUE;
+
+    -- índices/unique multi-tenant con email normalizado
     CREATE INDEX IF NOT EXISTS idx_usuarios_org ON public.usuarios (organizacion_id);
     CREATE UNIQUE INDEX IF NOT EXISTS uniq_usuarios_org_email_lower
       ON public.usuarios (organizacion_id, lower(email));
@@ -177,10 +189,7 @@ router.get("/me", auth, async (req, res) => {
     const id = Number(req.usuario?.id);
     if (!org || !id) return res.json({ ok: true, user: null });
 
-    const r = await q(
-      `SELECT * FROM public.usuarios WHERE id = $1 AND organizacion_id = $2`,
-      [id, org]
-    );
+    const r = await q(`SELECT * FROM public.usuarios WHERE id = $1 AND organizacion_id = $2`, [id, org]);
     res.json({ ok: true, user: safeUser(r.rows[0] || null) });
   } catch (e) {
     console.error("[GET /users/me]", e?.stack || e?.message || e);
@@ -274,7 +283,15 @@ router.patch("/:id", auth, async (req, res) => {
       values
     );
     if (!r.rowCount) return res.status(404).json({ ok: false, message: "Usuario no encontrado" });
-    res.json({ ok: true, user: safeUser(r.rows[0]) });
+
+    const updated = r.rows[0];
+    emitFlow("user.updated", {
+      org,
+      user: { id: String(updated.id), email: updated.email, nombre: updated.nombre, rol: updated.rol, activo: updated.activo },
+      meta: { source: "vex-core" },
+    }).catch(() => {});
+
+    res.json({ ok: true, user: safeUser(updated) });
   } catch (e) {
     console.error("[PATCH /users/:id]", e?.stack || e?.message || e);
     res.status(500).json({ ok: false, message: "Error actualizando usuario" });
@@ -292,10 +309,18 @@ router.delete("/:id", auth, async (req, res) => {
     if (!id) return res.status(400).json({ ok: false, message: "ID inválido" });
 
     const r = await q(
-      `UPDATE public.usuarios SET activo = FALSE, updated_at = now() WHERE id = $1 AND organizacion_id = $2 RETURNING id`,
+      `UPDATE public.usuarios SET activo = FALSE, updated_at = now() WHERE id = $1 AND organizacion_id = $2 RETURNING *`,
       [id, org]
     );
     if (!r.rowCount) return res.status(404).json({ ok: false, message: "Usuario no encontrado" });
+
+    const deleted = r.rows[0];
+    emitFlow("user.deleted", {
+      org,
+      user: { id: String(deleted.id), email: deleted.email, nombre: deleted.nombre, rol: deleted.rol },
+      meta: { source: "vex-core" },
+    }).catch(() => {});
+
     res.json({ ok: true });
   } catch (e) {
     console.error("[DELETE /users/:id]", e?.stack || e?.message || e);
