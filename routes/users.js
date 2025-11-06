@@ -13,14 +13,18 @@ const T = (v) => (v == null ? null : String(v).trim() || null);
 const E = (v) => (T(v)?.toLowerCase() ?? null); // email normalizado
 const ROLES = new Set(["owner", "admin", "member"]);
 
+// normaliza organizacion_id a INTEGER (coherente con el schema)
 function getOrg(req) {
-  return (
+  const raw =
     T(req.usuario?.organizacion_id) ||
     T(req.headers["x-org-id"]) ||
     T(req.query.organizacion_id) ||
     T(req.body?.organizacion_id) ||
-    null
-  );
+    null;
+
+  if (raw == null) return null;
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : null;
 }
 
 function signToken(u) {
@@ -80,24 +84,27 @@ async function emitFlow(type, payload) {
 /** Hace el schema resiliente aunque la migración no haya corrido todavía */
 async function ensureSchema() {
   await q(`
-    -- tabla base
+    -- tabla base (sólo si NO existe)
     CREATE TABLE IF NOT EXISTS public.usuarios (
       id               SERIAL PRIMARY KEY,
-      organizacion_id  TEXT NOT NULL,
+      organizacion_id  INTEGER NOT NULL,
       email            TEXT NOT NULL,
       password_hash    TEXT NOT NULL,
       nombre           TEXT,
       rol              TEXT DEFAULT 'member',
       activo           BOOLEAN DEFAULT TRUE,
       created_at       TIMESTAMPTZ DEFAULT now(),
-      updated_at       TIMESTAMPTZ DEFAULT now()
+      updated_at       TIMESTAMPTZ DEFAULT now(),
+      CHECK (rol IN ('owner','admin','member'))
     );
 
-    -- columnas que tu migración agrega (por si la tabla ya existía sin ellas)
+    -- columnas por compatibilidad (si existía con esquema viejo)
     ALTER TABLE public.usuarios
       ADD COLUMN IF NOT EXISTS nombre TEXT,
       ADD COLUMN IF NOT EXISTS rol TEXT DEFAULT 'member',
-      ADD COLUMN IF NOT EXISTS activo BOOLEAN DEFAULT TRUE;
+      ADD COLUMN IF NOT EXISTS activo BOOLEAN DEFAULT TRUE,
+      ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT now(),
+      ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT now();
 
     -- índices/unique multi-tenant con email normalizado
     CREATE INDEX IF NOT EXISTS idx_usuarios_org ON public.usuarios (organizacion_id);
@@ -111,7 +118,7 @@ ensureSchema().catch((e) => console.error("[users.ensureSchema]", e?.message || 
 router.post("/register", async (req, res) => {
   try {
     const org = getOrg(req);
-    if (!org) return res.status(400).json({ ok: false, message: "organizacion_id requerido" });
+    if (org == null) return res.status(400).json({ ok: false, message: "organizacion_id requerido" });
 
     const email = E(req.body?.email);
     const nombre = T(req.body?.nombre);
@@ -127,7 +134,9 @@ router.post("/register", async (req, res) => {
       `SELECT 1 FROM public.usuarios WHERE organizacion_id = $1 AND lower(email) = lower($2)`,
       [org, email]
     );
-    if (exists.rowCount) return res.status(409).json({ ok: false, message: "Email ya registrado en esta organización" });
+    if (exists.rowCount) {
+      return res.status(409).json({ ok: false, message: "Email ya registrado en esta organización" });
+    }
 
     const password_hash = await bcrypt.hash(pass, 10);
     const r = await q(
@@ -158,7 +167,7 @@ router.post("/register", async (req, res) => {
 router.post("/login", async (req, res) => {
   try {
     const org = getOrg(req);
-    if (!org) return res.status(400).json({ ok: false, message: "organizacion_id requerido" });
+    if (org == null) return res.status(400).json({ ok: false, message: "organizacion_id requerido" });
 
     const email = E(req.body?.email);
     const pass = T(req.body?.password);
@@ -187,7 +196,7 @@ router.get("/me", auth, async (req, res) => {
   try {
     const org = getOrg(req);
     const id = Number(req.usuario?.id);
-    if (!org || !id) return res.json({ ok: true, user: null });
+    if (org == null || !id) return res.json({ ok: true, user: null });
 
     const r = await q(`SELECT * FROM public.usuarios WHERE id = $1 AND organizacion_id = $2`, [id, org]);
     res.json({ ok: true, user: safeUser(r.rows[0] || null) });
@@ -201,7 +210,7 @@ router.get("/me", auth, async (req, res) => {
 router.get("/", auth, async (req, res) => {
   try {
     const org = getOrg(req);
-    if (!org) return res.json([]);
+    if (org == null) return res.json([]);
 
     const r = await q(
       `SELECT id, email, nombre, rol, activo, organizacion_id, created_at, updated_at
@@ -222,7 +231,7 @@ router.get("/", auth, async (req, res) => {
 router.patch("/:id", auth, async (req, res) => {
   try {
     const org = getOrg(req);
-    if (!org) return res.status(400).json({ ok: false, message: "organizacion_id requerido" });
+    if (org == null) return res.status(400).json({ ok: false, message: "organizacion_id requerido" });
     if (!assertRole(req, res)) return;
 
     const id = Number(req.params.id);
@@ -287,7 +296,13 @@ router.patch("/:id", auth, async (req, res) => {
     const updated = r.rows[0];
     emitFlow("user.updated", {
       org,
-      user: { id: String(updated.id), email: updated.email, nombre: updated.nombre, rol: updated.rol, activo: updated.activo },
+      user: {
+        id: String(updated.id),
+        email: updated.email,
+        nombre: updated.nombre,
+        rol: updated.rol,
+        activo: updated.activo,
+      },
       meta: { source: "vex-core" },
     }).catch(() => {});
 
@@ -302,7 +317,7 @@ router.patch("/:id", auth, async (req, res) => {
 router.delete("/:id", auth, async (req, res) => {
   try {
     const org = getOrg(req);
-    if (!org) return res.status(400).json({ ok: false, message: "organizacion_id requerido" });
+    if (org == null) return res.status(400).json({ ok: false, message: "organizacion_id requerido" });
     if (!assertRole(req, res)) return;
 
     const id = Number(req.params.id);
