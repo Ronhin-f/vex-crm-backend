@@ -1,26 +1,61 @@
-// routes/tareas.js — Tareas CRUD + KPIs
+// routes/users.js — Auth + Users CRUD (multi-tenant, ESM)
 import { Router } from "express";
 import { authenticateToken as auth } from "../middleware/auth.js";
 import { q } from "../utils/db.js";
 import axios from "axios";
+import bcrypt from "bcryptjs";
+import jwt from "jsonwebtoken";
 
 const router = Router();
 
 /* -------------------- helpers -------------------- */
 const T = (v) => (v == null ? null : String(v).trim() || null);
-const N = (v) => (v == null || v === "" ? null : Number(v));
-const D = (v) => {
-  if (!v) return null;
-  const d = new Date(v);
-  return isNaN(d.getTime()) ? null : d.toISOString();
-};
+const E = (v) => (T(v)?.toLowerCase() ?? null); // email normalizado
+const ROLES = new Set(["owner", "admin", "member"]);
+
 function getOrg(req) {
   return (
     T(req.usuario?.organizacion_id) ||
     T(req.headers["x-org-id"]) ||
     T(req.query.organizacion_id) ||
+    T(req.body?.organizacion_id) ||
     null
   );
+}
+function signToken(u) {
+  const secret = process.env.JWT_SECRET || "dev_jwt_secret_change_me";
+  return jwt.sign(
+    {
+      sub: String(u.id),
+      email: u.email,
+      organizacion_id: u.organizacion_id,
+      rol: u.rol || "member",
+    },
+    secret,
+    { expiresIn: "30d" }
+  );
+}
+const safeUser = (u) =>
+  u
+    ? {
+        id: u.id,
+        email: u.email,
+        nombre: u.nombre,
+        rol: u.rol,
+        activo: u.activo,
+        organizacion_id: u.organizacion_id,
+        created_at: u.created_at,
+        updated_at: u.updated_at,
+      }
+    : null;
+
+function assertRole(req, res, roles = ["owner", "admin"]) {
+  const rol = req.usuario?.rol || "member";
+  if (!roles.includes(rol)) {
+    res.status(403).json({ ok: false, message: "Permisos insuficientes" });
+    return false;
+  }
+  return true;
 }
 
 // opcional: enviar a Flows si está configurado
@@ -35,147 +70,152 @@ async function emitFlow(type, payload) {
       { headers: { Authorization: `Bearer ${token}` }, timeout: 8000 }
     );
   } catch (e) {
-    console.warn("[tareas.emitFlow]", e?.message || e);
+    console.warn("[users.emitFlow]", e?.message || e);
   }
 }
 
-/* -------------------- esquema mínimo -------------------- */
+/* -------------------- schema -------------------- */
 async function ensureSchema() {
-  // sin enums para no bloquear despliegues
   await q(`
-    CREATE TABLE IF NOT EXISTS tareas (
+    CREATE TABLE IF NOT EXISTS public.usuarios (
       id               SERIAL PRIMARY KEY,
       organizacion_id  TEXT NOT NULL,
-      titulo           TEXT NOT NULL,
-      descripcion      TEXT,
-      cliente_id       INTEGER,
-      vence_en         TIMESTAMPTZ,
-      usuario_email    TEXT,
-      prioridad        TEXT DEFAULT 'media',  -- 'alta' | 'media' | 'baja'
-      estado           TEXT DEFAULT 'todo',   -- 'todo' | 'doing' | 'waiting' | 'done'
-      completada       BOOLEAN DEFAULT FALSE,
-      recordatorio     BOOLEAN DEFAULT FALSE,
+      email            TEXT NOT NULL,
+      password_hash    TEXT NOT NULL,
+      nombre           TEXT,
+      rol              TEXT DEFAULT 'member',   -- owner | admin | member
+      activo           BOOLEAN DEFAULT TRUE,
       created_at       TIMESTAMPTZ DEFAULT now(),
       updated_at       TIMESTAMPTZ DEFAULT now()
     );
-    CREATE INDEX IF NOT EXISTS idx_tareas_org ON tareas (organizacion_id);
-    CREATE INDEX IF NOT EXISTS idx_tareas_org_estado ON tareas (organizacion_id, estado);
-    CREATE INDEX IF NOT EXISTS idx_tareas_org_vence ON tareas (organizacion_id, vence_en);
-  `);
-  // vista simple para KPIs
-  await q(`
-    CREATE OR REPLACE VIEW v_tareas_overview AS
-    SELECT
-      organizacion_id,
-      COUNT(*) FILTER (WHERE NOT completada) AS open_total,
-      COUNT(*) FILTER (WHERE NOT completada AND vence_en IS NOT NULL AND vence_en < now()) AS overdue,
-      COUNT(*) FILTER (WHERE NOT completada AND vence_en IS NOT NULL AND vence_en >= now() AND vence_en < now() + interval '7 days') AS due_next_7,
-      COUNT(*) FILTER (WHERE NOT completada AND prioridad = 'alta') AS open_high,
-      COUNT(*) FILTER (WHERE NOT completada AND prioridad = 'media') AS open_med,
-      COUNT(*) FILTER (WHERE NOT completada AND prioridad = 'baja') AS open_low
-    FROM tareas
-    GROUP BY organizacion_id;
+    CREATE INDEX IF NOT EXISTS idx_usuarios_org ON public.usuarios (organizacion_id);
+    CREATE UNIQUE INDEX IF NOT EXISTS uniq_usuarios_org_email_lower
+      ON public.usuarios (organizacion_id, lower(email));
   `);
 }
-ensureSchema().catch((e) => console.error("[tareas.ensureSchema]", e?.message || e));
+ensureSchema().catch((e) => console.error("[users.ensureSchema]", e?.message || e));
 
-/* -------------------- GET /tareas -------------------- */
-router.get("/", auth, async (req, res) => {
-  try {
-    const org = getOrg(req);
-    if (!org) return res.json([]); // no rompas el FE
-
-    const { q: qtext, estado, prioridad, assignee, cliente_id } = req.query || {};
-    const params = [org];
-    const where = ["t.organizacion_id = $1"];
-
-    if (qtext) {
-      params.push(`%${String(qtext).trim()}%`);
-      const i = params.length;
-      where.push(`(t.titulo ILIKE $${i} OR t.descripcion ILIKE $${i})`);
-    }
-    if (estado)     { params.push(String(estado));     where.push(`t.estado = $${params.length}`); }
-    if (prioridad)  { params.push(String(prioridad));  where.push(`t.prioridad = $${params.length}`); }
-    if (assignee)   { params.push(String(assignee));   where.push(`t.usuario_email = $${params.length}`); }
-    if (cliente_id) { params.push(Number(cliente_id)); where.push(`t.cliente_id = $${params.length}`); }
-
-    const sql = `
-      SELECT
-        t.*,
-        c.email  AS cliente_email,
-        c.nombre AS cliente_nombre
-      FROM tareas t
-      LEFT JOIN clientes c ON c.id = t.cliente_id
-      WHERE ${where.join(" AND ")}
-      ORDER BY t.created_at DESC, t.id DESC
-      LIMIT 2000
-    `;
-    const r = await q(sql, params);
-    res.json(r.rows || []);
-  } catch (e) {
-    console.error("[GET /tareas]", e?.stack || e?.message || e);
-    res.json([]); // compat FE
-  }
-});
-
-/* -------------------- POST /tareas -------------------- */
-router.post("/", auth, async (req, res) => {
+/* -------------------- POST /users/register -------------------- */
+router.post("/register", async (req, res) => {
   try {
     const org = getOrg(req);
     if (!org) return res.status(400).json({ ok: false, message: "organizacion_id requerido" });
 
-    const b = req.body || {};
-    const titulo = T(b.titulo);
-    if (!titulo) return res.status(400).json({ ok: false, message: "Título requerido" });
+    const email = E(req.body?.email);
+    const nombre = T(req.body?.nombre);
+    const rol = ROLES.has((req.body?.rol || "").toLowerCase())
+      ? (req.body.rol || "member").toLowerCase()
+      : "member";
+    const pass = T(req.body?.password);
 
+    if (!email || !pass) return res.status(400).json({ ok: false, message: "Email y password requeridos" });
+    if (pass.length < 6) return res.status(400).json({ ok: false, message: "Password mínimo 6 caracteres" });
+
+    const exists = await q(
+      `SELECT 1 FROM public.usuarios WHERE organizacion_id = $1 AND lower(email) = lower($2)`,
+      [org, email]
+    );
+    if (exists.rowCount) return res.status(409).json({ ok: false, message: "Email ya registrado en esta organización" });
+
+    const password_hash = await bcrypt.hash(pass, 10);
     const r = await q(
       `
-      INSERT INTO tareas (
-        organizacion_id, titulo, descripcion, cliente_id, vence_en,
-        usuario_email, prioridad, estado, completada, recordatorio, updated_at
-      )
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10, now())
+      INSERT INTO public.usuarios (organizacion_id, email, password_hash, nombre, rol, updated_at)
+      VALUES ($1,$2,$3,$4,$5, now())
       RETURNING *
       `,
-      [
-        org,
-        titulo,
-        T(b.descripcion),
-        N(b.cliente_id),
-        D(b.vence_en),
-        T(b.usuario_email),
-        (T(b.prioridad) || "media").toLowerCase(),
-        T(b.estado) || "todo",
-        !!b.completada,
-        !!b.recordatorio,
-      ]
+      [org, email, password_hash, nombre, rol]
     );
-    const item = r.rows[0];
+    const user = r.rows[0];
 
-    // aviso opcional
-    emitFlow("task.created", {
+    emitFlow("user.created", {
       org,
-      task: {
-        id: String(item.id),
-        title: item.titulo,
-        due: item.vence_en,
-        assignee: item.usuario_email || null,
-        priority: item.prioridad,
-      },
-      meta: { source: "vex-crm" },
+      user: { id: String(user.id), email: user.email, nombre: user.nombre, rol: user.rol },
+      meta: { source: "vex-core" },
     }).catch(() => {});
 
-    res.status(201).json(item);
+    const token = signToken(user);
+    res.status(201).json({ ok: true, token, user: safeUser(user) });
   } catch (e) {
-    console.error("[POST /tareas]", e?.stack || e?.message || e);
-    res.status(500).json({ ok: false, message: "Error creando tarea" });
+    console.error("[POST /users/register]", e?.stack || e?.message || e);
+    res.status(500).json({ ok: false, message: "Error registrando usuario" });
   }
 });
 
-/* -------------------- PATCH /tareas/:id -------------------- */
+/* -------------------- POST /users/login -------------------- */
+router.post("/login", async (req, res) => {
+  try {
+    const org = getOrg(req);
+    if (!org) return res.status(400).json({ ok: false, message: "organizacion_id requerido" });
+
+    const email = E(req.body?.email);
+    const pass = T(req.body?.password);
+    if (!email || !pass) return res.status(400).json({ ok: false, message: "Email y password requeridos" });
+
+    const r = await q(
+      `SELECT * FROM public.usuarios WHERE organizacion_id = $1 AND lower(email) = lower($2) AND activo = TRUE`,
+      [org, email]
+    );
+    const user = r.rows[0];
+    if (!user) return res.status(401).json({ ok: false, message: "Credenciales inválidas" });
+
+    const ok = await bcrypt.compare(pass, user.password_hash);
+    if (!ok) return res.status(401).json({ ok: false, message: "Credenciales inválidas" });
+
+    const token = signToken(user);
+    res.json({ ok: true, token, user: safeUser(user) });
+  } catch (e) {
+    console.error("[POST /users/login]", e?.stack || e?.message || e);
+    res.status(500).json({ ok: false, message: "Error en login" });
+  }
+});
+
+/* -------------------- GET /users/me -------------------- */
+router.get("/me", auth, async (req, res) => {
+  try {
+    const org = getOrg(req);
+    const id = Number(req.usuario?.id);
+    if (!org || !id) return res.json({ ok: true, user: null });
+
+    const r = await q(
+      `SELECT * FROM public.usuarios WHERE id = $1 AND organizacion_id = $2`,
+      [id, org]
+    );
+    res.json({ ok: true, user: safeUser(r.rows[0] || null) });
+  } catch (e) {
+    console.error("[GET /users/me]", e?.stack || e?.message || e);
+    res.json({ ok: true, user: null });
+  }
+});
+
+/* -------------------- GET /users (listado por org) -------------------- */
+router.get("/", auth, async (req, res) => {
+  try {
+    const org = getOrg(req);
+    if (!org) return res.json([]);
+
+    const r = await q(
+      `SELECT id, email, nombre, rol, activo, organizacion_id, created_at, updated_at
+         FROM public.usuarios
+        WHERE organizacion_id = $1
+        ORDER BY created_at DESC, id DESC
+        LIMIT 2000`,
+      [org]
+    );
+    res.json(r.rows || []);
+  } catch (e) {
+    console.error("[GET /users]", e?.stack || e?.message || e);
+    res.json([]);
+  }
+});
+
+/* -------------------- PATCH /users/:id -------------------- */
 router.patch("/:id", auth, async (req, res) => {
   try {
     const org = getOrg(req);
+    if (!org) return res.status(400).json({ ok: false, message: "organizacion_id requerido" });
+    if (!assertRole(req, res)) return;
+
     const id = Number(req.params.id);
     if (!id) return res.status(400).json({ ok: false, message: "ID inválido" });
 
@@ -183,88 +223,83 @@ router.patch("/:id", auth, async (req, res) => {
     const values = [];
     let i = 1;
 
-    const allowed = {
-      titulo: (v) => T(v),
-      descripcion: (v) => T(v),
-      cliente_id: (v) => N(v),
-      vence_en: (v) => D(v),
-      usuario_email: (v) => T(v),
-      prioridad: (v) => (T(v) || "media").toLowerCase(),
-      estado: (v) => T(v),
-      completada: (v) => !!v,
-      recordatorio: (v) => !!v,
-    };
-
-    for (const [k, conv] of Object.entries(allowed)) {
-      if (k in (req.body || {})) {
-        sets.push(`${k} = $${i++}`);
-        values.push(conv(req.body[k]));
-      }
+    const wantEmail = req.body?.email;
+    if (wantEmail != null) {
+      const email = E(wantEmail);
+      if (!email) return res.status(400).json({ ok: false, message: "Email inválido" });
+      // conflict check
+      const c = await q(
+        `SELECT 1 FROM public.usuarios WHERE organizacion_id = $1 AND lower(email) = lower($2) AND id <> $3`,
+        [org, email, id]
+      );
+      if (c.rowCount) return res.status(409).json({ ok: false, message: "Email ya usado en esta organización" });
+      sets.push(`email = $${i++}`);
+      values.push(email);
     }
+
+    if (req.body?.nombre != null) {
+      sets.push(`nombre = $${i++}`);
+      values.push(T(req.body.nombre));
+    }
+    if (req.body?.rol != null) {
+      const rol = (req.body.rol || "").toLowerCase();
+      if (!ROLES.has(rol)) return res.status(400).json({ ok: false, message: "Rol inválido" });
+      sets.push(`rol = $${i++}`);
+      values.push(rol);
+    }
+    if (req.body?.activo != null) {
+      sets.push(`activo = $${i++}`);
+      values.push(!!req.body.activo);
+    }
+    if (req.body?.password != null) {
+      const pass = T(req.body.password);
+      if (!pass || pass.length < 6) return res.status(400).json({ ok: false, message: "Password mínimo 6 caracteres" });
+      const hash = await bcrypt.hash(pass, 10);
+      sets.push(`password_hash = $${i++}`);
+      values.push(hash);
+    }
+
     if (!sets.length) return res.status(400).json({ ok: false, message: "Nada para actualizar" });
+
     sets.push("updated_at = now()");
-    values.push(id);
-    if (org) values.push(org);
+    values.push(id, org);
 
     const r = await q(
       `
-      UPDATE tareas
+      UPDATE public.usuarios
          SET ${sets.join(", ")}
-       WHERE id = $${i++} ${org ? `AND organizacion_id = $${i}` : ""}
+       WHERE id = $${i++} AND organizacion_id = $${i}
        RETURNING *
       `,
       values
     );
-    if (!r.rowCount) return res.status(404).json({ ok: false, message: "Tarea no encontrada" });
-    res.json(r.rows[0]);
+    if (!r.rowCount) return res.status(404).json({ ok: false, message: "Usuario no encontrado" });
+    res.json({ ok: true, user: safeUser(r.rows[0]) });
   } catch (e) {
-    console.error("[PATCH /tareas/:id]", e?.stack || e?.message || e);
-    res.status(500).json({ ok: false, message: "Error actualizando tarea" });
+    console.error("[PATCH /users/:id]", e?.stack || e?.message || e);
+    res.status(500).json({ ok: false, message: "Error actualizando usuario" });
   }
 });
 
-/* -------------------- DELETE /tareas/:id -------------------- */
+/* -------------------- DELETE /users/:id (soft delete) -------------------- */
 router.delete("/:id", auth, async (req, res) => {
   try {
     const org = getOrg(req);
+    if (!org) return res.status(400).json({ ok: false, message: "organizacion_id requerido" });
+    if (!assertRole(req, res)) return;
+
     const id = Number(req.params.id);
     if (!id) return res.status(400).json({ ok: false, message: "ID inválido" });
 
     const r = await q(
-      `DELETE FROM tareas WHERE id = $1 ${org ? "AND organizacion_id = $2" : ""}`,
-      org ? [id, org] : [id]
+      `UPDATE public.usuarios SET activo = FALSE, updated_at = now() WHERE id = $1 AND organizacion_id = $2 RETURNING id`,
+      [id, org]
     );
-    if (!r.rowCount) return res.status(404).json({ ok: false, message: "Tarea no encontrada" });
+    if (!r.rowCount) return res.status(404).json({ ok: false, message: "Usuario no encontrado" });
     res.json({ ok: true });
   } catch (e) {
-    console.error("[DELETE /tareas/:id]", e?.stack || e?.message || e);
-    res.status(500).json({ ok: false, message: "Error eliminando tarea" });
-  }
-});
-
-/* -------------------- KPIs: GET /tareas/kpis -------------------- */
-router.get("/kpis", auth, async (req, res) => {
-  try {
-    const org = getOrg(req);
-    if (!org) return res.json({ ok: true, kpis: {} });
-    const r = await q(`SELECT * FROM v_tareas_overview WHERE organizacion_id = $1`, [org]);
-    const row = r.rows[0] || {};
-    res.json({
-      ok: true,
-      kpis: {
-        open_total: Number(row.open_total || 0),
-        overdue: Number(row.overdue || 0),
-        due_next_7: Number(row.due_next_7 || 0),
-        by_priority: {
-          alta: Number(row.open_high || 0),
-          media: Number(row.open_med || 0),
-          baja: Number(row.open_low || 0),
-        },
-      },
-    });
-  } catch (e) {
-    console.error("[GET /tareas/kpis]", e?.stack || e?.message || e);
-    res.json({ ok: true, kpis: {} });
+    console.error("[DELETE /users/:id]", e?.stack || e?.message || e);
+    res.status(500).json({ ok: false, message: "Error eliminando usuario" });
   }
 });
 
