@@ -206,8 +206,82 @@ router.get("/me", auth, async (req, res) => {
   }
 });
 
-/* -------------------- GET /users (listado por org) -------------------- */
+/* ------------------------------------------------------------------
+ * GET /users  —  Lista para dropdown "Asignado a"
+ * Devuelve emails deduplicados desde usuarios, proyectos.assignee y tareas.assignee
+ * Acepta ?q= (search) y ?limit= (por defecto 50, máx 200)
+ * ------------------------------------------------------------------ */
 router.get("/", auth, async (req, res) => {
+  const org = getOrg(req);
+  if (org == null) return res.json([]);
+
+  const search = req.query.q ? `%${req.query.q}%` : null;
+  const limit = Math.min(Number(req.query.limit ?? 50), 200);
+
+  // Query principal (con fallback si alguna tabla/columna no existe)
+  const unionSQL = `
+    WITH emails AS (
+      SELECT LOWER(email) AS email
+        FROM public.usuarios
+       WHERE organizacion_id = $1
+
+      UNION
+      SELECT LOWER(assignee) AS email
+        FROM public.proyectos
+       WHERE organizacion_id = $1 AND COALESCE(assignee,'') <> ''
+
+      UNION
+      SELECT LOWER(assignee) AS email
+        FROM public.tareas
+       WHERE organizacion_id = $1 AND COALESCE(assignee,'') <> ''
+    )
+    SELECT email,
+           split_part(email,'@',1) AS nombre,
+           NULL::int AS id,
+           NULL::text AS rol,
+           TRUE AS activo,
+           $1::int AS organizacion_id,
+           NULL::timestamptz AS created_at,
+           NULL::timestamptz AS updated_at
+      FROM emails
+     WHERE ($2::text IS NULL OR email ILIKE $2)
+     ORDER BY 1
+     LIMIT $3;
+  `;
+
+  const fallbackSQL = `
+    SELECT id,
+           LOWER(email) AS email,
+           COALESCE(nombre, split_part(email,'@',1)) AS nombre,
+           rol,
+           activo,
+           organizacion_id,
+           created_at,
+           updated_at
+      FROM public.usuarios
+     WHERE organizacion_id = $1
+       AND ($2::text IS NULL OR email ILIKE $2 OR COALESCE(nombre,'') ILIKE $2)
+     ORDER BY created_at DESC NULLS LAST, id DESC
+     LIMIT $3;
+  `;
+
+  try {
+    const r = await q(unionSQL, [org, search, limit]);
+    return res.json(r.rows || []);
+  } catch (e) {
+    console.warn("[GET /users] fallback (solo usuarios)", e?.message || e);
+    try {
+      const r2 = await q(fallbackSQL, [org, search, limit]);
+      return res.json(r2.rows || []);
+    } catch (e2) {
+      console.error("[GET /users] error", e2?.stack || e2?.message || e2);
+      return res.json([]);
+    }
+  }
+});
+
+/* -------------------- GET /users/full (listado clásico por org) -------------------- */
+router.get("/full", auth, async (req, res) => {
   try {
     const org = getOrg(req);
     if (org == null) return res.json([]);
@@ -216,13 +290,13 @@ router.get("/", auth, async (req, res) => {
       `SELECT id, email, nombre, rol, activo, organizacion_id, created_at, updated_at
          FROM public.usuarios
         WHERE organizacion_id = $1
-        ORDER BY created_at DESC, id DESC
+        ORDER BY created_at DESC NULLS LAST, id DESC
         LIMIT 2000`,
       [org]
     );
     res.json(r.rows || []);
   } catch (e) {
-    console.error("[GET /users]", e?.stack || e?.message || e);
+    console.error("[GET /users/full]", e?.stack || e?.message || e);
     res.json([]);
   }
 });
