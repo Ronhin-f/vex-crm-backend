@@ -13,18 +13,8 @@ const T = (v) => (v == null ? null : String(v).trim() || null);
 const E = (v) => (T(v)?.toLowerCase() ?? null); // email normalizado
 const ROLES = new Set(["owner", "admin", "member"]);
 
-// normaliza organizacion_id a INTEGER (coherente con el schema)
-function getOrg(req) {
-  const raw =
-    T(req.usuario?.organizacion_id) ||
-    T(req.headers["x-org-id"]) ||
-    T(req.query.organizacion_id) ||
-    T(req.body?.organizacion_id) ||
-    null;
-
-  if (raw == null) return null;
-  const n = Number(raw);
-  return Number.isFinite(n) ? n : null;
+if (!process.env.JWT_SECRET) {
+  console.warn("[users] JWT_SECRET no seteado; usando valor por defecto (solo dev).");
 }
 
 function signToken(u) {
@@ -80,6 +70,53 @@ async function emitFlow(type, payload) {
   }
 }
 
+async function regclassExists(name) {
+  try {
+    const r = await q(`SELECT to_regclass($1) IS NOT NULL AS ok`, [`public.${name}`]);
+    return !!r.rows?.[0]?.ok;
+  } catch {
+    return false;
+  }
+}
+
+/** org resolver: JWT → header → query/body → lookup por email (único) → null */
+async function resolveOrgId(req) {
+  const raw =
+    T(req.usuario?.organizacion_id) ||
+    T(req.headers?.["x-org-id"]) ||
+    T(req.query?.organizacion_id) ||
+    T(req.query?.organization_id) ||
+    T(req.query?.org_id) ||
+    T(req.body?.organizacion_id) ||
+    T(req.body?.organization_id) ||
+    T(req.body?.org_id) ||
+    null;
+
+  if (raw != null) {
+    const n = Number(raw);
+    return Number.isFinite(n) ? n : null;
+  }
+
+  // Lookup por email solo si es único (para mejorar UX de login)
+  const email =
+    E(req.body?.email) ||
+    E(req.query?.email) ||
+    E(req.usuario?.email) ||
+    E(req.usuario_email);
+
+  if (email) {
+    const r = await q(
+      `SELECT DISTINCT organizacion_id FROM public.usuarios WHERE lower(email)=lower($1)`,
+      [email]
+    );
+    if (r.rowCount === 1) {
+      const n = Number(r.rows[0]?.organizacion_id);
+      return Number.isFinite(n) ? n : null;
+    }
+  }
+  return null;
+}
+
 /* -------------------- schema (idempotente) -------------------- */
 /** Hace el schema resiliente aunque la migración no haya corrido todavía */
 async function ensureSchema() {
@@ -117,7 +154,7 @@ ensureSchema().catch((e) => console.error("[users.ensureSchema]", e?.message || 
 /* -------------------- POST /users/register -------------------- */
 router.post("/register", async (req, res) => {
   try {
-    const org = getOrg(req);
+    const org = await resolveOrgId(req);
     if (org == null) return res.status(400).json({ ok: false, message: "organizacion_id requerido" });
 
     const email = E(req.body?.email);
@@ -166,7 +203,7 @@ router.post("/register", async (req, res) => {
 /* -------------------- POST /users/login -------------------- */
 router.post("/login", async (req, res) => {
   try {
-    const org = getOrg(req);
+    const org = await resolveOrgId(req);
     if (org == null) return res.status(400).json({ ok: false, message: "organizacion_id requerido" });
 
     const email = E(req.body?.email);
@@ -194,7 +231,7 @@ router.post("/login", async (req, res) => {
 /* -------------------- GET /users/me -------------------- */
 router.get("/me", auth, async (req, res) => {
   try {
-    const org = getOrg(req);
+    const org = await resolveOrgId(req);
     const id = Number(req.usuario?.id);
     if (org == null || !id) return res.json({ ok: true, user: null });
 
@@ -208,82 +245,63 @@ router.get("/me", auth, async (req, res) => {
 
 /* ------------------------------------------------------------------
  * GET /users  —  Lista para dropdown "Asignado a"
- * Devuelve emails deduplicados desde usuarios, proyectos.assignee y tareas.assignee
+ * Devuelve emails deduplicados desde usuarios y (si existen) proyectos.assignee y tareas.assignee
  * Acepta ?q= (search) y ?limit= (por defecto 50, máx 200)
  * ------------------------------------------------------------------ */
 router.get("/", auth, async (req, res) => {
-  const org = getOrg(req);
-  if (org == null) return res.json([]);
-
-  const search = req.query.q ? `%${req.query.q}%` : null;
-  const limit = Math.min(Number(req.query.limit ?? 50), 200);
-
-  // Query principal (con fallback si alguna tabla/columna no existe)
-  const unionSQL = `
-    WITH emails AS (
-      SELECT LOWER(email) AS email
-        FROM public.usuarios
-       WHERE organizacion_id = $1
-
-      UNION
-      SELECT LOWER(assignee) AS email
-        FROM public.proyectos
-       WHERE organizacion_id = $1 AND COALESCE(assignee,'') <> ''
-
-      UNION
-      SELECT LOWER(assignee) AS email
-        FROM public.tareas
-       WHERE organizacion_id = $1 AND COALESCE(assignee,'') <> ''
-    )
-    SELECT email,
-           split_part(email,'@',1) AS nombre,
-           NULL::int AS id,
-           NULL::text AS rol,
-           TRUE AS activo,
-           $1::int AS organizacion_id,
-           NULL::timestamptz AS created_at,
-           NULL::timestamptz AS updated_at
-      FROM emails
-     WHERE ($2::text IS NULL OR email ILIKE $2)
-     ORDER BY 1
-     LIMIT $3;
-  `;
-
-  const fallbackSQL = `
-    SELECT id,
-           LOWER(email) AS email,
-           COALESCE(nombre, split_part(email,'@',1)) AS nombre,
-           rol,
-           activo,
-           organizacion_id,
-           created_at,
-           updated_at
-      FROM public.usuarios
-     WHERE organizacion_id = $1
-       AND ($2::text IS NULL OR email ILIKE $2 OR COALESCE(nombre,'') ILIKE $2)
-     ORDER BY created_at DESC NULLS LAST, id DESC
-     LIMIT $3;
-  `;
-
   try {
+    const org = await resolveOrgId(req);
+    if (org == null) return res.json([]);
+
+    const search = req.query.q ? `%${String(req.query.q).trim()}%` : null;
+    const limit = Math.min(Number(req.query.limit ?? 50), 200);
+
+    const hasProyectos = await regclassExists("proyectos");
+    const hasTareas = await regclassExists("tareas");
+
+    const pieces = [
+      `SELECT LOWER(email) AS email FROM public.usuarios WHERE organizacion_id = $1`,
+    ];
+    if (hasProyectos)
+      pieces.push(
+        `SELECT LOWER(assignee) AS email FROM public.proyectos WHERE organizacion_id = $1 AND COALESCE(assignee,'') <> ''`
+      );
+    if (hasTareas)
+      pieces.push(
+        `SELECT LOWER(assignee) AS email FROM public.tareas WHERE organizacion_id = $1 AND COALESCE(assignee,'') <> ''`
+      );
+
+    const unionSQL = `
+      WITH emails AS (
+        ${pieces.join("\nUNION\n")}
+      )
+      SELECT email,
+             split_part(email,'@',1) AS nombre,
+             NULL::int AS id,
+             NULL::text AS rol,
+             TRUE AS activo,
+             $1::int AS organizacion_id,
+             NULL::timestamptz AS created_at,
+             NULL::timestamptz AS updated_at
+        FROM emails
+       WHERE ($2::text IS NULL OR email ILIKE $2)
+       GROUP BY email
+       ORDER BY 1
+       LIMIT $3;
+    `;
+
     const r = await q(unionSQL, [org, search, limit]);
     return res.json(r.rows || []);
   } catch (e) {
-    console.warn("[GET /users] fallback (solo usuarios)", e?.message || e);
-    try {
-      const r2 = await q(fallbackSQL, [org, search, limit]);
-      return res.json(r2.rows || []);
-    } catch (e2) {
-      console.error("[GET /users] error", e2?.stack || e2?.message || e2);
-      return res.json([]);
-    }
+    console.error("[GET /users]", e?.stack || e?.message || e);
+    return res.json([]);
   }
 });
 
 /* -------------------- GET /users/full (listado clásico por org) -------------------- */
 router.get("/full", auth, async (req, res) => {
   try {
-    const org = getOrg(req);
+    const org = await resolveOrgId(req);
     if (org == null) return res.json([]);
 
     const r = await q(
@@ -304,12 +322,20 @@ router.get("/full", auth, async (req, res) => {
 /* -------------------- PATCH /users/:id -------------------- */
 router.patch("/:id", auth, async (req, res) => {
   try {
-    const org = getOrg(req);
+    const org = await resolveOrgId(req);
     if (org == null) return res.status(400).json({ ok: false, message: "organizacion_id requerido" });
     if (!assertRole(req, res)) return;
 
     const id = Number(req.params.id);
     if (!id) return res.status(400).json({ ok: false, message: "ID inválido" });
+
+    // Traigo usuario actual para checks (rol actual)
+    const cur = await q(
+      `SELECT id, rol, activo FROM public.usuarios WHERE id=$1 AND organizacion_id=$2`,
+      [id, org]
+    );
+    if (!cur.rowCount) return res.status(404).json({ ok: false, message: "Usuario no encontrado" });
+    const current = cur.rows[0];
 
     const sets = [];
     const values = [];
@@ -333,16 +359,41 @@ router.patch("/:id", auth, async (req, res) => {
       sets.push(`nombre = $${i++}`);
       values.push(T(req.body.nombre));
     }
+
     if (req.body?.rol != null) {
-      const rol = (req.body.rol || "").toLowerCase();
-      if (!ROLES.has(rol)) return res.status(400).json({ ok: false, message: "Rol inválido" });
+      const newRol = (req.body.rol || "").toLowerCase();
+      if (!ROLES.has(newRol)) return res.status(400).json({ ok: false, message: "Rol inválido" });
+
+      // Protección: no dejar la org sin owners
+      if (current.rol === "owner" && newRol !== "owner") {
+        const owners = await q(
+          `SELECT COUNT(*)::int AS n FROM public.usuarios WHERE organizacion_id=$1 AND rol='owner' AND activo=TRUE`,
+          [org]
+        );
+        if ((owners.rows?.[0]?.n ?? 0) <= 1) {
+          return res.status(409).json({ ok: false, message: "No se puede remover al último owner" });
+        }
+      }
       sets.push(`rol = $${i++}`);
-      values.push(rol);
+      values.push(newRol);
     }
+
     if (req.body?.activo != null) {
+      const toActive = !!req.body.activo;
+      // si desactivamos un owner y es el último → bloquear
+      if (current.rol === "owner" && current.activo && !toActive) {
+        const owners = await q(
+          `SELECT COUNT(*)::int AS n FROM public.usuarios WHERE organizacion_id=$1 AND rol='owner' AND activo=TRUE`,
+          [org]
+        );
+        if ((owners.rows?.[0]?.n ?? 0) <= 1) {
+          return res.status(409).json({ ok: false, message: "No se puede desactivar al último owner" });
+        }
+      }
       sets.push(`activo = $${i++}`);
-      values.push(!!req.body.activo);
+      values.push(toActive);
     }
+
     if (req.body?.password != null) {
       const pass = T(req.body.password);
       if (!pass || pass.length < 6) return res.status(400).json({ ok: false, message: "Password mínimo 6 caracteres" });
@@ -390,12 +441,28 @@ router.patch("/:id", auth, async (req, res) => {
 /* -------------------- DELETE /users/:id (soft delete) -------------------- */
 router.delete("/:id", auth, async (req, res) => {
   try {
-    const org = getOrg(req);
+    const org = await resolveOrgId(req);
     if (org == null) return res.status(400).json({ ok: false, message: "organizacion_id requerido" });
     if (!assertRole(req, res)) return;
 
     const id = Number(req.params.id);
     if (!id) return res.status(400).json({ ok: false, message: "ID inválido" });
+
+    // Si es owner, evitar borrar el último
+    const cur = await q(
+      `SELECT rol, activo FROM public.usuarios WHERE id=$1 AND organizacion_id=$2`,
+      [id, org]
+    );
+    if (!cur.rowCount) return res.status(404).json({ ok: false, message: "Usuario no encontrado" });
+    if (cur.rows[0].rol === "owner" && cur.rows[0].activo) {
+      const owners = await q(
+        `SELECT COUNT(*)::int AS n FROM public.usuarios WHERE organizacion_id=$1 AND rol='owner' AND activo=TRUE`,
+        [org]
+      );
+      if ((owners.rows?.[0]?.n ?? 0) <= 1) {
+        return res.status(409).json({ ok: false, message: "No se puede eliminar al último owner" });
+      }
+    }
 
     const r = await q(
       `UPDATE public.usuarios SET activo = FALSE, updated_at = now() WHERE id = $1 AND organizacion_id = $2 RETURNING *`,
