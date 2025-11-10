@@ -1,8 +1,9 @@
 // routes/analytics.js — KPIs CRM (ESM) - actualizado y robusto
-// - org_id robusto (JWT → x-org-id → query/body → lookup por email → fallback)
+// - org_id saneado a INTEGER (JWT → x-org-id → query/body → lookup por email → fallback)
 // - won/lost multi-idioma
 // - AR/DSO con detección de vista/tabla
 // - incluye GET /analytics/kpis y GET /analytics/tasks/kpis
+// - memo del pipeline table por 10 minutos
 
 import { Router } from "express";
 import { q } from "../utils/db.js";
@@ -32,15 +33,20 @@ function firstText(...vals) {
   return null;
 }
 
+function toIntOrNull(v) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
 async function resolveOrgId(req) {
   // 1) JWT / user object
   const u = getUserFromReq(req);
   const fromUser = firstText(u?.organizacion_id);
-  if (fromUser) return fromUser;
+  if (fromUser) return toIntOrNull(fromUser);
 
   // 2) Header x-org-id
   const fromHeader = firstText(req.headers?.["x-org-id"]);
-  if (fromHeader) return fromHeader;
+  if (fromHeader) return toIntOrNull(fromHeader);
 
   // 3) Query/body fallbacks comunes
   const fromQueryOrBody = firstText(
@@ -51,7 +57,7 @@ async function resolveOrgId(req) {
     req.body?.organization_id,
     req.body?.org_id
   );
-  if (fromQueryOrBody) return fromQueryOrBody;
+  if (fromQueryOrBody) return toIntOrNull(fromQueryOrBody);
 
   // 4) Lookup por email (si hay)
   const email = firstText(u?.email);
@@ -61,11 +67,11 @@ async function resolveOrgId(req) {
       [email]
     );
     const org = r.rows?.[0]?.organizacion_id;
-    if (org) return String(org);
+    if (org != null) return toIntOrNull(org);
   }
 
   // 5) 🔒 Fallback seguro mientras propagamos JWT con org
-  return "10";
+  return 10; // <- número, no string
 }
 
 function parseRange(query) {
@@ -83,15 +89,20 @@ function pct(n, d) {
   return D > 0 ? Math.round((N * 100) / D) : 0;
 }
 
+let PIPE_CACHE = { name: null, ts: 0 };
 async function pickPipelineTable() {
-  // Sólo devuelve valores fijos para evitar inyección
+  const now = Date.now();
+  if (PIPE_CACHE.name && now - PIPE_CACHE.ts < 10 * 60 * 1000) return PIPE_CACHE.name;
+
   const r = await q(
     `SELECT EXISTS (
        SELECT 1 FROM information_schema.tables
        WHERE table_schema='public' AND table_name='proyectos'
      ) AS ok`
   );
-  return r.rows?.[0]?.ok ? "proyectos" : "clientes";
+  const name = r.rows?.[0]?.ok ? "proyectos" : "clientes";
+  PIPE_CACHE = { name, ts: now };
+  return name;
 }
 
 function nocache(_req, res, next) {
@@ -104,10 +115,9 @@ function nocache(_req, res, next) {
   next();
 }
 
-function contactabilitySafe(row) {
-  if (!row) return 0;
-  const p = Number(row.pct);
-  return Number.isFinite(p) ? p : 0;
+function num(v, fallback = 0) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : fallback;
 }
 
 async function regclassExists(name) {
@@ -125,7 +135,7 @@ async function regclassExists(name) {
  */
 router.get("/kpis", authenticateToken, nocache, async (req, res) => {
   try {
-    const organizacion_id = await resolveOrgId(req);
+    const orgId = await resolveOrgId(req); // int|null
     const { fromISO, toISO } = parseRange(req.query);
     const stalledDays = Math.max(1, Number(req.query.stalled_days || 7));
     const PIPE = await pickPipelineTable();
@@ -134,18 +144,18 @@ router.get("/kpis", authenticateToken, nocache, async (req, res) => {
     const contactsTotal = await q(
       `SELECT COUNT(*)::int AS total
          FROM clientes
-        WHERE ($1::text IS NULL OR organizacion_id = $1)`,
-      [organizacion_id]
+        WHERE ($1 IS NULL OR organizacion_id = $1)`,
+      [orgId]
     );
 
     const contactsNewByDay = await q(
       `SELECT DATE_TRUNC('day', created_at) AS dia, COUNT(*)::int AS nuevos
          FROM clientes
-        WHERE ($1::text IS NULL OR organizacion_id = $1)
+        WHERE ($1 IS NULL OR organizacion_id = $1)
           AND created_at >= $2::timestamptz AND created_at < $3::timestamptz
         GROUP BY 1
         ORDER BY 1`,
-      [organizacion_id, fromISO, toISO]
+      [orgId, fromISO, toISO]
     );
 
     /* ---------- CONTACTABILITY (primer contacto vía tareas) ---------- */
@@ -153,14 +163,14 @@ router.get("/kpis", authenticateToken, nocache, async (req, res) => {
       `WITH touched AS (
          SELECT DISTINCT t.cliente_id
            FROM tareas t
-          WHERE ($1::text IS NULL OR t.organizacion_id = $1)
+          WHERE ($1 IS NULL OR t.organizacion_id = $1)
             AND t.created_at >= $2::timestamptz AND t.created_at < $3::timestamptz
             AND t.cliente_id IS NOT NULL
        ),
        base AS (
          SELECT COUNT(*)::int AS total
            FROM clientes c
-          WHERE ($1::text IS NULL OR c.organizacion_id = $1)
+          WHERE ($1 IS NULL OR c.organizacion_id = $1)
             AND c.created_at < $3::timestamptz
        )
        SELECT
@@ -168,7 +178,7 @@ router.get("/kpis", authenticateToken, nocache, async (req, res) => {
          base.total,
          COALESCE(ROUND(100.0 * (SELECT COUNT(*) FROM touched) / NULLIF(base.total,0))::int, 0) AS pct
        FROM base`,
-      [organizacion_id, fromISO, toISO]
+      [orgId, fromISO, toISO]
     );
 
     /* ---------- FIRST TOUCH SLA (p50/p90/avg en min) ---------- */
@@ -179,7 +189,8 @@ router.get("/kpis", authenticateToken, nocache, async (req, res) => {
                 c.created_at
            FROM clientes c
       LEFT JOIN tareas t ON t.cliente_id = c.id
-          WHERE ($1::text IS NULL OR c.organizacion_id = $1)
+          WHERE ($1 IS NULL OR c.organizacion_id = $1)
+            AND ($1 IS NULL OR t.organizacion_id = $1)
             AND c.created_at >= $2::timestamptz AND c.created_at < $3::timestamptz
           GROUP BY 1,3
        ),
@@ -189,11 +200,11 @@ router.get("/kpis", authenticateToken, nocache, async (req, res) => {
           WHERE first_touch IS NOT NULL
        )
        SELECT
-         PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY mins)::double precision AS p50_min,
-         PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY mins)::double precision AS p90_min,
-         AVG(mins)::double precision AS avg_min
+         PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY mins) AS p50_min,
+         PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY mins) AS p90_min,
+         AVG(mins) AS avg_min
        FROM deltas`,
-      [organizacion_id, fromISO, toISO]
+      [orgId, fromISO, toISO]
     );
 
     /* ---------- TASKS: overdue & due_next_7d ---------- */
@@ -203,8 +214,8 @@ router.get("/kpis", authenticateToken, nocache, async (req, res) => {
         WHERE completada = FALSE
           AND vence_en IS NOT NULL
           AND vence_en < NOW()
-          AND ($1::text IS NULL OR organizacion_id = $1)`,
-      [organizacion_id]
+          AND ($1 IS NULL OR organizacion_id = $1)`,
+      [orgId]
     );
 
     const tasksNext7d = await q(
@@ -213,8 +224,8 @@ router.get("/kpis", authenticateToken, nocache, async (req, res) => {
         WHERE completada = FALSE
           AND vence_en IS NOT NULL
           AND vence_en <= NOW() + INTERVAL '7 days'
-          AND ($1::text IS NULL OR organizacion_id = $1)`,
-      [organizacion_id]
+          AND ($1 IS NULL OR organizacion_id = $1)`,
+      [orgId]
     );
 
     /* ---------- PIPELINE: by source / by owner (regex won/lost multi-idioma) ---------- */
@@ -224,7 +235,7 @@ router.get("/kpis", authenticateToken, nocache, async (req, res) => {
                 SUM(CASE WHEN stage ~* '^(won|ganad)'  OR result='won'  THEN 1 ELSE 0 END)::int AS won,
                 SUM(CASE WHEN stage ~* '^(lost|perdid)' OR result='lost' THEN 1 ELSE 0 END)::int AS lost
            FROM ${PIPE}
-          WHERE ($1::text IS NULL OR organizacion_id = $1)
+          WHERE ($1 IS NULL OR organizacion_id = $1)
             AND created_at >= $2::timestamptz AND created_at < $3::timestamptz
           GROUP BY 1
        )
@@ -232,17 +243,17 @@ router.get("/kpis", authenticateToken, nocache, async (req, res) => {
               CASE WHEN (won+lost)>0 THEN ROUND(100.0*won/(won+lost))::int ELSE 0 END AS win_rate
          FROM agg
         ORDER BY win_rate DESC, won DESC, source ASC`,
-      [organizacion_id, fromISO, toISO]
+      [orgId, fromISO, toISO]
     );
 
-    // COALESCE con múltiples posibles columnas de propietario (clientes podría no tener 'assignee')
+    // COALESCE con múltiples posibles columnas de propietario
     const byOwner = await q(
       `WITH base AS (
          SELECT
            COALESCE(NULLIF(assignee,''), NULLIF(owner,''), NULLIF(usuario_email,''), 'Unassigned') AS owner,
            stage, result, created_at, organizacion_id
          FROM ${PIPE}
-         WHERE ($1::text IS NULL OR organizacion_id = $1)
+         WHERE ($1 IS NULL OR organizacion_id = $1)
            AND created_at >= $2::timestamptz AND created_at < $3::timestamptz
        ),
        agg AS (
@@ -256,32 +267,32 @@ router.get("/kpis", authenticateToken, nocache, async (req, res) => {
               CASE WHEN (won+lost)>0 THEN ROUND(100.0*won/(won+lost))::int ELSE 0 END AS win_rate
          FROM agg
         ORDER BY win_rate DESC, won DESC, owner ASC`,
-      [organizacion_id, fromISO, toISO]
+      [orgId, fromISO, toISO]
     );
 
-    // Resumen robusto won/lost en el rango (usa result o regex del stage, y ordena por fecha efectiva)
+    // Resumen robusto won/lost en el rango (result o regex del stage, por fecha efectiva)
     const wonLostAgg = await q(
       `SELECT
          SUM(CASE WHEN result='won'  OR stage ~* '^(won|ganad)'  THEN 1 ELSE 0 END)::int AS won,
          SUM(CASE WHEN result='lost' OR stage ~* '^(lost|perdid)' THEN 1 ELSE 0 END)::int AS lost
        FROM ${PIPE}
-      WHERE ($1::text IS NULL OR organizacion_id = $1)
+      WHERE ($1 IS NULL OR organizacion_id = $1)
         AND COALESCE(closed_at, updated_at, created_at) >= $2::timestamptz
         AND COALESCE(closed_at, updated_at, created_at) <  $3::timestamptz`,
-      [organizacion_id, fromISO, toISO]
+      [orgId, fromISO, toISO]
     );
-    const wonTotal  = wonLostAgg.rows?.[0]?.won  ?? 0;
-    const lostTotal = wonLostAgg.rows?.[0]?.lost ?? 0;
+    const wonTotal  = num(wonLostAgg.rows?.[0]?.won, 0);
+    const lostTotal = num(wonLostAgg.rows?.[0]?.lost, 0);
     const win_rate  = (wonTotal + lostTotal) > 0 ? Math.round((wonTotal * 100) / (wonTotal + lostTotal)) : 0;
 
     // Distribución por stage
     const stagesAgg = await q(
       `SELECT COALESCE(stage,'Uncategorized') AS stage, COUNT(*)::int AS total
          FROM ${PIPE}
-        WHERE ($1::text IS NULL OR organizacion_id = $1)
+        WHERE ($1 IS NULL OR organizacion_id = $1)
           AND created_at >= $2::timestamptz AND created_at < $3::timestamptz
         GROUP BY 1`,
-      [organizacion_id, fromISO, toISO]
+      [orgId, fromISO, toISO]
     );
 
     /* ---------- AR (Aging / Overdue / Due next 7 / DSO) ---------- */
@@ -298,18 +309,18 @@ router.get("/kpis", authenticateToken, nocache, async (req, res) => {
     const hasInvoicesTable = await regclassExists("invoices");
 
     if (hasAgingView) {
-      const r = await q(`SELECT * FROM v_ar_aging WHERE organizacion_id = $1`, [organizacion_id]);
+      const r = await q(`SELECT * FROM v_ar_aging WHERE organizacion_id = $1`, [orgId]);
       const v = r.rows?.[0] || {};
       ar = {
-        total: Number(v.ar_total || 0),
-        overdue: { count: Number(v.overdue_count || 0), amount: Number(v.overdue_amount || 0) },
-        due_next_7: Number(v.due_next_7 || 0),
+        total: num(v.ar_total),
+        overdue: { count: num(v.overdue_count), amount: num(v.overdue_amount) },
+        due_next_7: num(v.due_next_7),
         aging: {
-          current: Number(v.bucket_current || 0),
-          d1_30: Number(v.bucket_1_30 || 0),
-          d31_60: Number(v.bucket_31_60 || 0),
-          d61_90: Number(v.bucket_61_90 || 0),
-          d90p: Number(v.bucket_90p || 0),
+          current: num(v.bucket_current),
+          d1_30: num(v.bucket_1_30),
+          d31_60: num(v.bucket_31_60),
+          d61_90: num(v.bucket_61_90),
+          d90p: num(v.bucket_90p),
         },
         dso_days: 0,
         source: "v_ar_aging",
@@ -328,20 +339,20 @@ router.get("/kpis", authenticateToken, nocache, async (req, res) => {
            SUM(GREATEST(amount_total - amount_paid,0)) FILTER (WHERE (now()::date - due_date) > 90) AS bucket_90p
          FROM invoices
         WHERE status IN ('sent','partial','overdue')
-          AND ($1::text IS NULL OR organizacion_id = $1)`,
-        [organizacion_id]
+          AND ($1 IS NULL OR organizacion_id = $1)`,
+        [orgId]
       );
       const v = base.rows?.[0] || {};
       ar = {
-        total: Number(v.ar_total || 0),
-        overdue: { count: Number(v.overdue_count || 0), amount: Number(v.overdue_amount || 0) },
-        due_next_7: Number(v.due_next_7 || 0),
+        total: num(v.ar_total),
+        overdue: { count: num(v.overdue_count), amount: num(v.overdue_amount) },
+        due_next_7: num(v.due_next_7),
         aging: {
-          current: Number(v.bucket_current || 0),
-          d1_30: Number(v.bucket_1_30 || 0),
-          d31_60: Number(v.bucket_31_60 || 0),
-          d61_90: Number(v.bucket_61_90 || 0),
-          d90p: Number(v.bucket_90p || 0),
+          current: num(v.bucket_current),
+          d1_30: num(v.bucket_1_30),
+          d31_60: num(v.bucket_31_60),
+          d61_90: num(v.bucket_61_90),
+          d90p: num(v.bucket_90p),
         },
         dso_days: 0,
         source: "invoices",
@@ -351,16 +362,16 @@ router.get("/kpis", authenticateToken, nocache, async (req, res) => {
     // DSO sólo si hay tabla invoices
     if (hasInvoicesTable) {
       const sales30 = await q(
-        `SELECT COALESCE(SUM(amount_total),0)::numeric AS s
+        `SELECT COALESCE(SUM(amount_total),0) AS s
            FROM invoices
-          WHERE ($1::text IS NULL OR organizacion_id = $1)
+          WHERE ($1 IS NULL OR organizacion_id = $1)
             AND issue_date >= (now()::date - INTERVAL '30 days')
             AND status IN ('sent','partial','paid','overdue')`,
-        [organizacion_id]
+        [orgId]
       );
-      const s = Number(sales30.rows?.[0]?.s || 0);
+      const s = num(sales30.rows?.[0]?.s, 0);
       const daily = s / 30;
-      ar.dso_days = daily > 0 ? Math.round(Number(ar.total) / daily) : 0;
+      ar.dso_days = daily > 0 ? Math.round(num(ar.total) / daily) : 0;
     }
 
     /* ---------- Qualification (sobre clientes) ---------- */
@@ -369,81 +380,85 @@ router.get("/kpis", authenticateToken, nocache, async (req, res) => {
     const qualifiedRes = await q(
       `SELECT COUNT(*)::int AS n
          FROM clientes
-        WHERE ($1::text IS NULL OR organizacion_id = $1)
+        WHERE ($1 IS NULL OR organizacion_id = $1)
           AND created_at >= $2::timestamptz AND created_at < $3::timestamptz
           AND (
             stage IN ('Qualified','Bid/Estimate Sent','Won') OR
             stage ~* '^(calificad|presup|ganad)'
           )`,
-      [organizacion_id, fromISO, toISO]
+      [orgId, fromISO, toISO]
     );
     const qualifiedCount = qualifiedRes.rows?.[0]?.n ?? 0;
 
     const uncontactableRes = await q(
       `SELECT COUNT(*)::int AS n
          FROM clientes c
-        WHERE ($1::text IS NULL OR c.organizacion_id = $1)
+        WHERE ($1 IS NULL OR c.organizacion_id = $1)
           AND c.created_at >= $2::timestamptz AND c.created_at < $3::timestamptz
           AND COALESCE(NULLIF(TRIM(c.email), ''), '') = ''
           AND COALESCE(NULLIF(TRIM(c.telefono), ''), '') = ''`,
-      [organizacion_id, fromISO, toISO]
+      [orgId, fromISO, toISO]
     );
     const uncontactableCount = uncontactableRes.rows?.[0]?.n ?? 0;
 
     const noFirstTouchRes = await q(
       `SELECT COUNT(*)::int AS n
          FROM clientes c
-        WHERE ($1::text IS NULL OR c.organizacion_id = $1)
+        WHERE ($1 IS NULL OR c.organizacion_id = $1)
           AND c.created_at >= $2::timestamptz AND c.created_at < $3::timestamptz
           AND NOT EXISTS (
             SELECT 1 FROM tareas t
              WHERE t.cliente_id = c.id
-               ${organizacion_id ? "AND t.organizacion_id = c.organizacion_id" : ""}
+               AND ($1 IS NULL OR t.organizacion_id = $1)
           )`,
-      [organizacion_id, fromISO, toISO]
+      [orgId, fromISO, toISO]
     );
     const noFirstTouchCount = noFirstTouchRes.rows?.[0]?.n ?? 0;
 
     const uncategorizedRes = await q(
       `SELECT COUNT(*)::int AS n
          FROM clientes c
-        WHERE ($1::text IS NULL OR c.organizacion_id = $1)
+        WHERE ($1 IS NULL OR c.organizacion_id = $1)
           AND c.created_at >= $2::timestamptz AND c.created_at < $3::timestamptz
           AND (
             c.stage IS NULL OR TRIM(c.stage) = '' OR
             NOT (c.stage ~* '(incoming|lead|entrante|unqualified|calificad|qualified|follow|seguim|perdid|lost|bid|estimate|presup|won|ganad)')
           )`,
-      [organizacion_id, fromISO, toISO]
+      [orgId, fromISO, toISO]
     );
     const uncategorizedCount = uncategorizedRes.rows?.[0]?.n ?? 0;
 
     const stalledIncomingRes = await q(
       `SELECT COUNT(*)::int AS n
          FROM clientes c
-        WHERE ($1::text IS NULL OR c.organizacion_id = $1)
+        WHERE ($1 IS NULL OR c.organizacion_id = $1)
           AND c.stage ~* '^(incoming|lead|entrante)'
           AND c.created_at <= NOW() - (($2::int || ' days')::interval)
           AND NOT EXISTS (
             SELECT 1 FROM tareas t
              WHERE t.cliente_id = c.id
-               ${organizacion_id ? "AND t.organizacion_id = c.organizacion_id" : ""}
+               AND ($1 IS NULL OR t.organizacion_id = $1)
           )`,
-      [organizacion_id, stalledDays]
+      [orgId, stalledDays]
     );
     const stalledIncomingCount = stalledIncomingRes.rows?.[0]?.n ?? 0;
 
     /* ---------- Respuesta ---------- */
     const new_by_day = (contactsNewByDay.rows || []).map((r) => ({ dia: r.dia, nuevos: r.nuevos }));
-    const contactability_pct = contactabilitySafe(contactability.rows?.[0]);
+    const contactability_pct = num(contactability.rows?.[0]?.pct, 0);
     const ft = firstTouch.rows?.[0] || {};
-    const first_touch = { p50_min: ft.p50_min ?? 0, p90_min: ft.p90_min ?? 0, avg_min: ft.avg_min ?? 0 };
+    const first_touch = {
+      p50_min: num(ft.p50_min, 0),
+      p90_min: num(ft.p90_min, 0),
+      avg_min: num(ft.avg_min, 0),
+    };
 
     res.json({
       range: { from: fromISO, to: toISO },
       contacts: { total: totalContacts, new_by_day, contactability_pct, first_touch },
       tasks: {
-        overdue: tasksOverdue.rows?.[0]?.overdue ?? 0,
-        due_next_7d: tasksNext7d.rows?.[0]?.due_next_7d ?? 0,
+        overdue: num(tasksOverdue.rows?.[0]?.overdue, 0),
+        due_next_7d: num(tasksNext7d.rows?.[0]?.due_next_7d, 0),
       },
       ar,
       pipeline: {
@@ -502,10 +517,10 @@ router.get("/kpis", authenticateToken, nocache, async (req, res) => {
  */
 router.get("/tasks/kpis", authenticateToken, nocache, async (req, res) => {
   try {
-    const organizacion_id = await resolveOrgId(req);
+    const orgId = await resolveOrgId(req);
     const r = await q(
       `SELECT * FROM public.v_tareas_overview WHERE organizacion_id = $1`,
-      [organizacion_id]
+      [orgId]
     );
     if (r.rows?.length === 1) return res.json(r.rows[0]);
     return res.json(r.rows || []);
