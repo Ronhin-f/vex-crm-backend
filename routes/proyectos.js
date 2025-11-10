@@ -7,19 +7,31 @@ import { emit as emitFlow } from "../services/flows.client.js";
 const router = Router();
 
 /* ---------------------------- helpers ---------------------------- */
-function getUserFromReq(req) {
-  const u = req.usuario || {};
-  return {
-    email: (u.email ?? req.usuario_email ?? u.usuario_email ?? null) || null,
-    organizacion_id: u.organizacion_id ?? req.organizacion_id ?? u.organization_id ?? null,
-  };
-}
-const T = (v) => { if (v == null) return null; const s = String(v).trim(); return s.length ? s : null; };
+const T = (v) => (v == null ? null : String(v).trim() || null);
 const N = (v) => (v == null || v === "" ? null : Number(v));
 const D = (v) => { if (!v) return null; const d = new Date(v); return isNaN(d.getTime()) ? null : d.toISOString(); };
 const toInt = (v) => { const n = Number(v); return Number.isInteger(n) ? n : null; };
 const getBearer = (req) => req.headers?.authorization || null;
 const emailNorm = (v) => (T(v) ? String(v).trim().toLowerCase() : null);
+
+function getOrg(req) {
+  const raw =
+    T(req.usuario?.organizacion_id) ||
+    T(req.headers?.["x-org-id"]) ||
+    T(req.organizacion_id) ||
+    T(req.query?.organizacion_id) ||
+    T(req.body?.organizacion_id) ||
+    null;
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : null;
+}
+function getUserFromReq(req) {
+  const u = req.usuario || {};
+  return {
+    email: (u.email ?? req.usuario_email ?? u.usuario_email ?? null) || null,
+    organizacion_id: getOrg(req),
+  };
+}
 
 // Selección estándar (incluye alias "notas" para compat FE)
 const SELECT_PROJECT = `
@@ -44,37 +56,35 @@ const SELECT_PROJECT = `
 /**
  * GET /proyectos/options
  * Devuelve { stages, sources, assignees }
- * sources: unión de distintos en DB + defaults
- * assignees: distintos en DB + usuario actual
  */
 router.get("/options", authenticateToken, async (req, res) => {
   try {
     const { organizacion_id, email } = getUserFromReq(req);
 
-    const params = [];
-    const where = [];
-    if (organizacion_id) { params.push(organizacion_id); where.push(`p.organizacion_id = $${params.length}`); }
-
     // Distinct sources
+    const srcConds = [`p.source IS NOT NULL`, `p.source <> ''`];
+    const srcParams = [];
+    if (organizacion_id != null) { srcParams.push(organizacion_id); srcConds.unshift(`p.organizacion_id = $${srcParams.length}`); }
     const srcSQL = `
       SELECT DISTINCT p.source AS v
       FROM proyectos p
-      ${where.length ? "WHERE " + where.join(" AND ") : ""}
-      AND p.source IS NOT NULL AND p.source <> ''
+      ${srcConds.length ? "WHERE " + srcConds.join(" AND ") : ""}
       ORDER BY 1
     `;
-    const srcQ = await q(srcSQL, params);
+    const srcQ = await q(srcSQL, srcParams);
     const dbSources = (srcQ.rows || []).map(r => r.v).filter(Boolean);
 
     // Distinct assignees
+    const asgConds = [`p.assignee IS NOT NULL`, `p.assignee <> ''`];
+    const asgParams = [];
+    if (organizacion_id != null) { asgParams.push(organizacion_id); asgConds.unshift(`p.organizacion_id = $${asgParams.length}`); }
     const asgSQL = `
       SELECT DISTINCT p.assignee AS v
       FROM proyectos p
-      ${where.length ? "WHERE " + where.join(" AND ") : ""}
-      AND p.assignee IS NOT NULL AND p.assignee <> ''
+      ${asgConds.length ? "WHERE " + asgConds.join(" AND ") : ""}
       ORDER BY 1
     `;
-    const asgQ = await q(asgSQL, params);
+    const asgQ = await q(asgSQL, asgParams);
     const dbAssignees = (asgQ.rows || []).map(r => String(r.v).toLowerCase()).filter(Boolean);
 
     const defaultSources = [
@@ -107,7 +117,7 @@ router.get("/", authenticateToken, async (req, res) => {
   try {
     const { organizacion_id } = getUserFromReq(req);
     const { stage, cliente_id, q: qtext } = req.query || {};
-    // aceptar alias en filtros
+    // alias en filtros
     const source = req.query?.source ?? req.query?.origen ?? null;
     const assignee = req.query?.assignee ?? req.query?.responsable ?? null;
     const only_due = req.query?.only_due;
@@ -117,9 +127,9 @@ router.get("/", authenticateToken, async (req, res) => {
     const params = [];
     const where = [];
 
-    if (organizacion_id) { params.push(organizacion_id); where.push(`p.organizacion_id = $${params.length}`); }
+    if (organizacion_id != null) { params.push(organizacion_id); where.push(`p.organizacion_id = $${params.length}`); }
     if (stage)          { params.push(String(stage));     where.push(`p.stage = $${params.length}`); }
-    if (cliente_id)     { params.push(Number(cliente_id)); where.push(`p.cliente_id = $${params.length}`); }
+    if (cliente_id != null && cliente_id !== "") { params.push(Number(cliente_id)); where.push(`p.cliente_id = $${params.length}`); }
     if (source)         { params.push(String(source));     where.push(`p.source = $${params.length}`); }
     if (assignee)       { params.push(String(assignee));   where.push(`p.assignee = $${params.length}`); }
     if (String(only_due) === "1") { where.push("p.due_date IS NOT NULL"); }
@@ -160,9 +170,9 @@ router.get("/:id", authenticateToken, async (req, res) => {
       `
       ${SELECT_PROJECT}
       WHERE p.id = $1
-        AND (${organizacion_id != null ? "p.organizacion_id = $2" : "p.organizacion_id IS NULL"})
+        AND ($2::int IS NULL OR p.organizacion_id = $2)
       `,
-      organizacion_id != null ? [id, organizacion_id] : [id]
+      [id, organizacion_id]
     );
     if (!r.rowCount) return res.status(404).json({ ok: false, message: "Proyecto no encontrado" });
     res.json({ ok: true, item: r.rows[0] });
@@ -173,7 +183,7 @@ router.get("/:id", authenticateToken, async (req, res) => {
 });
 
 /* ============== GET /proyectos/kanban ============== */
-app.use('/proyectos/kanban', (req, res, next) => { req.url = '/kanban/proyectos'; next(); });
+// (Se quitó el app.use inválido)
 router.get("/kanban", authenticateToken, async (req, res) => {
   try {
     const { organizacion_id } = getUserFromReq(req);
@@ -185,7 +195,7 @@ router.get("/kanban", authenticateToken, async (req, res) => {
     const params = [];
     const where = [];
 
-    if (organizacion_id) { params.push(organizacion_id); where.push(`p.organizacion_id = $${params.length}`); }
+    if (organizacion_id != null) { params.push(organizacion_id); where.push(`p.organizacion_id = $${params.length}`); }
     if (source)          { params.push(String(source));   where.push(`p.source = $${params.length}`); }
     if (assignee)        { params.push(String(assignee)); where.push(`p.assignee = $${params.length}`); }
     if (String(only_due) === "1") { where.push("p.due_date IS NOT NULL"); }
@@ -207,8 +217,9 @@ router.get("/kanban", authenticateToken, async (req, res) => {
     const rows = r.rows || [];
 
     const byStage = new Map(CANON_CATS.map((s) => [s, []]));
+    const fallback = CANON_CATS[0] || "Incoming Leads";
     for (const it of rows) {
-      const key = CANON_CATS.includes(it.stage) ? it.stage : CANON_CATS[0];
+      const key = CANON_CATS.includes(it.stage) ? it.stage : fallback;
       byStage.get(key).push(it);
     }
     const columns = CANON_CATS.map((s) => ({
@@ -264,8 +275,8 @@ router.post("/", authenticateToken, async (req, res) => {
 
     if (!T(descripcion) && T(notas)) descripcion = notas;
 
-    const stageIn = T(stage) ?? T(categoria) ?? CANON_CATS[0];
-    const finalStage = CANON_CATS.includes(stageIn) ? stageIn : CANON_CATS[0];
+    const stageIn = T(stage) ?? T(categoria) ?? (CANON_CATS[0] || "Incoming Leads");
+    const finalStage = CANON_CATS.includes(stageIn) ? stageIn : (CANON_CATS[0] || "Incoming Leads");
 
     const r = await q(
       `INSERT INTO proyectos
@@ -292,7 +303,7 @@ router.post("/", authenticateToken, async (req, res) => {
       [
         T(nombre),
         T(descripcion),
-        cliente_id == null ? null : Number(cliente_id),
+        cliente_id == null || cliente_id === "" ? null : Number(cliente_id),
         finalStage,
         finalStage,
         T(source),
@@ -573,9 +584,9 @@ router.delete("/:id", authenticateToken, async (req, res) => {
       `
       ${SELECT_PROJECT}
       WHERE p.id=$1
-        AND (${organizacion_id != null ? "p.organizacion_id = $2" : "p.organizacion_id IS NULL"})
+        AND ($2::int IS NULL OR p.organizacion_id = $2)
       `,
-      organizacion_id != null ? [id, organizacion_id] : [id]
+      [id, organizacion_id]
     );
 
     const r = await q(
