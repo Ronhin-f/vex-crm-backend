@@ -59,11 +59,25 @@ async function regclassExists(name) {
   }
 }
 
-/** org resolver: JWT/req → headers → query/body → lookup por email único → null */
-async function resolveOrgId(req) {
+async function columnExists(table, column) {
+  try {
+    const r = await q(
+      `SELECT 1
+         FROM information_schema.columns
+        WHERE table_schema='public' AND table_name=$1 AND column_name=$2`,
+      [table, column]
+    );
+    return r.rowCount > 0;
+  } catch {
+    return false;
+  }
+}
+
+/** org resolver (preferimos TEXT para evitar choques text=int) */
+async function resolveOrgText(req) {
   const raw =
     T(req.usuario?.organizacion_id) ||
-    T(req.organizacion_id) || // ← alineado con middleware que la setea directo
+    T(req.organizacion_id) ||
     T(req.headers?.["x-org-id"]) ||
     T(req.query?.organizacion_id) ||
     T(req.query?.organization_id) ||
@@ -73,10 +87,7 @@ async function resolveOrgId(req) {
     T(req.body?.org_id) ||
     null;
 
-  if (raw != null) {
-    const n = Number(raw);
-    return Number.isFinite(n) ? n : null;
-  }
+  if (raw != null) return String(raw);
 
   const email =
     E(req.body?.email) ||
@@ -86,13 +97,12 @@ async function resolveOrgId(req) {
 
   if (email) {
     const r = await q(
-      `SELECT DISTINCT organizacion_id FROM public.usuarios WHERE lower(email)=lower($1)`,
+      `SELECT DISTINCT organizacion_id::text AS organizacion_id
+         FROM public.usuarios
+        WHERE lower(email)=lower($1)`,
       [email]
     );
-    if (r.rowCount === 1) {
-      const n = Number(r.rows[0]?.organizacion_id);
-      return Number.isFinite(n) ? n : null;
-    }
+    if (r.rowCount === 1) return String(r.rows[0]?.organizacion_id);
   }
   return null;
 }
@@ -132,7 +142,7 @@ ensureSchema().catch((e) => console.error("[users.ensureSchema]", e?.message || 
 /* -------------------- POST /users/register -------------------- */
 router.post("/register", async (req, res) => {
   try {
-    const org = await resolveOrgId(req);
+    const org = await resolveOrgText(req);
     if (org == null) return res.status(400).json({ ok: false, message: "organizacion_id requerido" });
 
     const email = E(req.body?.email);
@@ -146,7 +156,10 @@ router.post("/register", async (req, res) => {
     if (pass.length < 6) return res.status(400).json({ ok: false, message: "Password mínimo 6 caracteres" });
 
     const exists = await q(
-      `SELECT 1 FROM public.usuarios WHERE organizacion_id = $1 AND lower(email) = lower($2)`,
+      `SELECT 1
+         FROM public.usuarios
+        WHERE organizacion_id::text = $1::text
+          AND lower(email) = lower($2)`,
       [org, email]
     );
     if (exists.rowCount) {
@@ -157,18 +170,21 @@ router.post("/register", async (req, res) => {
     const r = await q(
       `
       INSERT INTO public.usuarios (organizacion_id, email, password_hash, nombre, rol, updated_at)
-      VALUES ($1,$2,$3,$4,$5, now())
+      VALUES ($1::int,$2,$3,$4,$5, now())
       RETURNING *
       `,
-      [org, email, password_hash, nombre, rol]
+      [Number(org), email, password_hash, nombre, rol]
     );
     const user = r.rows[0];
 
-    emitFlow("user.created", {
-      org,
-      user: { id: String(user.id), email: user.email, nombre: user.nombre, rol: user.rol },
-      meta: { source: "vex-core" },
-    }).catch(() => {});
+    // notificar flows (si existe)
+    try {
+      await emitFlow?.("user.created", {
+        org,
+        user: { id: String(user.id), email: user.email, nombre: user.nombre, rol: user.rol },
+        meta: { source: "vex-core" },
+      });
+    } catch {}
 
     const token = signToken(user);
     res.status(201).json({ ok: true, token, user: safeUser(user) });
@@ -181,7 +197,7 @@ router.post("/register", async (req, res) => {
 /* -------------------- POST /users/login -------------------- */
 router.post("/login", async (req, res) => {
   try {
-    const org = await resolveOrgId(req);
+    const org = await resolveOrgText(req);
     if (org == null) return res.status(400).json({ ok: false, message: "organizacion_id requerido" });
 
     const email = E(req.body?.email);
@@ -189,7 +205,11 @@ router.post("/login", async (req, res) => {
     if (!email || !pass) return res.status(400).json({ ok: false, message: "Email y password requeridos" });
 
     const r = await q(
-      `SELECT * FROM public.usuarios WHERE organizacion_id = $1 AND lower(email) = lower($2) AND activo = TRUE`,
+      `SELECT *
+         FROM public.usuarios
+        WHERE organizacion_id::text = $1::text
+          AND lower(email) = lower($2)
+          AND activo = TRUE`,
       [org, email]
     );
     const user = r.rows[0];
@@ -198,7 +218,12 @@ router.post("/login", async (req, res) => {
     const ok = await bcrypt.compare(pass, user.password_hash);
     if (!ok) return res.status(401).json({ ok: false, message: "Credenciales inválidas" });
 
-    await q(`UPDATE public.usuarios SET last_login_at = now(), updated_at = now() WHERE id = $1`, [user.id]).catch(() => {});
+    await q(
+      `UPDATE public.usuarios
+          SET last_login_at = now(), updated_at = now()
+        WHERE id = $1`,
+      [user.id]
+    ).catch(() => {});
 
     const token = signToken(user);
     res.json({ ok: true, token, user: safeUser({ ...user, last_login_at: new Date().toISOString() }) });
@@ -211,11 +236,17 @@ router.post("/login", async (req, res) => {
 /* -------------------- GET /users/me -------------------- */
 router.get("/me", auth, async (req, res) => {
   try {
-    const org = await resolveOrgId(req);
+    const org = await resolveOrgText(req);
     const id = Number(req.usuario?.id);
     if (org == null || !id) return res.json({ ok: true, user: null });
 
-    const r = await q(`SELECT * FROM public.usuarios WHERE id = $1 AND organizacion_id = $2`, [id, org]);
+    const r = await q(
+      `SELECT *
+         FROM public.usuarios
+        WHERE id = $1
+          AND organizacion_id::text = $2::text`,
+      [id, org]
+    );
     res.json({ ok: true, user: safeUser(r.rows[0] || null) });
   } catch (e) {
     console.error("[GET /users/me]", e?.stack || e?.message || e);
@@ -226,37 +257,39 @@ router.get("/me", auth, async (req, res) => {
 /* -------------------- GET /users — dropdown “Asignado a” -------------------- */
 router.get("/", auth, async (req, res) => {
   try {
-    const org = await resolveOrgId(req);
+    const org = await resolveOrgText(req);
     if (org == null) return res.json([]);
 
     const search = req.query.q ? `%${String(req.query.q).trim()}%` : null;
     const limit = Math.min(Number(req.query.limit ?? 50) || 50, 200);
 
     const hasProyectos = await regclassExists("proyectos");
+    const hasProyectosAssignee = hasProyectos && (await columnExists("proyectos", "assignee"));
     const hasTareas = await regclassExists("tareas");
+    const hasTareasUsuarioEmail = hasTareas && (await columnExists("tareas", "usuario_email"));
 
     const pieces = [
       `SELECT LOWER(email) AS email
          FROM public.usuarios
-        WHERE organizacion_id = $1
+        WHERE organizacion_id::text = $1::text
           AND activo = TRUE
           AND COALESCE(email,'') <> ''`,
     ];
 
-    if (hasProyectos) {
+    if (hasProyectosAssignee) {
       pieces.push(
         `SELECT LOWER(assignee) AS email
            FROM public.proyectos
-          WHERE organizacion_id = $1
+          WHERE organizacion_id::text = $1::text
             AND COALESCE(assignee,'') <> ''`
       );
     }
 
-    if (hasTareas) {
+    if (hasTareasUsuarioEmail) {
       pieces.push(
         `SELECT LOWER(usuario_email) AS email
            FROM public.tareas
-          WHERE organizacion_id = $1
+          WHERE organizacion_id::text = $1::text
             AND COALESCE(usuario_email,'') <> ''`
       );
     }
@@ -270,14 +303,14 @@ router.get("/", auth, async (req, res) => {
              NULL::int   AS id,
              NULL::text  AS rol,
              TRUE        AS activo,
-             $1::int     AS organizacion_id,
+             $1::text    AS organizacion_id,
              NULL::timestamptz AS created_at,
              NULL::timestamptz AS updated_at
         FROM emails
-       WHERE ($2::text IS NULL OR email ILIKE $2)
+       WHERE ($2::text IS NULL OR email ILIKE $2::text)
        GROUP BY email
        ORDER BY 1
-       LIMIT $3;
+       LIMIT $3::int;
     `;
 
     const r = await q(unionSQL, [org, search, limit]);
@@ -291,13 +324,13 @@ router.get("/", auth, async (req, res) => {
 /* -------------------- GET /users/full -------------------- */
 router.get("/full", auth, async (req, res) => {
   try {
-    const org = await resolveOrgId(req);
+    const org = await resolveOrgText(req);
     if (org == null) return res.json([]);
 
     const r = await q(
       `SELECT id, email, nombre, rol, activo, organizacion_id, created_at, updated_at, last_login_at
          FROM public.usuarios
-        WHERE organizacion_id = $1
+        WHERE organizacion_id::text = $1::text
         ORDER BY created_at DESC NULLS LAST, id DESC
         LIMIT 2000`,
       [org]
@@ -312,14 +345,16 @@ router.get("/full", auth, async (req, res) => {
 /* -------------------- PATCH /users/:id -------------------- */
 router.patch("/:id", auth, requireRole("owner", "admin"), async (req, res) => {
   try {
-    const org = await resolveOrgId(req);
+    const org = await resolveOrgText(req);
     if (org == null) return res.status(400).json({ ok: false, message: "organizacion_id requerido" });
 
     const id = Number(req.params.id);
     if (!id) return res.status(400).json({ ok: false, message: "ID inválido" });
 
     const cur = await q(
-      `SELECT id, rol, activo FROM public.usuarios WHERE id=$1 AND organizacion_id=$2`,
+      `SELECT id, rol, activo
+         FROM public.usuarios
+        WHERE id=$1 AND organizacion_id::text=$2::text`,
       [id, org]
     );
     if (!cur.rowCount) return res.status(404).json({ ok: false, message: "Usuario no encontrado" });
@@ -333,7 +368,11 @@ router.patch("/:id", auth, requireRole("owner", "admin"), async (req, res) => {
       const email = E(req.body.email);
       if (!email) return res.status(400).json({ ok: false, message: "Email inválido" });
       const c = await q(
-        `SELECT 1 FROM public.usuarios WHERE organizacion_id = $1 AND lower(email) = lower($2) AND id <> $3`,
+        `SELECT 1
+           FROM public.usuarios
+          WHERE organizacion_id::text = $1::text
+            AND lower(email) = lower($2)
+            AND id <> $3`,
         [org, email, id]
       );
       if (c.rowCount) return res.status(409).json({ ok: false, message: "Email ya usado en esta organización" });
@@ -352,7 +391,9 @@ router.patch("/:id", auth, requireRole("owner", "admin"), async (req, res) => {
 
       if (current.rol === "owner" && newRol !== "owner") {
         const owners = await q(
-          `SELECT COUNT(*)::int AS n FROM public.usuarios WHERE organizacion_id=$1 AND rol='owner' AND activo=TRUE`,
+          `SELECT COUNT(*)::int AS n
+             FROM public.usuarios
+            WHERE organizacion_id::text=$1::text AND rol='owner' AND activo=TRUE`,
           [org]
         );
         if ((owners.rows?.[0]?.n ?? 0) <= 1) {
@@ -367,7 +408,9 @@ router.patch("/:id", auth, requireRole("owner", "admin"), async (req, res) => {
       const toActive = !!req.body.activo;
       if (current.rol === "owner" && current.activo && !toActive) {
         const owners = await q(
-          `SELECT COUNT(*)::int AS n FROM public.usuarios WHERE organizacion_id=$1 AND rol='owner' AND activo=TRUE`,
+          `SELECT COUNT(*)::int AS n
+             FROM public.usuarios
+            WHERE organizacion_id::text=$1::text AND rol='owner' AND activo=TRUE`,
           [org]
         );
         if ((owners.rows?.[0]?.n ?? 0) <= 1) {
@@ -395,7 +438,7 @@ router.patch("/:id", auth, requireRole("owner", "admin"), async (req, res) => {
       `
       UPDATE public.usuarios
          SET ${sets.join(", ")}
-       WHERE id = $${i++} AND organizacion_id = $${i}
+       WHERE id = $${i++} AND organizacion_id::text = $${i}::text
        RETURNING *
       `,
       values
@@ -403,17 +446,19 @@ router.patch("/:id", auth, requireRole("owner", "admin"), async (req, res) => {
     if (!r.rowCount) return res.status(404).json({ ok: false, message: "Usuario no encontrado" });
 
     const updated = r.rows[0];
-    emitFlow("user.updated", {
-      org,
-      user: {
-        id: String(updated.id),
-        email: updated.email,
-        nombre: updated.nombre,
-        rol: updated.rol,
-        activo: updated.activo,
-      },
-      meta: { source: "vex-core" },
-    }).catch(() => {});
+    try {
+      await emitFlow?.("user.updated", {
+        org,
+        user: {
+          id: String(updated.id),
+          email: updated.email,
+          nombre: updated.nombre,
+          rol: updated.rol,
+          activo: updated.activo,
+        },
+        meta: { source: "vex-core" },
+      });
+    } catch {}
 
     res.json({ ok: true, user: safeUser(updated) });
   } catch (e) {
@@ -425,20 +470,24 @@ router.patch("/:id", auth, requireRole("owner", "admin"), async (req, res) => {
 /* -------------------- DELETE /users/:id (soft delete) -------------------- */
 router.delete("/:id", auth, requireRole("owner", "admin"), async (req, res) => {
   try {
-    const org = await resolveOrgId(req);
+    const org = await resolveOrgText(req);
     if (org == null) return res.status(400).json({ ok: false, message: "organizacion_id requerido" });
 
     const id = Number(req.params.id);
     if (!id) return res.status(400).json({ ok: false, message: "ID inválido" });
 
     const cur = await q(
-      `SELECT rol, activo FROM public.usuarios WHERE id=$1 AND organizacion_id=$2`,
+      `SELECT rol, activo
+         FROM public.usuarios
+        WHERE id=$1 AND organizacion_id::text=$2::text`,
       [id, org]
     );
     if (!cur.rowCount) return res.status(404).json({ ok: false, message: "Usuario no encontrado" });
     if (cur.rows[0].rol === "owner" && cur.rows[0].activo) {
       const owners = await q(
-        `SELECT COUNT(*)::int AS n FROM public.usuarios WHERE organizacion_id=$1 AND rol='owner' AND activo=TRUE`,
+        `SELECT COUNT(*)::int AS n
+           FROM public.usuarios
+          WHERE organizacion_id::text=$1::text AND rol='owner' AND activo=TRUE`,
         [org]
       );
       if ((owners.rows?.[0]?.n ?? 0) <= 1) {
@@ -447,17 +496,22 @@ router.delete("/:id", auth, requireRole("owner", "admin"), async (req, res) => {
     }
 
     const r = await q(
-      `UPDATE public.usuarios SET activo = FALSE, updated_at = now() WHERE id = $1 AND organizacion_id = $2 RETURNING *`,
+      `UPDATE public.usuarios
+          SET activo = FALSE, updated_at = now()
+        WHERE id = $1 AND organizacion_id::text = $2::text
+      RETURNING *`,
       [id, org]
     );
     if (!r.rowCount) return res.status(404).json({ ok: false, message: "Usuario no encontrado" });
 
     const deleted = r.rows[0];
-    emitFlow("user.deleted", {
-      org,
-      user: { id: String(deleted.id), email: deleted.email, nombre: deleted.nombre, rol: deleted.rol },
-      meta: { source: "vex-core" },
-    }).catch(() => {});
+    try {
+      await emitFlow?.("user.deleted", {
+        org,
+        user: { id: String(deleted.id), email: deleted.email, nombre: deleted.nombre, rol: deleted.rol },
+        meta: { source: "vex-core" },
+      });
+    } catch {}
 
     res.json({ ok: true });
   } catch (e) {
