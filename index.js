@@ -8,15 +8,15 @@ import axios from "axios";
 import cron from "node-cron";
 import { applySecurity } from "./middleware/security.js";
 import { initDB, q, pool } from "./utils/db.js";
-import { authenticateToken as auth, requireRole } from "./middleware/auth.js";
+import { authenticateToken as auth } from "./middleware/auth.js";
 import { scheduleReminders } from "./workers/reminders.worker.js";
-import { startOutboxDispatcher } from "./workers/outbox.dispatch.js"; // 👈 nuevo
+import { startOutboxDispatcher } from "./workers/outbox.dispatch.js";
 
 // ✅ Defaults útiles (no pisan Railway)
 process.env.SLACK_WEBHOOK_FALLBACK_CHANNEL ??= "#reminders-and-follow-ups";
 process.env.REMINDER_CRON ??= "*/10 * * * *";
 process.env.INVOICE_REMINDER_CRON ??= "0 * * * *"; // cada hora
-process.env.OUTBOX_DISPATCH_INTERVAL_MS ??= "60000"; // 👈 nuevo
+process.env.OUTBOX_DISPATCH_INTERVAL_MS ??= "60000";
 
 const app = express();
 app.set("trust proxy", true);
@@ -45,7 +45,7 @@ if (process.env.NODE_ENV !== "test") {
 // Seguridad (CORS + headers)
 applySecurity(app);
 
-// Estáticos para estimates
+// Estáticos (uploads para estimates/adjuntos)
 const UPLOAD_DIR = process.env.UPLOAD_DIR || path.join(process.cwd(), "uploads");
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 app.use("/uploads", express.static(UPLOAD_DIR));
@@ -132,7 +132,7 @@ function withOrg(req, res, next) {
     null;
 
   if (!org) return res.status(400).json({ error: "organizacion_id requerido" });
-  req.orgId = String(org);
+  req.orgId = String(org); // mantenemos TEXT por ahora
   next();
 }
 
@@ -335,7 +335,8 @@ function startInvoiceReminders() {
 
         const { rows } = await c.query(`
           WITH cand AS (
-            SELECT i.*, (now()::date - i.due_date)::int AS days_overdue,
+            SELECT i.*,
+                   (now()::date - i.due_date)::int AS days_overdue,
                    COALESCE((i.reminder_policy->'days_before')::jsonb, '[]'::jsonb) AS db,
                    COALESCE((i.reminder_policy->'days_after')::jsonb,  '[]'::jsonb) AS da
             FROM invoices i
@@ -344,9 +345,13 @@ function startInvoiceReminders() {
           SELECT * FROM cand
           WHERE
             (
-              (due_date >= now()::date AND (due_date - now()::date) IN (SELECT (value)::int FROM jsonb_array_elements(db)))
+              (due_date >= now()::date AND (due_date - now()::date) IN (
+                SELECT (value)::int FROM jsonb_array_elements_text(db)
+              ))
               OR
-              (due_date <  now()::date AND (now()::date - due_date) IN (SELECT (value)::int FROM jsonb_array_elements(da)))
+              (due_date <  now()::date AND (now()::date - due_date) IN (
+                SELECT (value)::int FROM jsonb_array_elements_text(da)
+              ))
             )
             AND (last_reminder_at IS NULL OR last_reminder_at < now() - interval '20 hours')
         `);
