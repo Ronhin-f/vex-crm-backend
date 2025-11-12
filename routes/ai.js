@@ -1,15 +1,16 @@
-// routes/ai.js
+// routes/ai.js — Insights + baseline IA (multi-tenant TEXT)
 import { Router } from "express";
 import { q } from "../utils/db.js";
 import { authenticateToken } from "../middleware/auth.js";
+import { getOrgText } from "../utils/org.js";
 
 const router = Router();
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
 let OpenAIClient = null;
 
+// Carga perezosa: si no hay key o lib, no rompe
 try {
-  // Carga perezosa (si no está instalada la lib o no hay key, no rompe)
   if (OPENAI_API_KEY) {
     const mod = await import("openai");
     OpenAIClient = new mod.default({ apiKey: OPENAI_API_KEY });
@@ -18,7 +19,12 @@ try {
 
 // GET /ai/insights → KPIs + (si hay key) texto de recomendaciones
 router.get("/insights", authenticateToken, async (req, res) => {
-  const org = (req.usuario?.organizacion_id ?? req.organizacion_id) || null;
+  let org;
+  try {
+    org = getOrgText(req); // siempre TEXT, admite token/header/query/body
+  } catch {
+    return res.status(400).json({ error: "organizacion_id requerido" });
+  }
 
   const out = {
     kpis: { clientes: 0, tareas: 0, proximos_7d: 0 },
@@ -31,7 +37,7 @@ router.get("/insights", authenticateToken, async (req, res) => {
   try {
     const [c1, c2, c3, c4] = await Promise.all([
       q(`SELECT COUNT(*)::int AS c FROM clientes WHERE organizacion_id = $1`, [org]),
-      q(`SELECT COUNT(*)::int AS c FROM tareas WHERE organizacion_id = $1`, [org]),
+      q(`SELECT COUNT(*)::int AS c FROM tareas   WHERE organizacion_id = $1`, [org]),
       q(
         `SELECT COUNT(*)::int AS c
            FROM tareas
@@ -51,16 +57,17 @@ router.get("/insights", authenticateToken, async (req, res) => {
       ),
     ]);
 
-    out.kpis.clientes   = c1.rows?.[0]?.c ?? 0;
-    out.kpis.tareas     = c2.rows?.[0]?.c ?? 0;
-    out.kpis.proximos_7d= c3.rows?.[0]?.c ?? 0;
-    out.pipeline        = c4.rows || [];
+    out.kpis.clientes    = c1.rows?.[0]?.c ?? 0;
+    out.kpis.tareas      = c2.rows?.[0]?.c ?? 0;
+    out.kpis.proximos_7d = c3.rows?.[0]?.c ?? 0;
+    out.pipeline         = c4.rows || [];
 
     // Baseline de reglas simples (si no hay OpenAI)
     const baseline = [];
-    const leadIn = out.pipeline.find(p => p.stage === "Incoming Leads")?.total ?? 0;
-    const estSent = out.pipeline.find(p => p.stage === "Bid/Estimate Sent")?.total ?? 0;
-    const won = out.pipeline.find(p => p.stage === "Won")?.total ?? 0;
+    const findStage = (name) => out.pipeline.find(p => (p.stage || "").toLowerCase() === name.toLowerCase())?.total ?? 0;
+    const leadIn  = findStage("Incoming Leads");
+    const estSent = findStage("Bid/Estimate Sent");
+    const won     = findStage("Won");
 
     if (leadIn > 0 && estSent === 0) {
       baseline.push("Tenés leads entrantes pero ningún presupuesto enviado. Priorizá calificar y enviar 3 estimaciones hoy.");
@@ -71,28 +78,16 @@ router.get("/insights", authenticateToken, async (req, res) => {
     if (won === 0 && estSent > 0) {
       baseline.push("Hay presupuestos enviados sin cierres. Agendá follow-up por WhatsApp para 3 mejores oportunidades.");
     }
-    if (!baseline.length) baseline.push("El pipeline está balanceado. Mantené el ritmo de follow-ups.");
+    if (!baseline.length) baseline.push("Pipeline razonable. Mantené frecuencia de follow-ups y cuidá los próximos 7 días.");
 
-    // Si hay OpenAI, pedimos recomendaciones con contexto
+    // OpenAI opcional
     if (OpenAIClient) {
-      const prompt = [
-        {
-          role: "system",
-          content: "Sos un analista de ventas B2B. Dás recomendaciones accionables y breves (3 bullets).",
-        },
-        {
-          role: "user",
-          content: JSON.stringify({
-            kpis: out.kpis,
-            pipeline: out.pipeline,
-            ejemplos_reglas: baseline,
-          }),
-        },
-      ];
-
       try {
-        // chat.completions (v4)
         const model = process.env.OPENAI_MODEL || "gpt-4o-mini";
+        const prompt = [
+          { role: "system", content: "Sos un analista de ventas B2B. Respuestas en 3 bullets, concretas y accionables." },
+          { role: "user", content: JSON.stringify({ kpis: out.kpis, pipeline: out.pipeline, ejemplos_reglas: baseline }) },
+        ];
         const resp = await OpenAIClient.chat.completions.create({
           model,
           temperature: 0.2,
@@ -100,7 +95,7 @@ router.get("/insights", authenticateToken, async (req, res) => {
         });
         out.recomendaciones = resp?.choices?.[0]?.message?.content?.trim() || baseline.join("\n");
       } catch (e) {
-        console.error("[/ai/insights openai]", e?.stack || e?.message || e);
+        console.error("[/ai/insights openai]", e?.message || e);
         out.recomendaciones = baseline.join("\n");
       }
     } else {
@@ -109,8 +104,9 @@ router.get("/insights", authenticateToken, async (req, res) => {
 
     res.json(out);
   } catch (e) {
-    console.error("[GET /ai/insights]", e?.stack || e?.message || e);
-    res.status(200).json(out); // fallback suave
+    console.error("[GET /ai/insights]", e?.message || e);
+    // devolvemos baseline parcial para no romper dashboard
+    res.status(200).json(out);
   }
 });
 

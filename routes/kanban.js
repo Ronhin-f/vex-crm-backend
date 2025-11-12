@@ -1,128 +1,147 @@
-// backend/routes/kanban.js
+// routes/kanban.js — Kanban (proyectos/clientes/tareas) + KPIs (blindado)
 import { Router } from "express";
 import { q, CANON_CATS } from "../utils/db.js";
 import { authenticateToken } from "../middleware/auth.js";
+import { nocache } from "../middleware/nocache.js";
+import { resolveOrgId, hasTable, tableColumns } from "../utils/schema.js";
 
 const router = Router();
 
 /* ---------------------------- helpers ---------------------------- */
-const T = (v) => (v == null ? null : String(v).trim() || null);
-function getOrg(req) {
-  const raw =
-    T(req.usuario?.organizacion_id) ||
-    T(req.headers?.["x-org-id"]) ||
-    T(req.organizacion_id) ||
-    T(req.query?.organizacion_id) ||
-    T(req.body?.organizacion_id) ||
-    null;
-  const n = Number(raw);
-  return Number.isFinite(n) ? n : null;
-}
-function getUserFromReq(req) {
-  const u = req.usuario || {};
-  return {
-    email: u.email ?? req.usuario_email ?? u.usuario_email ?? null,
-    organizacion_id: getOrg(req),
-  };
-}
-function coerceText(v) {
+const ORDER = Array.isArray(CANON_CATS) && CANON_CATS.length
+  ? CANON_CATS
+  : ["Incoming Leads","Unqualified","Qualified","Follow-up Missed","Bid/Estimate Sent","Won","Lost"];
+const PIPELINE_SET = new Set(ORDER);
+
+const coerceText = (v) => {
   if (v == null) return null;
   const s = String(v).trim();
   return s.length ? s : null;
-}
-function isTruthy(v) {
+};
+const isTruthy = (v) => {
   if (v == null) return false;
   const s = String(v).trim().toLowerCase();
   return s === "1" || s === "true" || s === "t" || s === "yes" || s === "y" || s === "on";
-}
-
-/* ------------------ Pipeline (proyectos/clientes) ------------------ */
-const ORDER =
-  Array.isArray(CANON_CATS) && CANON_CATS.length
-    ? CANON_CATS
-    : ["Incoming Leads", "Unqualified", "Qualified", "Follow-up Missed", "Bid/Estimate Sent", "Won", "Lost"];
-const PIPELINE_SET = new Set(ORDER);
+};
 
 /* ============================ KPIs ============================ */
-router.get("/kpis", authenticateToken, async (req, res) => {
+router.get("/kpis", authenticateToken, nocache, async (req, res) => {
   try {
-    const { organizacion_id } = getUserFromReq(req);
+    const orgId = await resolveOrgId(req);
 
-    // PROYECTOS por stage
-    const pProj = [], wProj = [];
-    if (organizacion_id != null) { pProj.push(organizacion_id); wProj.push(`organizacion_id = $${pProj.length}`); }
-    const proyectosPorStage = await q(
-      `SELECT COALESCE(stage,'Uncategorized') AS stage, COUNT(*)::int AS total
-         FROM proyectos
-        ${wProj.length ? "WHERE " + wProj.join(" AND ") : ""}
-        GROUP BY 1
-        ORDER BY total DESC`,
-      pProj
-    );
+    // ---- PROYECTOS
+    let proyectosPorStage = { rows: [] };
+    let proximos7d_proyectos = 0;
 
-    // CLIENTES por stage/categoría
-    const pCli = [], wCli = [];
-    if (organizacion_id != null) { pCli.push(organizacion_id); wCli.push(`organizacion_id = $${pCli.length}`); }
-    const clientesPorStage = await q(
-      `SELECT COALESCE(stage,'Uncategorized') AS stage, COUNT(*)::int AS total
-         FROM clientes
-        ${wCli.length ? "WHERE " + wCli.join(" AND ") : ""}
-        GROUP BY 1
-        ORDER BY total DESC`,
-      pCli
-    );
-    const clientesPorCat = await q(
-      `SELECT COALESCE(categoria,'Uncategorized') AS categoria, COUNT(*)::int AS total
-         FROM clientes
-        ${wCli.length ? "WHERE " + wCli.join(" AND ") : ""}
-        GROUP BY 1
-        ORDER BY total DESC`,
-      pCli
-    );
+    if (await hasTable("proyectos")) {
+      const pCols = await tableColumns("proyectos");
+      const stageExpr = pCols.has("stage")
+        ? "COALESCE(p.stage,'Uncategorized')"
+        : pCols.has("categoria")
+          ? "COALESCE(p.categoria,'Uncategorized')"
+          : "'Uncategorized'";
+      const whereP = [];
+      const paramsP = [];
+      if (pCols.has("organizacion_id") && orgId != null) {
+        paramsP.push(orgId);
+        whereP.push(`p.organizacion_id = $${paramsP.length}`);
+      }
+      proyectosPorStage = await q(
+        `SELECT ${stageExpr} AS stage, COUNT(*)::int AS total
+           FROM proyectos p
+          ${whereP.length ? "WHERE " + whereP.join(" AND ") : ""}
+          GROUP BY 1
+          ORDER BY total DESC`,
+        paramsP
+      );
 
-    // TAREAS por estado
-    const pTask = [], wTask = [];
-    if (organizacion_id != null) { pTask.push(organizacion_id); wTask.push(`organizacion_id = $${pTask.length}`); }
-    const tareasPorEstado = await q(
-      `SELECT COALESCE(estado,'todo') AS estado, COUNT(*)::int AS total
-         FROM tareas
-        ${wTask.length ? "WHERE " + wTask.join(" AND ") : ""}
-        GROUP BY 1
-        ORDER BY total DESC`,
-      pTask
-    );
+      if (pCols.has("due_date")) {
+        const p2 = [];
+        const w2 = [`p.due_date IS NOT NULL`, `p.due_date <= NOW() + INTERVAL '7 days'`];
+        if (pCols.has("organizacion_id") && orgId != null) { p2.push(orgId); w2.push(`p.organizacion_id = $${p2.length}`); }
+        const r = await q(`SELECT COUNT(*)::int AS total FROM proyectos p WHERE ${w2.join(" AND ")}`, p2);
+        proximos7d_proyectos = r.rows?.[0]?.total ?? 0;
+      }
+    }
 
-    // Próximos 7 días
-    const vencen7T = await q(
-      `SELECT COUNT(*)::int AS total
-         FROM tareas
-        WHERE completada = FALSE
-          AND vence_en IS NOT NULL
-          AND vence_en <= NOW() + INTERVAL '7 days'
-          ${organizacion_id != null ? "AND organizacion_id = $1" : ""}`,
-      organizacion_id != null ? [organizacion_id] : []
-    );
-    const vencen7P = await q(
-      `SELECT COUNT(*)::int AS total
-         FROM proyectos
-        WHERE due_date IS NOT NULL
-          AND due_date <= NOW() + INTERVAL '7 days'
-          ${organizacion_id != null ? "AND organizacion_id = $1" : ""}`,
-      organizacion_id != null ? [organizacion_id] : []
-    );
+    // ---- CLIENTES
+    let clientesPorStage = { rows: [] };
+    let clientesPorCat = { rows: [] };
+    if (await hasTable("clientes")) {
+      const cCols = await tableColumns("clientes");
+      const whereC = [];
+      const paramsC = [];
+      if (cCols.has("organizacion_id") && orgId != null) { paramsC.push(orgId); whereC.push(`organizacion_id = $${paramsC.length}`); }
+
+      const cliStageExpr = cCols.has("stage")
+        ? "COALESCE(stage,'Uncategorized')"
+        : cCols.has("categoria")
+          ? "COALESCE(categoria,'Uncategorized')"
+          : "'Uncategorized'";
+
+      clientesPorStage = await q(
+        `SELECT ${cliStageExpr} AS stage, COUNT(*)::int AS total
+           FROM clientes
+          ${whereC.length ? "WHERE " + whereC.join(" AND ") : ""}
+          GROUP BY 1
+          ORDER BY total DESC`,
+        paramsC
+      );
+      clientesPorCat = await q(
+        `SELECT COALESCE(${cCols.has("categoria") ? "categoria" : "NULL"},'Uncategorized') AS categoria, COUNT(*)::int AS total
+           FROM clientes
+          ${whereC.length ? "WHERE " + whereC.join(" AND ") : ""}
+          GROUP BY 1
+          ORDER BY total DESC`,
+        paramsC
+      );
+    }
+
+    // ---- TAREAS
+    let tareasPorEstado = { rows: [] };
+    let proximos7d = 0;
+    if (await hasTable("tareas")) {
+      const tCols = await tableColumns("tareas");
+      const whereT = [];
+      const paramsT = [];
+      if (tCols.has("organizacion_id") && orgId != null) { paramsT.push(orgId); whereT.push(`organizacion_id = $${paramsT.length}`); }
+
+      const estadoExpr = tCols.has("estado")
+        ? "COALESCE(estado,'todo')"
+        : tCols.has("completada")
+          ? "CASE WHEN completada THEN 'done' ELSE 'todo' END"
+          : "'todo'";
+
+      tareasPorEstado = await q(
+        `SELECT ${estadoExpr} AS estado, COUNT(*)::int AS total
+           FROM tareas
+          ${whereT.length ? "WHERE " + whereT.join(" AND ") : ""}
+          GROUP BY 1
+          ORDER BY total DESC`,
+        paramsT
+      );
+
+      if (tCols.has("vence_en")) {
+        const p2 = [];
+        const w2 = [`t.completada = FALSE`, `t.vence_en IS NOT NULL`, `t.vence_en <= NOW() + INTERVAL '7 days'`];
+        if (tCols.has("organizacion_id") && orgId != null) { p2.push(orgId); w2.push(`t.organizacion_id = $${p2.length}`); }
+        const r = await q(`SELECT COUNT(*)::int AS total FROM tareas t WHERE ${w2.join(" AND ")}`, p2);
+        proximos7d = r.rows?.[0]?.total ?? 0;
+      }
+    }
 
     res.json({
       proyectosPorStage: proyectosPorStage.rows || [],
-      proximos7d_proyectos: vencen7P.rows?.[0]?.total ?? 0,
+      proximos7d_proyectos,
       clientesPorStage: clientesPorStage.rows || [],
       clientesPorCat: clientesPorCat.rows || [],
       tareasPorEstado: tareasPorEstado.rows || [],
-      proximos7d: vencen7T.rows?.[0]?.total ?? 0,
-      proximos_7d: vencen7T.rows?.[0]?.total ?? 0,
+      proximos7d,
+      proximos_7d: proximos7d, // compat
     });
   } catch (e) {
     console.error("[GET /kanban/kpis]", e?.stack || e?.message || e);
-    res.json({
+    res.status(200).json({
       proyectosPorStage: [], proximos7d_proyectos: 0,
       clientesPorStage: [], clientesPorCat: [],
       tareasPorEstado: [], proximos7d: 0, proximos_7d: 0,
@@ -131,54 +150,85 @@ router.get("/kpis", authenticateToken, async (req, res) => {
 });
 
 /* ====================== Kanban de PROYECTOS ===================== */
-router.get("/proyectos", authenticateToken, async (req, res) => {
+router.get("/proyectos", authenticateToken, nocache, async (req, res) => {
   try {
-    const { organizacion_id } = getUserFromReq(req);
-    const { q: qtext, source, assignee, stage, only_due } = req.query || {};
-    const params = [], where = [];
+    if (!(await hasTable("proyectos"))) {
+      const columns = ORDER.map(name => ({ key: name, title: name, count: 0, items: [] }));
+      return res.status(200).json({ columns, order: ORDER });
+    }
 
-    if (organizacion_id != null) { params.push(organizacion_id); where.push(`p.organizacion_id = $${params.length}`); }
-    if (stage)   { params.push(String(stage));   where.push(`p.stage = $${params.length}`); }
-    if (source)  { params.push(String(source));  where.push(`p.source = $${params.length}`); }
-    if (assignee) {
+    const orgId = await resolveOrgId(req);
+    const hasCli = await hasTable("clientes");
+    const pCols = await tableColumns("proyectos");
+    const cCols = hasCli ? await tableColumns("clientes") : new Set();
+
+    const { q: qtext, source, assignee, stage, only_due } = req.query || {};
+    const params = []; const where = [];
+
+    if (pCols.has("organizacion_id") && orgId != null) { params.push(orgId); where.push(`p.organizacion_id = $${params.length}`); }
+    if (stage && pCols.has("stage"))   { params.push(String(stage));   where.push(`p.stage = $${params.length}`); }
+    if (source && pCols.has("source")) { params.push(String(source));  where.push(`p.source = $${params.length}`); }
+    if (assignee && pCols.has("assignee")) {
       if (/^(sin asignar|unassigned)$/i.test(String(assignee))) {
         where.push(`(p.assignee IS NULL OR TRIM(p.assignee) = '')`);
       } else { params.push(String(assignee)); where.push(`p.assignee = $${params.length}`); }
     }
+    if (isTruthy(only_due) && pCols.has("due_date")) where.push(`p.due_date IS NOT NULL`);
+
     if (qtext) {
-      const qval = `%${String(qtext).trim()}%`; params.push(qval);
+      const qval = `%${String(qtext).trim()}%`;
+      params.push(qval);
       const i = params.length;
-      where.push(
-        `(p.nombre ILIKE $${i}
-          OR COALESCE(p.email, c.email) ILIKE $${i}
-          OR COALESCE(p.telefono, c.telefono) ILIKE $${i}
-          OR c.nombre ILIKE $${i})`
-      );
+      const ors = [];
+      if (pCols.has("nombre"))   ors.push(`p.nombre ILIKE $${i}`);
+      if (pCols.has("email"))    ors.push(`p.email ILIKE $${i}`);
+      if (pCols.has("telefono")) ors.push(`CAST(p.telefono AS TEXT) ILIKE $${i}`);
+      if (hasCli && cCols.has("email"))    ors.push(`c.email ILIKE $${i}`);
+      if (hasCli && cCols.has("telefono")) ors.push(`CAST(c.telefono AS TEXT) ILIKE $${i}`);
+      if (hasCli && cCols.has("nombre"))   ors.push(`c.nombre ILIKE $${i}`);
+      if (ors.length) where.push("(" + ors.join(" OR ") + ")");
     }
-    if (isTruthy(only_due)) where.push(`p.due_date IS NOT NULL`);
+
+    const joinCli = hasCli ? `LEFT JOIN clientes c ON c.id = p.cliente_id` : "";
+
+    const sel = (colName, tableAlias, asType = "text") => {
+      const colSet = tableAlias === "p" ? pCols : cCols;
+      if (colSet.has(colName)) return `${tableAlias}.${colName}`;
+      if (asType === "timestamptz") return "NULL::timestamptz";
+      if (asType === "int") return "NULL::int";
+      return "NULL::text";
+    };
 
     const rs = await q(
       `SELECT
-         p.id, p.cliente_id,
-         p.nombre,
-         COALESCE(p.email, c.email)       AS email,
-         COALESCE(p.telefono, c.telefono) AS telefono,
-         p.stage, p.categoria, p.source, p.assignee, p.due_date,
-         p.estimate_url, p.estimate_file, p.created_at,
-         c.nombre AS cliente_nombre,
-         COALESCE(p.contacto_nombre, c.contacto_nombre) AS contacto_nombre
+         ${sel("id","p","int")} AS id,
+         ${sel("cliente_id","p","int")} AS cliente_id,
+         ${sel("nombre","p")} AS nombre,
+         ${hasCli ? sel("nombre","c") : "NULL::text"} AS cliente_nombre,
+         COALESCE(${sel("email","p")}, ${hasCli ? sel("email","c") : "NULL::text"}) AS email,
+         CAST(COALESCE(${sel("telefono","p")}, ${hasCli ? sel("telefono","c") : "NULL::text"}) AS TEXT) AS telefono,
+         ${sel("stage","p")}   AS stage,
+         ${sel("categoria","p")} AS categoria,
+         ${sel("source","p")}  AS source,
+         ${sel("assignee","p")} AS assignee,
+         ${sel("due_date","p","timestamptz")} AS due_date,
+         ${sel("estimate_url","p")} AS estimate_url,
+         ${sel("estimate_file","p")} AS estimate_file,
+         ${sel("created_at","p","timestamptz")} AS created_at,
+         COALESCE(${sel("contacto_nombre","p")}, ${hasCli ? sel("contacto_nombre","c") : "NULL::text"}) AS contacto_nombre
        FROM proyectos p
-       LEFT JOIN clientes c ON c.id = p.cliente_id
+       ${joinCli}
        ${where.length ? "WHERE " + where.join(" AND ") : ""}
-       ORDER BY p.created_at DESC NULLS LAST, p.id DESC`,
+       ORDER BY ${pCols.has("created_at") ? "p.created_at DESC NULLS LAST," : ""} p.id DESC`,
       params
     );
 
     const bucket = new Map(ORDER.map(k => [k, []]));
     for (const row of rs.rows) {
       const key =
-        PIPELINE_SET.has(row.stage) ? row.stage :
-        PIPELINE_SET.has(row.categoria) ? row.categoria : ORDER[ORDER.length - 1] || "Lost";
+        (row.stage && PIPELINE_SET.has(row.stage)) ? row.stage :
+        (row.categoria && PIPELINE_SET.has(row.categoria)) ? row.categoria :
+        ORDER[ORDER.length - 1] || "Lost";
 
       const estimateChip = !!(row.estimate_url || row.estimate_file);
       bucket.get(key)?.push({
@@ -210,28 +260,42 @@ router.get("/proyectos", authenticateToken, async (req, res) => {
     res.json({ columns, order: ORDER });
   } catch (e) {
     console.error("[GET /kanban/proyectos]", e?.stack || e?.message || e);
-    res.status(500).json({ message: "Error obteniendo Kanban de proyectos" });
+    const columns = ORDER.map(name => ({ key: name, title: name, count: 0, items: [] }));
+    res.status(200).json({ columns, order: ORDER });
   }
 });
 
 router.patch("/proyectos/:id/move", authenticateToken, async (req, res) => {
   try {
-    const { organizacion_id } = getUserFromReq(req);
+    if (!(await hasTable("proyectos"))) return res.status(404).json({ message: "Tabla proyectos no existe" });
+    const pCols = await tableColumns("proyectos");
+    const orgId = await resolveOrgId(req);
+
     const id = Number(req.params.id);
     let next = coerceText(req.body?.stage ?? req.body?.categoria);
     if (!Number.isInteger(id)) return res.status(400).json({ message: "ID inválido" });
     if (!next) return res.status(400).json({ message: "stage requerido" });
-    if (!PIPELINE_SET.has(next) && !CANON_CATS.includes(next)) {
+    if (!PIPELINE_SET.has(next) && !ORDER.includes(next)) {
       return res.status(400).json({ message: "stage fuera del pipeline" });
     }
 
+    const sets = [];
+    const params = [next, id];
+    let i = 3;
+
+    if (pCols.has("stage"))     sets.push(`stage = $1`);
+    if (pCols.has("categoria")) sets.push(`categoria = $1`);
+    if (pCols.has("updated_at")) sets.push(`updated_at = NOW()`);
+
+    let where = `id = $2`;
+    if (pCols.has("organizacion_id") && orgId != null) {
+      params.push(orgId); where += ` AND organizacion_id = $${i++}`;
+    }
+
     const r = await q(
-      `UPDATE proyectos
-          SET stage = $1,
-              categoria = $1
-        WHERE id = $2 AND ($3::int IS NULL OR organizacion_id = $3)
-        RETURNING id, nombre, stage, categoria`,
-      [next, id, organizacion_id]
+      `UPDATE proyectos SET ${sets.join(", ")} WHERE ${where}
+       RETURNING id, ${pCols.has("nombre") ? "nombre" : "NULL::text AS nombre"}, ${pCols.has("stage") ? "stage" : "NULL::text AS stage"}, ${pCols.has("categoria") ? "categoria" : "NULL::text AS categoria"}`,
+      params
     );
     if (!r.rowCount) return res.status(404).json({ message: "Proyecto no encontrado" });
     res.json(r.rows[0]);
@@ -241,44 +305,74 @@ router.patch("/proyectos/:id/move", authenticateToken, async (req, res) => {
   }
 });
 
-/* ====================== Kanban de CLIENTES (compat) ===================== */
-router.get("/clientes", authenticateToken, async (req, res) => {
+/* ====================== Kanban de CLIENTES ===================== */
+router.get("/clientes", authenticateToken, nocache, async (req, res) => {
   try {
-    const { organizacion_id } = getUserFromReq(req);
-    const { q: qtext, source, assignee, stage, only_due } = req.query || {};
-    const params = [], where = [];
+    if (!(await hasTable("clientes"))) {
+      const columns = ORDER.map(name => ({ key: name, title: name, count: 0, items: [] }));
+      return res.status(200).json({ columns, order: ORDER });
+    }
 
-    if (organizacion_id != null) { params.push(organizacion_id); where.push(`c.organizacion_id = $${params.length}`); }
-    if (stage)   { params.push(String(stage));   where.push(`c.stage = $${params.length}`); }
-    if (source)  { params.push(String(source));  where.push(`c.source = $${params.length}`); }
-    if (assignee) {
+    const orgId = await resolveOrgId(req);
+    const cCols = await tableColumns("clientes");
+
+    const { q: qtext, source, assignee, stage, only_due } = req.query || {};
+    const params = []; const where = [];
+
+    if (cCols.has("organizacion_id") && orgId != null) { params.push(orgId); where.push(`c.organizacion_id = $${params.length}`); }
+    if (stage && cCols.has("stage"))   { params.push(String(stage));   where.push(`c.stage = $${params.length}`); }
+    if (source && cCols.has("source")) { params.push(String(source));  where.push(`c.source = $${params.length}`); }
+    if (assignee && cCols.has("assignee")) {
       if (/^(sin asignar|unassigned)$/i.test(String(assignee))) {
         where.push(`(c.assignee IS NULL OR TRIM(c.assignee) = '')`);
       } else { params.push(String(assignee)); where.push(`c.assignee = $${params.length}`); }
     }
+    if (isTruthy(only_due) && cCols.has("due_date")) where.push(`c.due_date IS NOT NULL`);
+
     if (qtext) {
-      const qval = `%${String(qtext).trim()}%`; params.push(qval);
+      const qval = `%${String(qtext).trim()}%`;
+      params.push(qval);
       const i = params.length;
-      where.push(`(c.nombre ILIKE $${i} OR c.email ILIKE $${i} OR c.telefono ILIKE $${i})`);
+      const ors = [];
+      if (cCols.has("nombre"))   ors.push(`c.nombre ILIKE $${i}`);
+      if (cCols.has("email"))    ors.push(`c.email ILIKE $${i}`);
+      if (cCols.has("telefono")) ors.push(`CAST(c.telefono AS TEXT) ILIKE $${i}`);
+      if (ors.length) where.push("(" + ors.join(" OR ") + ")");
     }
-    if (isTruthy(only_due)) where.push(`c.due_date IS NOT NULL`);
+
+    const sel = (col, asType = "text") => {
+      if (cCols.has(col)) return `c.${col}`;
+      if (asType === "timestamptz") return "NULL::timestamptz";
+      if (asType === "int") return "NULL::int";
+      return "NULL::text";
+    };
 
     const rs = await q(
       `SELECT
-         c.id, c.nombre, c.telefono, c.email,
-         c.stage, c.categoria, c.source, c.assignee, c.due_date,
-         c.estimate_url, c.estimate_file, c.created_at
+         ${sel("id","int")} AS id,
+         ${sel("nombre")}    AS nombre,
+         CAST(${cCols.has("telefono") ? "c.telefono" : "NULL::text"} AS TEXT) AS telefono,
+         ${sel("email")}     AS email,
+         ${sel("stage")}     AS stage,
+         ${sel("categoria")} AS categoria,
+         ${sel("source")}    AS source,
+         ${sel("assignee")}  AS assignee,
+         ${sel("due_date","timestamptz")} AS due_date,
+         ${sel("estimate_url")}  AS estimate_url,
+         ${sel("estimate_file")} AS estimate_file,
+         ${sel("created_at","timestamptz")} AS created_at
        FROM clientes c
        ${where.length ? "WHERE " + where.join(" AND ") : ""}
-       ORDER BY c.created_at DESC NULLS LAST, c.id DESC`,
+       ORDER BY ${cCols.has("created_at") ? "c.created_at DESC NULLS LAST," : ""} c.id DESC`,
       params
     );
 
     const bucket = new Map(ORDER.map(k => [k, []]));
     for (const row of rs.rows) {
       const key =
-        PIPELINE_SET.has(row.stage) ? row.stage :
-        PIPELINE_SET.has(row.categoria) ? row.categoria : ORDER[ORDER.length - 1] || "Lost";
+        (row.stage && PIPELINE_SET.has(row.stage)) ? row.stage :
+        (row.categoria && PIPELINE_SET.has(row.categoria)) ? row.categoria :
+        ORDER[ORDER.length - 1] || "Lost";
 
       const estimateChip = !!(row.estimate_url || row.estimate_file);
       bucket.get(key)?.push({
@@ -307,28 +401,39 @@ router.get("/clientes", authenticateToken, async (req, res) => {
     res.json({ columns, order: ORDER });
   } catch (e) {
     console.error("[GET /kanban/clientes]", e?.stack || e?.message || e);
-    res.status(500).json({ message: "Error obteniendo Kanban de clientes" });
+    const columns = ORDER.map(name => ({ key: name, title: name, count: 0, items: [] }));
+    res.status(200).json({ columns, order: ORDER });
   }
 });
 
 router.patch("/clientes/:id/move", authenticateToken, async (req, res) => {
   try {
-    const { organizacion_id } = getUserFromReq(req);
+    if (!(await hasTable("clientes"))) return res.status(404).json({ message: "Tabla clientes no existe" });
+    const cCols = await tableColumns("clientes");
+    const orgId = await resolveOrgId(req);
+
     const id = Number(req.params.id);
     let next = coerceText(req.body?.stage ?? req.body?.categoria);
     if (!Number.isInteger(id)) return res.status(400).json({ message: "ID inválido" });
     if (!next) return res.status(400).json({ message: "stage requerido" });
-    if (!PIPELINE_SET.has(next) && !CANON_CATS.includes(next)) {
+    if (!PIPELINE_SET.has(next) && !ORDER.includes(next)) {
       return res.status(400).json({ message: "stage fuera del pipeline" });
     }
 
+    const sets = [];
+    if (cCols.has("stage"))     sets.push(`stage = $1`);
+    if (cCols.has("categoria")) sets.push(`categoria = $1`);
+    if (cCols.has("updated_at")) sets.push(`updated_at = NOW()`);
+
+    const params = [next, id];
+    let i = 3;
+    let where = `id = $2`;
+    if (cCols.has("organizacion_id") && orgId != null) { params.push(orgId); where += ` AND organizacion_id = $${i++}`; }
+
     const r = await q(
-      `UPDATE clientes
-          SET stage = $1,
-              categoria = $1
-        WHERE id = $2 AND ($3::int IS NULL OR organizacion_id = $3)
-        RETURNING id, nombre, stage, categoria`,
-      [next, id, organizacion_id]
+      `UPDATE clientes SET ${sets.join(", ")} WHERE ${where}
+       RETURNING id, ${cCols.has("nombre") ? "nombre" : "NULL::text AS nombre"}, ${cCols.has("stage") ? "stage" : "NULL::text AS stage"}, ${cCols.has("categoria") ? "categoria" : "NULL::text AS categoria"}`,
+      params
     );
     if (!r.rowCount) return res.status(404).json({ message: "Cliente no encontrado" });
     res.json(r.rows[0]);
@@ -339,30 +444,56 @@ router.patch("/clientes/:id/move", authenticateToken, async (req, res) => {
 });
 
 /* ======================= Kanban de TAREAS ====================== */
-const TASK_COLUMNS = [
-  { key: "todo",    title: "Por hacer"  },
-  { key: "doing",   title: "En curso"   },
-  { key: "waiting", title: "En espera"  },
-  { key: "done",    title: "Hecho"      },
-];
-
 // GET compatible: devuelve items[], columns{}, lanes[]
-router.get("/tareas", authenticateToken, async (req, res) => {
+router.get("/tareas", authenticateToken, nocache, async (req, res) => {
   try {
-    const { organizacion_id } = getUserFromReq(req);
-    const params = [], where = [];
+    if (!(await hasTable("tareas"))) {
+      return res.status(200).json({
+        ok: true,
+        items: [],
+        columns: { todo: [], doing: [], waiting: [], done: [] },
+        lanes: [
+          { id: "todo", title: "Por hacer", items: [] },
+          { id: "doing", title: "En curso", items: [] },
+          { id: "waiting", title: "En espera", items: [] },
+          { id: "done", title: "Hecho", items: [] },
+        ],
+      });
+    }
 
-    if (organizacion_id != null) { params.push(organizacion_id); where.push(`t.organizacion_id = $${params.length}`); }
+    const orgId = await resolveOrgId(req);
+    const tCols = await tableColumns("tareas");
+    const hasClientes = await hasTable("clientes");
+    const cCols = hasClientes ? await tableColumns("clientes") : new Set();
+
+    const params = []; const where = [];
+    if (tCols.has("organizacion_id") && orgId != null) { params.push(orgId); where.push(`t.organizacion_id = $${params.length}`); }
+
+    const sel = (col, asType = "text") => {
+      if (tCols.has(col)) return `t.${col}`;
+      if (asType === "timestamptz") return "NULL::timestamptz";
+      if (asType === "int") return "NULL::int";
+      if (asType === "bool") return "FALSE::boolean";
+      return "NULL::text";
+    };
 
     const r = await q(
       `SELECT
-         t.id, t.titulo, t.descripcion, t.estado, t.orden, t.completada,
-         t.vence_en, t.created_at, t.cliente_id, t.usuario_email,
-         c.nombre AS cliente_nombre
+         ${sel("id","int")} AS id,
+         ${sel("titulo")} AS titulo,
+         ${sel("descripcion")} AS descripcion,
+         ${tCols.has("estado") ? "t.estado" : tCols.has("completada") ? "CASE WHEN t.completada THEN 'done' ELSE 'todo' END AS estado" : "'todo' AS estado"},
+         ${tCols.has("orden") ? "t.orden" : "0 AS orden"},
+         ${sel("completada","bool")} AS completada,
+         ${sel("vence_en","timestamptz")} AS vence_en,
+         ${sel("created_at","timestamptz")} AS created_at,
+         ${sel("cliente_id","int")} AS cliente_id,
+         ${sel("usuario_email")} AS usuario_email,
+         ${hasClientes && cCols.has("nombre") ? "c.nombre" : "NULL::text"} AS cliente_nombre
        FROM tareas t
-       LEFT JOIN clientes c ON c.id = t.cliente_id
+       ${hasClientes ? "LEFT JOIN clientes c ON c.id = t.cliente_id" : ""}
        ${where.length ? "WHERE " + where.join(" AND ") : ""}
-       ORDER BY t.estado ASC, t.orden ASC, t.created_at DESC, t.id DESC`,
+       ORDER BY ${tCols.has("estado") ? "t.estado ASC," : ""} ${tCols.has("orden") ? "t.orden ASC," : ""} ${tCols.has("created_at") ? "t.created_at DESC NULLS LAST," : ""} t.id DESC`,
       params
     );
 
@@ -383,26 +514,22 @@ router.get("/tareas", authenticateToken, async (req, res) => {
       usuario_email: row.usuario_email || null,
     }));
 
-    // Columns
+    // Columns + lanes
     const columns = { todo: [], doing: [], waiting: [], done: [] };
     for (const it of items) {
       const lane = columns[it.estado] ? it.estado : "todo";
       columns[lane].push(it);
     }
-
-    // Lanes
-    const lanes = Object.entries(columns).map(([id, arr]) => ({
-      id,
-      title: id === "todo" ? "Por hacer" :
-             id === "doing" ? "En curso" :
-             id === "waiting" ? "En espera" : "Hecho",
-      items: arr,
-    }));
+    const lanes = [
+      { id: "todo",    title: "Por hacer", items: columns.todo },
+      { id: "doing",   title: "En curso",  items: columns.doing },
+      { id: "waiting", title: "En espera", items: columns.waiting },
+      { id: "done",    title: "Hecho",     items: columns.done },
+    ];
 
     res.json({ ok: true, items, columns, lanes });
   } catch (e) {
     console.error("[GET /kanban/tareas]", e?.stack || e?.message || e);
-    // Respuesta "suave" para no romper el render del FE
     res.status(200).json({
       ok: true,
       items: [],
@@ -419,7 +546,10 @@ router.get("/tareas", authenticateToken, async (req, res) => {
 
 router.patch("/tareas/:id/move", authenticateToken, async (req, res) => {
   try {
-    const { organizacion_id } = getUserFromReq(req);
+    if (!(await hasTable("tareas"))) return res.status(404).json({ message: "Tabla tareas no existe" });
+    const tCols = await tableColumns("tareas");
+    const orgId = await resolveOrgId(req);
+
     const id = Number(req.params.id);
     let { estado, orden } = req.body || {};
     if (!Number.isInteger(id)) return res.status(400).json({ message: "ID inválido" });
@@ -429,25 +559,39 @@ router.patch("/tareas/:id/move", authenticateToken, async (req, res) => {
       return res.status(400).json({ message: "Estado inválido" });
     }
 
-    // Si no se envía orden: al final del carril destino (por organización)
-    if (orden == null) {
-      const mr = await q(
-        `SELECT COALESCE(MAX(orden),0) AS m
-           FROM tareas
-          WHERE estado = $1 AND ($2::int IS NULL OR organizacion_id = $2)`,
-        [estado, organizacion_id]
-      );
+    // Si no se envía orden → al final del carril
+    if (orden == null && tCols.has("orden")) {
+      const p = [];
+      let w = `estado = $1`; p.push(estado);
+      if (tCols.has("organizacion_id") && orgId != null) { p.push(orgId); w += ` AND organizacion_id = $2`; }
+      const mr = await q(`SELECT COALESCE(MAX(orden),0) AS m FROM tareas WHERE ${w}`, p);
       orden = (mr.rows?.[0]?.m ?? 0) + 1;
+    } else if (orden == null) {
+      orden = 0;
     }
 
+    const sets = [];
+    const params = [];
+    let idx = 1;
+
+    if (tCols.has("estado"))     { sets.push(`estado = $${idx++}`); params.push(estado); }
+    if (tCols.has("orden"))      { sets.push(`orden = $${idx++}`);  params.push(orden); }
+    if (tCols.has("completada")) { sets.push(`completada = $${idx++}`); params.push(estado === "done"); }
+    if (tCols.has("updated_at")) { sets.push(`updated_at = NOW()`); }
+
+    params.push(id);
+    let where = `id = $${idx++}`;
+    if (tCols.has("organizacion_id") && orgId != null) { params.push(orgId); where += ` AND organizacion_id = $${idx++}`; }
+
     const r = await q(
-      `UPDATE tareas
-          SET estado = $1,
-              orden = $2,
-              completada = CASE WHEN $1='done' THEN TRUE ELSE FALSE END
-        WHERE id = $3 AND ($4::int IS NULL OR organizacion_id = $4)
-        RETURNING id, titulo, estado, orden, completada`,
-      [estado, orden, id, organizacion_id]
+      `UPDATE tareas SET ${sets.join(", ")} WHERE ${where}
+       RETURNING
+         id,
+         ${tCols.has("titulo") ? "titulo" : "NULL::text AS titulo"},
+         ${tCols.has("estado") ? "estado" : "CASE WHEN $1='done' THEN 'done' ELSE 'todo' END AS estado"},
+         ${tCols.has("orden") ? "orden" : "0 AS orden"},
+         ${tCols.has("completada") ? "completada" : "($1='done') AS completada"}`,
+      params
     );
     if (!r.rowCount) return res.status(404).json({ message: "Tarea no encontrada" });
     res.json(r.rows[0]);

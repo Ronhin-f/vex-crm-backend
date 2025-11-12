@@ -6,17 +6,21 @@
 // - API_CORE_URL
 // - CORE_BASE_URL
 // - CORE_API_URL
-// (fallback) https://vex-core-backend-production.up.railway.app
+// (fallback) https://vex-core-backend-production.up.railway.app  ← confirmar si es correcto
 //
-// También soporta token de servicio:
+// Token de servicio (opcional):
 // - CORE_SERVICE_TOKEN o CORE_MACHINE_TOKEN
 //
 // Comportamiento:
-// • Pasa Authorization del request si viene; si no, usa SERVICE_TOKEN.
-// • Timeout defensivo y un reintento corto.
-// • Cache en memoria 60s por (orgId + tipo de auth).
+// • Si viene Authorization en el request, se usa tal cual; si no, se usa SERVICE_TOKEN (si existe).
+// • Timeout defensivo y un reintento corto ante errores de red.
+// • Cache en memoria (TTL configurable por CORE_CACHE_MS; por defecto 60s) por (orgId + tipo de auth).
 // • Soporta respuestas {items:[]}, {users:[]}, {data:[]} o array directo.
 // • Fallback de rutas: /api/users?organizacion_id=... → /api/orgs/:id/users → /api/users
+//
+// Extra:
+// • Header x-org-id (cuando hay org) para servicios que lo soporten.
+// • Fallback opcional a SERVICE_TOKEN si el bearer de usuario responde 401/403 (require allowSvcFallback=true).
 
 const RAW_BASE =
   (process.env.CORE_URL ||
@@ -30,6 +34,8 @@ const RAW_BASE =
 const CORE_BASE_URL = RAW_BASE.replace(/\/+$/, ""); // sin trailing slash
 const SERVICE_TOKEN =
   process.env.CORE_SERVICE_TOKEN || process.env.CORE_MACHINE_TOKEN || null;
+
+const CACHE_MS = Number(process.env.CORE_CACHE_MS || 60_000);
 
 // cache simple en memoria
 const mem = {
@@ -62,7 +68,7 @@ async function coreGet(path, { headers = {}, retry = 1 } = {}) {
       : await res.text().catch(() => null);
 
     return { ok: res.ok, status: res.status, data };
-  } catch (e) {
+  } catch (_e) {
     if (retry > 0) {
       // backoff pequeño
       await new Promise((r) => setTimeout(r, 150));
@@ -116,42 +122,75 @@ function pickArrayFrom(data) {
  *
  * @param {number|string|null} orgId
  * @param {string|undefined} bearerFromReq  // ej: "Bearer eyJ..."
+ * @param {object} [opts]
+ * @param {boolean} [opts.allowSvcFallback=false] // si 401/403 con bearer, reintenta con SERVICE_TOKEN (si existe)
+ * @param {boolean} [opts.passOrgHeader=true] // envía x-org-id junto con los query params
  * @returns {Promise<Array>}  // usuarios normalizados (email, name, slack_user_id)
  */
-export async function coreListUsers(orgId, bearerFromReq) {
+export async function coreListUsers(orgId, bearerFromReq, opts = {}) {
+  const { allowSvcFallback = false, passOrgHeader = true } = opts;
+
   // cache key distinta si es bearer de usuario o token de servicio
   const authKind = bearerFromReq ? "user" : (SERVICE_TOKEN ? "svc" : "none");
   const key = `${orgId ?? "none"}|${authKind}`;
 
   const hit = mem.users.get(key);
-  if (hit && Date.now() - hit.ts < 60_000) return hit.data;
+  if (hit && Date.now() - hit.ts < CACHE_MS) return hit.data;
 
-  const headers = {};
-  if (bearerFromReq) headers.Authorization = bearerFromReq;
-  else if (SERVICE_TOKEN) headers.Authorization = `Bearer ${SERVICE_TOKEN}`;
-
-  // Intento principal: /api/users con múltiples nombres de query por compatibilidad
-  const qs = new URLSearchParams();
-  if (orgId !== null && orgId !== undefined && orgId !== "") {
-    qs.set("organizacion_id", String(orgId));
-    qs.set("orgId", String(orgId));
-    qs.set("org_id", String(orgId));
-  }
-  qs.set("limit", "500");
-
-  let res = await coreGet(`/api/users?${qs.toString()}`, { headers, retry: 1 });
-
-  // Fallback 1: /api/orgs/:orgId/users (si hay orgId)
-  if ((!res.ok || !res.data) && orgId) {
-    res = await coreGet(`/api/orgs/${encodeURIComponent(orgId)}/users`, {
-      headers,
-      retry: 1,
-    });
+  const baseHeaders = {};
+  if (passOrgHeader && orgId !== null && orgId !== undefined && orgId !== "") {
+    baseHeaders["x-org-id"] = String(orgId);
   }
 
-  // Fallback 2: /api/users sin filtros (último recurso)
-  if (!res.ok || !res.data) {
-    res = await coreGet(`/api/users`, { headers, retry: 0 });
+  // Construcción de query con aliases
+  const makeQS = (id) => {
+    const qs = new URLSearchParams();
+    if (id !== null && id !== undefined && id !== "") {
+      qs.set("organizacion_id", String(id));
+      qs.set("orgId", String(id));
+      qs.set("org_id", String(id));
+    }
+    qs.set("limit", "500");
+    return qs.toString();
+  };
+
+  // Helper para intentar con header dado
+  const tryList = async (authHeader) => {
+    const headers = { ...baseHeaders };
+    if (authHeader) headers.Authorization = authHeader;
+
+    // Intento principal: /api/users
+    let res = await coreGet(`/api/users?${makeQS(orgId)}`, { headers, retry: 1 });
+
+    // Fallback 1: /api/orgs/:orgId/users (si hay orgId)
+    if ((!res.ok || !res.data) && orgId) {
+      res = await coreGet(`/api/orgs/${encodeURIComponent(orgId)}/users`, {
+        headers,
+        retry: 1,
+      });
+    }
+
+    // Fallback 2: /api/users sin filtros (último recurso)
+    if (!res.ok || !res.data) {
+      res = await coreGet(`/api/users`, { headers, retry: 0 });
+    }
+
+    return res;
+  };
+
+  // 1) Intento con el bearer de usuario o con SERVICE_TOKEN si no hay bearer
+  const primaryAuth =
+    bearerFromReq || (SERVICE_TOKEN ? `Bearer ${SERVICE_TOKEN}` : undefined);
+  let res = await tryList(primaryAuth);
+
+  // 2) Fallback opcional: si vino bearer de usuario y falló por 401/403, reintento con SERVICE_TOKEN
+  if (
+    allowSvcFallback &&
+    bearerFromReq &&
+    SERVICE_TOKEN &&
+    (!res.ok && (res.status === 401 || res.status === 403))
+  ) {
+    res = await tryList(`Bearer ${SERVICE_TOKEN}`);
   }
 
   let items = [];

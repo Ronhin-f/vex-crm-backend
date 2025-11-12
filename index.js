@@ -10,11 +10,13 @@ import { applySecurity } from "./middleware/security.js";
 import { initDB, q, pool } from "./utils/db.js";
 import { authenticateToken as auth, requireRole } from "./middleware/auth.js";
 import { scheduleReminders } from "./workers/reminders.worker.js";
+import { startOutboxDispatcher } from "./workers/outbox.dispatch.js"; // 👈 nuevo
 
 // ✅ Defaults útiles (no pisan Railway)
 process.env.SLACK_WEBHOOK_FALLBACK_CHANNEL ??= "#reminders-and-follow-ups";
 process.env.REMINDER_CRON ??= "*/10 * * * *";
 process.env.INVOICE_REMINDER_CRON ??= "0 * * * *"; // cada hora
+process.env.OUTBOX_DISPATCH_INTERVAL_MS ??= "60000"; // 👈 nuevo
 
 const app = express();
 app.set("trust proxy", true);
@@ -124,7 +126,7 @@ await mount("/web",            "./routes/web.js");
 // middleware multi-tenant (corrige req.user → req.usuario)
 function withOrg(req, res, next) {
   const org =
-    req.usuario?.organizacion_id ||   // ⬅️ clave correcta según auth.js
+    req.usuario?.organizacion_id ||
     req.headers["x-org-id"] ||
     req.query.organizacion_id ||
     null;
@@ -253,6 +255,10 @@ console.log(
   `🕒 InvoiceReminders ON cron=${process.env.INVOICE_REMINDER_CRON} tz=${process.env.TZ || "UTC"}`
 );
 
+// 🚚 Outbox dispatcher (cada OUTBOX_DISPATCH_INTERVAL_MS ms)
+startOutboxDispatcher();
+console.log(`🚚 Outbox ON interval=${process.env.OUTBOX_DISPATCH_INTERVAL_MS}ms`);
+
 // Start
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`✅ VEX CRM en :${PORT} | dbReady=${dbReady}`));
@@ -324,9 +330,7 @@ function startInvoiceReminders() {
     async () => {
       const c = await pool.connect();
       try {
-        const got = (
-          await c.query("SELECT pg_try_advisory_lock($1)", [LOCK])
-        ).rows[0].pg_try_advisory_lock;
+        const got = (await c.query("SELECT pg_try_advisory_lock($1)", [LOCK])).rows[0].pg_try_advisory_lock;
         if (!got) return;
 
         const { rows } = await c.query(`
@@ -347,6 +351,7 @@ function startInvoiceReminders() {
             AND (last_reminder_at IS NULL OR last_reminder_at < now() - interval '20 hours')
         `);
 
+        const N = (x) => Number(x ?? 0);
         for (const i of rows) {
           const due = Math.max(N(i.amount_total) - N(i.amount_paid), 0);
           await notifyFlows("invoice_reminder", {

@@ -1,14 +1,19 @@
-// routes/proyectos.js — Oportunidades/Proyectos
+// routes/proyectos.js — Oportunidades/Proyectos (blindado + multi-tenant + schema-agnostic)
 import { Router } from "express";
 import { q, CANON_CATS } from "../utils/db.js";
 import { authenticateToken } from "../middleware/auth.js";
 import { emit as emitFlow } from "../services/flows.client.js";
+import { hasTable, tableColumns } from "../utils/schema.js";
 
 const router = Router();
 
 /* ---------------------------- helpers ---------------------------- */
 const T = (v) => (v == null ? null : String(v).trim() || null);
-const N = (v) => (v == null || v === "" ? null : Number(v));
+const N = (v) => {
+  if (v == null || v === "") return null;
+  const n = +v;
+  return Number.isFinite(n) ? n : null;
+};
 const D = (v) => { if (!v) return null; const d = new Date(v); return isNaN(d.getTime()) ? null : d.toISOString(); };
 const toInt = (v) => { const n = Number(v); return Number.isInteger(n) ? n : null; };
 const getBearer = (req) => req.headers?.authorization || null;
@@ -33,74 +38,112 @@ function getUserFromReq(req) {
   };
 }
 
-// Selección estándar (incluye alias "notas" para compat FE)
-const SELECT_PROJECT = `
-  SELECT
-    p.id, p.nombre,
-    p.descripcion,
-    p.descripcion AS notas,             -- alias de compatibilidad
-    p.cliente_id,
-    p.stage, p.categoria,
-    p.source, p.assignee, p.due_date,
-    p.estimate_url, p.estimate_file,
-    p.estimate_amount, p.estimate_currency,
-    p.prob_win, p.fecha_cierre_estimada,
-    p.contacto_nombre,
-    p.usuario_email, p.organizacion_id,
-    p.result, p.closed_at,
-    p.created_at, p.updated_at
-  FROM proyectos p
-`;
+function exp(cols, name, type) {
+  return cols.has(name) ? `p.${name}` : `NULL::${type}`;
+}
+function orderExpr(cols) {
+  if (cols.has("updated_at")) return "p.updated_at DESC NULLS LAST, p.id DESC";
+  if (cols.has("created_at")) return "p.created_at DESC NULLS LAST, p.id DESC";
+  return "p.id DESC";
+}
+async function buildProjectSelect() {
+  const cols = await tableColumns("proyectos");
+  const parts = [
+    `${exp(cols, "id", "int")} AS id`,
+    `${exp(cols, "nombre", "text")} AS nombre`,
+    `${exp(cols, "descripcion", "text")} AS descripcion`,
+    `${exp(cols, "descripcion", "text")} AS notas`,
+    `${exp(cols, "cliente_id", "int")} AS cliente_id`,
+    `${exp(cols, "stage", "text")} AS stage`,
+    `${exp(cols, "categoria", "text")} AS categoria`,
+    `${exp(cols, "source", "text")} AS source`,
+    `${exp(cols, "assignee", "text")} AS assignee`,
+    `${exp(cols, "due_date", "timestamptz")} AS due_date`,
+    `${exp(cols, "estimate_url", "text")} AS estimate_url`,
+    `${exp(cols, "estimate_file", "text")} AS estimate_file`,
+    `${exp(cols, "estimate_amount", "numeric")} AS estimate_amount`,
+    `${exp(cols, "estimate_currency", "text")} AS estimate_currency`,
+    `${exp(cols, "prob_win", "numeric")} AS prob_win`,
+    `${exp(cols, "fecha_cierre_estimada", "timestamptz")} AS fecha_cierre_estimada`,
+    `${exp(cols, "contacto_nombre", "text")} AS contacto_nombre`,
+    `${exp(cols, "usuario_email", "text")} AS usuario_email`,
+    `${exp(cols, "organizacion_id", "int")} AS organizacion_id`,
+    `${exp(cols, "result", "text")} AS result`,
+    `${exp(cols, "closed_at", "timestamptz")} AS closed_at`,
+    `${exp(cols, "created_at", "timestamptz")} AS created_at`,
+    `${exp(cols, "updated_at", "timestamptz")} AS updated_at`,
+  ];
+  return { cols, selectSQL: `SELECT\n  ${parts.join(",\n  ")}\nFROM proyectos p`, orderBy: orderExpr(cols) };
+}
 
-/* ============== OPTIONS para dropdowns (antes de :id) ============== */
-/**
- * GET /proyectos/options
- * Devuelve { stages, sources, assignees }
- */
+function pickInsert(cols, obj) {
+  const fields = [];
+  const values = [];
+  for (const [k, v] of Object.entries(obj)) {
+    if (cols.has(k)) { fields.push(k); values.push(v); }
+  }
+  return { fields, values };
+}
+
+function pickUpdate(cols, obj) {
+  const sets = [];
+  const values = [];
+  let i = 1;
+  for (const [k, v] of Object.entries(obj)) {
+    if (!cols.has(k)) continue;
+    sets.push(`${k} = $${i++}`);
+    values.push(v);
+  }
+  if (cols.has("updated_at")) {
+    sets.push(`updated_at = NOW()`);
+  }
+  return { sets, values };
+}
+
+/* ============== OPTIONS (antes de :id) ============== */
 router.get("/options", authenticateToken, async (req, res) => {
   try {
+    if (!(await hasTable("proyectos"))) {
+      const { email } = getUserFromReq(req);
+      return res.json({
+        ok: true,
+        stages: CANON_CATS,
+        sources: ["Website","Referral","Email","WhatsApp","Phone","Instagram","Facebook","Google Ads","LinkedIn","Cold Outreach","Event","Walk-in"],
+        assignees: email ? [String(email).toLowerCase()] : [],
+      });
+    }
+
     const { organizacion_id, email } = getUserFromReq(req);
+    const cols = await tableColumns("proyectos");
 
-    // Distinct sources
-    const srcConds = [`p.source IS NOT NULL`, `p.source <> ''`];
-    const srcParams = [];
-    if (organizacion_id != null) { srcParams.push(organizacion_id); srcConds.unshift(`p.organizacion_id = $${srcParams.length}`); }
-    const srcSQL = `
-      SELECT DISTINCT p.source AS v
-      FROM proyectos p
-      ${srcConds.length ? "WHERE " + srcConds.join(" AND ") : ""}
-      ORDER BY 1
-    `;
-    const srcQ = await q(srcSQL, srcParams);
-    const dbSources = (srcQ.rows || []).map(r => r.v).filter(Boolean);
+    // sources
+    let sources = [];
+    if (cols.has("source")) {
+      const ps = [];
+      const wh = [`p.source IS NOT NULL`, `p.source <> ''`];
+      if (cols.has("organizacion_id") && organizacion_id != null) {
+        ps.push(organizacion_id); wh.unshift(`p.organizacion_id = $${ps.length}`);
+      }
+      const src = await q(`SELECT DISTINCT p.source AS v FROM proyectos p ${wh.length ? "WHERE " + wh.join(" AND ") : ""} ORDER BY 1`, ps);
+      sources = (src.rows || []).map(r => r.v).filter(Boolean);
+    }
+    const defaults = ["Website","Referral","Email","WhatsApp","Phone","Instagram","Facebook","Google Ads","LinkedIn","Cold Outreach","Event","Walk-in"];
+    const sourcesSet = new Set([...defaults, ...sources]);
 
-    // Distinct assignees
-    const asgConds = [`p.assignee IS NOT NULL`, `p.assignee <> ''`];
-    const asgParams = [];
-    if (organizacion_id != null) { asgParams.push(organizacion_id); asgConds.unshift(`p.organizacion_id = $${asgParams.length}`); }
-    const asgSQL = `
-      SELECT DISTINCT p.assignee AS v
-      FROM proyectos p
-      ${asgConds.length ? "WHERE " + asgConds.join(" AND ") : ""}
-      ORDER BY 1
-    `;
-    const asgQ = await q(asgSQL, asgParams);
-    const dbAssignees = (asgQ.rows || []).map(r => String(r.v).toLowerCase()).filter(Boolean);
+    // assignees
+    let assignees = [];
+    if (cols.has("assignee")) {
+      const pa = [];
+      const wha = [`p.assignee IS NOT NULL`, `p.assignee <> ''`];
+      if (cols.has("organizacion_id") && organizacion_id != null) {
+        pa.push(organizacion_id); wha.unshift(`p.organizacion_id = $${pa.length}`);
+      }
+      const asg = await q(`SELECT DISTINCT p.assignee AS v FROM proyectos p ${wha.length ? "WHERE " + wha.join(" AND ") : ""} ORDER BY 1`, pa);
+      assignees = (asg.rows || []).map(r => String(r.v || "").toLowerCase()).filter(Boolean);
+    }
+    const assigneesSet = new Set([...(email ? [String(email).toLowerCase()] : []), ...assignees]);
 
-    const defaultSources = [
-      "Website","Referral","Email","WhatsApp","Phone",
-      "Instagram","Facebook","Google Ads","LinkedIn","Cold Outreach","Event","Walk-in"
-    ];
-
-    const sourcesSet = new Set([...defaultSources, ...dbSources]);
-    const assigneesSet = new Set([...(email ? [String(email).toLowerCase()] : []), ...dbAssignees]);
-
-    res.json({
-      ok: true,
-      stages: CANON_CATS,
-      sources: Array.from(sourcesSet),
-      assignees: Array.from(assigneesSet),
-    });
+    res.json({ ok: true, stages: CANON_CATS, sources: Array.from(sourcesSet), assignees: Array.from(assigneesSet) });
   } catch (e) {
     console.error("[GET /proyectos/options]", e?.stack || e?.message || e);
     res.json({ ok: true, stages: CANON_CATS, sources: [], assignees: [] });
@@ -108,72 +151,80 @@ router.get("/options", authenticateToken, async (req, res) => {
 });
 
 /* ============== GET /proyectos ============== */
-/**
- * Filtros: q (nombre/descripcion), stage, cliente_id, source, assignee, only_due(=1)
- * Orden: updated_at DESC, id DESC
- * Extras: limit, offset
- */
 router.get("/", authenticateToken, async (req, res) => {
   try {
+    if (!(await hasTable("proyectos"))) return res.status(200).json({ ok: true, items: [] });
+
     const { organizacion_id } = getUserFromReq(req);
+    const { selectSQL, orderBy, cols } = await buildProjectSelect();
+
     const { stage, cliente_id, q: qtext } = req.query || {};
-    // alias en filtros
     const source = req.query?.source ?? req.query?.origen ?? null;
     const assignee = req.query?.assignee ?? req.query?.responsable ?? null;
     const only_due = req.query?.only_due;
 
     let { limit = 1000, offset = 0 } = req.query || {};
+    limit = Math.max(1, Math.min(2000, Number(limit) || 1000));
+    offset = Math.max(0, Number(offset) || 0);
 
     const params = [];
     const where = [];
 
-    if (organizacion_id != null) { params.push(organizacion_id); where.push(`p.organizacion_id = $${params.length}`); }
-    if (stage)          { params.push(String(stage));     where.push(`p.stage = $${params.length}`); }
-    if (cliente_id != null && cliente_id !== "") { params.push(Number(cliente_id)); where.push(`p.cliente_id = $${params.length}`); }
-    if (source)         { params.push(String(source));     where.push(`p.source = $${params.length}`); }
-    if (assignee)       { params.push(String(assignee));   where.push(`p.assignee = $${params.length}`); }
-    if (String(only_due) === "1") { where.push("p.due_date IS NOT NULL"); }
+    if (cols.has("organizacion_id") && organizacion_id != null) { params.push(organizacion_id); where.push(`p.organizacion_id = $${params.length}`); }
+    if (stage && (cols.has("stage") || cols.has("categoria"))) {
+      params.push(String(stage));
+      where.push(`${cols.has("stage") ? "p.stage" : "p.categoria"} = $${params.length}`);
+    }
+    if (cliente_id != null && cliente_id !== "" && cols.has("cliente_id")) { params.push(Number(cliente_id)); where.push(`p.cliente_id = $${params.length}`); }
+    if (source && cols.has("source")) { params.push(String(source)); where.push(`p.source = $${params.length}`); }
+    if (assignee && cols.has("assignee")) { params.push(String(assignee)); where.push(`p.assignee = $${params.length}`); }
+    if (String(only_due) === "1" && cols.has("due_date")) { where.push("p.due_date IS NOT NULL"); }
 
     if (qtext) {
       const qv = `%${String(qtext).trim()}%`;
-      params.push(qv);
-      const i = params.length;
-      where.push(`(p.nombre ILIKE $${i} OR p.descripcion ILIKE $${i})`);
+      if (cols.has("descripcion")) {
+        params.push(qv); const i = params.length;
+        where.push(`(p.nombre ILIKE $${i} OR p.descripcion ILIKE $${i})`);
+      } else {
+        params.push(qv); const i = params.length;
+        where.push(`(p.nombre ILIKE $${i})`);
+      }
     }
 
-    limit = Math.max(1, Math.min(2000, Number(limit) || 1000));
-    offset = Math.max(0, Number(offset) || 0);
     params.push(limit, offset);
-
     const sql = `
-      ${SELECT_PROJECT}
+      ${selectSQL}
       ${where.length ? "WHERE " + where.join(" AND ") : ""}
-      ORDER BY p.updated_at DESC NULLS LAST, p.id DESC
+      ORDER BY ${orderBy}
       LIMIT $${params.length - 1} OFFSET $${params.length}
     `;
     const r = await q(sql, params);
     res.json({ ok: true, items: r.rows || [] });
   } catch (e) {
     console.error("[GET /proyectos]", e?.stack || e?.message || e);
-    res.status(200).json({ ok: true, items: [] }); // no romper FE
+    res.status(200).json({ ok: true, items: [] });
   }
 });
 
 /* ============== GET /proyectos/:id ============== */
 router.get("/:id", authenticateToken, async (req, res) => {
   try {
+    if (!(await hasTable("proyectos"))) return res.status(404).json({ ok: false, message: "Proyecto no encontrado" });
+
     const { organizacion_id } = getUserFromReq(req);
     const id = toInt(req.params.id);
     if (id == null) return res.status(400).json({ ok: false, message: "ID inválido" });
 
-    const r = await q(
-      `
-      ${SELECT_PROJECT}
-      WHERE p.id = $1
-        AND ($2::int IS NULL OR p.organizacion_id = $2)
-      `,
-      [id, organizacion_id]
-    );
+    const { selectSQL, cols } = await buildProjectSelect();
+
+    const params = [id];
+    let where = `p.id = $1`;
+    if (cols.has("organizacion_id") && organizacion_id != null) {
+      params.push(organizacion_id);
+      where += ` AND p.organizacion_id = $2`;
+    }
+
+    const r = await q(`${selectSQL} WHERE ${where}`, params);
     if (!r.rowCount) return res.status(404).json({ ok: false, message: "Proyecto no encontrado" });
     res.json({ ok: true, item: r.rows[0] });
   } catch (e) {
@@ -183,10 +234,15 @@ router.get("/:id", authenticateToken, async (req, res) => {
 });
 
 /* ============== GET /proyectos/kanban ============== */
-// (Se quitó el app.use inválido)
 router.get("/kanban", authenticateToken, async (req, res) => {
   try {
+    if (!(await hasTable("proyectos"))) {
+      return res.json({ ok: true, order: CANON_CATS, columns: CANON_CATS.map(s => ({ key: s, title: s, items: [], count: 0 })) });
+    }
+
     const { organizacion_id } = getUserFromReq(req);
+    const { selectSQL, orderBy, cols } = await buildProjectSelect();
+
     const { q: qtext } = req.query || {};
     const source = req.query?.source ?? req.query?.origen ?? null;
     const assignee = req.query?.assignee ?? req.query?.responsable ?? null;
@@ -195,33 +251,42 @@ router.get("/kanban", authenticateToken, async (req, res) => {
     const params = [];
     const where = [];
 
-    if (organizacion_id != null) { params.push(organizacion_id); where.push(`p.organizacion_id = $${params.length}`); }
-    if (source)          { params.push(String(source));   where.push(`p.source = $${params.length}`); }
-    if (assignee)        { params.push(String(assignee)); where.push(`p.assignee = $${params.length}`); }
-    if (String(only_due) === "1") { where.push("p.due_date IS NOT NULL"); }
+    if (cols.has("organizacion_id") && organizacion_id != null) { params.push(organizacion_id); where.push(`p.organizacion_id = $${params.length}`); }
+    if (source && cols.has("source")) { params.push(String(source)); where.push(`p.source = $${params.length}`); }
+    if (assignee && cols.has("assignee")) { params.push(String(assignee)); where.push(`p.assignee = $${params.length}`); }
+    if (String(only_due) === "1" && cols.has("due_date")) { where.push("p.due_date IS NOT NULL"); }
 
     if (qtext) {
       const qv = `%${String(qtext).trim()}%`;
-      params.push(qv);
-      const i = params.length;
-      where.push(`(p.nombre ILIKE $${i} OR p.descripcion ILIKE $${i})`);
+      if (cols.has("descripcion")) {
+        params.push(qv); const i = params.length;
+        where.push(`(p.nombre ILIKE $${i} OR p.descripcion ILIKE $${i})`);
+      } else {
+        params.push(qv); const i = params.length;
+        where.push(`(p.nombre ILIKE $${i})`);
+      }
     }
 
-    const sql = `
-      ${SELECT_PROJECT}
+    const r = await q(
+      `
+      ${selectSQL}
       ${where.length ? "WHERE " + where.join(" AND ") : ""}
-      ORDER BY p.updated_at DESC NULLS LAST, p.id DESC
+      ORDER BY ${orderBy}
       LIMIT 1500
-    `;
-    const r = await q(sql, params);
-    const rows = r.rows || [];
+      `,
+      params
+    );
 
+    const rows = r.rows || [];
     const byStage = new Map(CANON_CATS.map((s) => [s, []]));
-    const fallback = CANON_CATS[0] || "Incoming Leads";
+    const fallback = (cols.has("stage") || cols.has("categoria")) ? (CANON_CATS[0] || "Incoming Leads") : (CANON_CATS[CANON_CATS.length - 1] || "Lost");
+
     for (const it of rows) {
-      const key = CANON_CATS.includes(it.stage) ? it.stage : fallback;
-      byStage.get(key).push(it);
+      const stageVal = cols.has("stage") ? it.stage : (cols.has("categoria") ? it.categoria : null);
+      const key = stageVal && CANON_CATS.includes(stageVal) ? stageVal : fallback;
+      byStage.get(key)?.push(it);
     }
+
     const columns = CANON_CATS.map((s) => ({
       key: s,
       title: s,
@@ -239,16 +304,14 @@ router.get("/kanban", authenticateToken, async (req, res) => {
 /* ============== POST /proyectos ============== */
 router.post("/", authenticateToken, async (req, res) => {
   try {
+    if (!(await hasTable("proyectos"))) return res.status(501).json({ ok: false, message: "Módulo de proyectos no instalado" });
+
     const bearer = getBearer(req);
     const { organizacion_id, email: usuario_email } = getUserFromReq(req);
+    const cols = await tableColumns("proyectos");
 
-    // alias español → campos internos
-    if (!("assignee" in (req.body || {})) && "responsable" in (req.body || {})) {
-      req.body.assignee = req.body.responsable;
-    }
-    if (!("source" in (req.body || {})) && "origen" in (req.body || {})) {
-      req.body.source = req.body.origen;
-    }
+    if (!("assignee" in (req.body || {})) && "responsable" in (req.body || {})) req.body.assignee = req.body.responsable;
+    if (!("source" in (req.body || {})) && "origen" in (req.body || {})) req.body.source = req.body.origen;
 
     let {
       nombre,
@@ -269,64 +332,51 @@ router.post("/", authenticateToken, async (req, res) => {
       contacto_nombre = null,
     } = req.body || {};
 
-    if (!nombre || !String(nombre).trim()) {
-      return res.status(400).json({ ok: false, message: "Nombre requerido" });
-    }
-
+    if (!nombre || !String(nombre).trim()) return res.status(400).json({ ok: false, message: "Nombre requerido" });
     if (!T(descripcion) && T(notas)) descripcion = notas;
 
     const stageIn = T(stage) ?? T(categoria) ?? (CANON_CATS[0] || "Incoming Leads");
     const finalStage = CANON_CATS.includes(stageIn) ? stageIn : (CANON_CATS[0] || "Incoming Leads");
 
-    const r = await q(
-      `INSERT INTO proyectos
-        (nombre, descripcion, cliente_id, stage, categoria,
-         source, assignee, due_date,
-         estimate_url, estimate_file,
-         estimate_amount, estimate_currency,
-         prob_win, fecha_cierre_estimada, contacto_nombre,
-         usuario_email, organizacion_id)
-       VALUES
-        ($1,$2,$3,$4,$5,
-         $6,$7,$8,
-         $9,$10,
-         $11,$12,
-         $13,$14,$15,
-         $16,$17)
-       RETURNING
-         id, nombre, descripcion, descripcion AS notas, cliente_id, stage, categoria,
-         source, assignee, due_date,
-         estimate_url, estimate_file,
-         estimate_amount, estimate_currency,
-         prob_win, fecha_cierre_estimada, contacto_nombre,
-         usuario_email, organizacion_id, result, closed_at, created_at, updated_at`,
-      [
-        T(nombre),
-        T(descripcion),
-        cliente_id == null || cliente_id === "" ? null : Number(cliente_id),
-        finalStage,
-        finalStage,
-        T(source),
-        emailNorm(assignee),
-        D(due_date),
-        T(estimate_url),
-        T(estimate_file),
-        N(estimate_amount),
-        T(estimate_currency),
-        N(prob_win),
-        D(fecha_cierre_estimada),
-        T(contacto_nombre),
-        emailNorm(usuario_email),
-        organizacion_id,
-      ]
-    );
-    const item = r.rows[0];
+    const payload = {
+      nombre: T(nombre),
+      descripcion: T(descripcion),
+      cliente_id: (cliente_id == null || cliente_id === "") ? null : Number(cliente_id),
+      stage: finalStage,
+      categoria: finalStage,
+      source: T(source),
+      assignee: emailNorm(assignee),
+      due_date: D(due_date),
+      estimate_url: T(estimate_url),
+      estimate_file: T(estimate_file),
+      estimate_amount: N(estimate_amount),
+      estimate_currency: T(estimate_currency),
+      prob_win: N(prob_win),
+      fecha_cierre_estimada: D(fecha_cierre_estimada),
+      contacto_nombre: T(contacto_nombre),
+      usuario_email: emailNorm(usuario_email),
+      organizacion_id: organizacion_id,
+    };
+    if (cols.has("created_at")) payload.created_at = new Date();
+    if (cols.has("updated_at")) payload.updated_at = new Date();
 
-    // Emit create
+    // Sólo insertar columnas existentes
+    const { fields, values } = pickInsert(cols, payload);
+    if (!fields.length) return res.status(501).json({ ok: false, message: "Schema inválido: no hay columnas insertables" });
+
+    const placeholders = fields.map((_, i) => `$${i + 1}`).join(",");
+    const ins = await q(`INSERT INTO proyectos (${fields.join(",")}) VALUES (${placeholders}) RETURNING id`, values);
+    const newId = ins.rows[0].id;
+
+    // Releer con SELECT blindado
+    const { selectSQL } = await buildProjectSelect();
+    const item = (await q(`${selectSQL} WHERE p.id = $1`, [newId])).rows[0];
+
+    // Emit create (best-effort)
     emitFlow(
       "crm.lead.created",
       {
-        org_id: String(organizacion_id || ""),
+        org_id: String(item.organizacion_id || ""),
         idempotency_key: `lead:${item.id}:created`,
         lead: {
           id: String(item.id),
@@ -353,34 +403,29 @@ router.post("/", authenticateToken, async (req, res) => {
 /* ============== PATCH /proyectos/:id ============== */
 router.patch("/:id", authenticateToken, async (req, res) => {
   try {
+    if (!(await hasTable("proyectos"))) return res.status(501).json({ ok: false, message: "Módulo de proyectos no instalado" });
+
     const bearer = getBearer(req);
     const { organizacion_id } = getUserFromReq(req);
     const id = toInt(req.params.id);
     if (id == null) return res.status(400).json({ ok: false, message: "ID inválido" });
 
-    // alias español → internos
-    if (!("descripcion" in (req.body || {})) && "notas" in (req.body || {})) {
-      req.body.descripcion = req.body.notas;
-    }
-    if (!("assignee" in (req.body || {})) && "responsable" in (req.body || {})) {
-      req.body.assignee = req.body.responsable;
-    }
-    if (!("source" in (req.body || {})) && "origen" in (req.body || {})) {
-      req.body.source = req.body.origen;
-    }
+    const cols = await tableColumns("proyectos");
 
-    // Si viene stage/categoria, las espejamos y validamos
+    if (!("descripcion" in (req.body || {})) && "notas" in (req.body || {})) req.body.descripcion = req.body.notas;
+    if (!("assignee" in (req.body || {})) && "responsable" in (req.body || {})) req.body.assignee = req.body.responsable;
+    if (!("source" in (req.body || {})) && "origen" in (req.body || {})) req.body.source = req.body.origen;
+
     const incomingStage = T(req.body?.stage ?? req.body?.categoria);
-    const sets = [];
-    const values = [];
-    let i = 1;
+    const updates = {};
 
     if (incomingStage) {
-      if (!CANON_CATS.includes(incomingStage)) {
-        return res.status(400).json({ ok: false, message: "stage fuera del pipeline" });
+      if (!CANON_CATS.includes(incomingStage)) return res.status(400).json({ ok: false, message: "stage fuera del pipeline" });
+      if (cols.has("stage")) updates.stage = incomingStage;
+      if (cols.has("categoria")) updates.categoria = incomingStage;
+      if (!cols.has("stage") && !cols.has("categoria")) {
+        return res.status(501).json({ ok: false, message: "Schema no soporta stage/categoria" });
       }
-      sets.push(`stage = $${i++}`); values.push(incomingStage);
-      sets.push(`categoria = $${i++}`); values.push(incomingStage);
     }
 
     const allowed = {
@@ -399,46 +444,32 @@ router.patch("/:id", authenticateToken, async (req, res) => {
       contacto_nombre: (v) => T(v),
     };
 
-    for (const k of Object.keys(allowed)) {
-      if (k in (req.body || {})) {
-        const conv = allowed[k](req.body[k]);
-        sets.push(`${k} = $${i++}`);
-        values.push(conv);
-      }
+    for (const [k, conv] of Object.entries(allowed)) {
+      if (k in (req.body || {})) updates[k] = conv(req.body[k]);
     }
 
+    const { sets, values } = pickUpdate(cols, updates);
     if (!sets.length) return res.status(400).json({ ok: false, message: "Nada para actualizar" });
-    sets.push(`updated_at = NOW()`);
 
     values.push(id);
-    if (organizacion_id != null) values.push(organizacion_id);
+    let where = `id = $${values.length}`;
+    if (cols.has("organizacion_id") && organizacion_id != null) {
+      values.push(organizacion_id);
+      where += ` AND organizacion_id = $${values.length}`;
+    }
 
-    const r = await q(
-      `
-      UPDATE proyectos
-         SET ${sets.join(", ")}
-       WHERE id = $${i++} ${organizacion_id != null ? `AND organizacion_id = $${i}` : ""}
-       RETURNING
-         id, nombre, descripcion, descripcion AS notas, cliente_id, stage, categoria,
-         source, assignee, due_date,
-         estimate_url, estimate_file,
-         estimate_amount, estimate_currency,
-         prob_win, fecha_cierre_estimada, contacto_nombre,
-         usuario_email, organizacion_id, result, closed_at, created_at, updated_at
-      `,
-      values
-    );
-    if (!r.rowCount) return res.status(404).json({ ok: false, message: "Proyecto no encontrado" });
+    const ret = await q(`UPDATE proyectos SET ${sets.join(", ")} WHERE ${where} RETURNING id`, values);
+    if (!ret.rowCount) return res.status(404).json({ ok: false, message: "Proyecto no encontrado" });
 
-    const item = r.rows[0];
+    const { selectSQL } = await buildProjectSelect();
+    const item = (await q(`${selectSQL} WHERE p.id = $1`, [id])).rows[0];
 
-    // Emit update / closed si corresponde
-    const isClosed = item.stage === "Won" || item.stage === "Lost";
+    const isClosed = (item.stage === "Won" || item.stage === "Lost");
     const evt = isClosed ? "crm.lead.closed" : "crm.lead.updated";
     emitFlow(
       evt,
       {
-        org_id: String(organizacion_id || ""),
+        org_id: String(item.organizacion_id || ""),
         idempotency_key: `lead:${item.id}:${isClosed ? "closed" : "updated"}:${Number(item.updated_at ? new Date(item.updated_at).getTime() : Date.now())}`,
         lead: {
           id: String(item.id),
@@ -447,9 +478,7 @@ router.patch("/:id", authenticateToken, async (req, res) => {
           result: item.result || (item.stage === "Won" ? "won" : item.stage === "Lost" ? "lost" : null),
           closed_at: item.closed_at ? new Date(item.closed_at).toISOString() : null,
           assignee: item.assignee ? { email: item.assignee } : null,
-          estimate: item.estimate_amount
-            ? { amount: Number(item.estimate_amount), currency: item.estimate_currency || null }
-            : null,
+          estimate: item.estimate_amount ? { amount: Number(item.estimate_amount), currency: item.estimate_currency || null } : null,
         },
         meta: { source: "vex-crm", version: "v1" },
       },
@@ -466,37 +495,43 @@ router.patch("/:id", authenticateToken, async (req, res) => {
 /* ============== PATCH /proyectos/:id/stage ============== */
 router.patch("/:id/stage", authenticateToken, async (req, res) => {
   try {
+    if (!(await hasTable("proyectos"))) return res.status(501).json({ ok: false, message: "Módulo de proyectos no instalado" });
+
     const bearer = getBearer(req);
     const { organizacion_id } = getUserFromReq(req);
     const id = toInt(req.params.id);
     if (id == null) return res.status(400).json({ ok: false, message: "ID inválido" });
 
+    const cols = await tableColumns("proyectos");
     const next = T(req.body?.stage ?? req.body?.categoria);
     if (!next) return res.status(400).json({ ok: false, message: "stage requerido" });
     if (!CANON_CATS.includes(next)) return res.status(400).json({ ok: false, message: "stage fuera del pipeline" });
+    if (!cols.has("stage") && !cols.has("categoria")) return res.status(501).json({ ok: false, message: "Schema no soporta stage/categoria" });
 
-    const r = await q(
-      `UPDATE proyectos
-          SET stage=$1, categoria=$1, updated_at=NOW()
-        WHERE id=$2 ${organizacion_id != null ? "AND organizacion_id = $3" : ""}
-        RETURNING
-          id, nombre, descripcion, descripcion AS notas, cliente_id, stage, categoria,
-          source, assignee, due_date,
-          estimate_url, estimate_file,
-          estimate_amount, estimate_currency,
-          prob_win, fecha_cierre_estimada, contacto_nombre,
-          usuario_email, organizacion_id, result, closed_at, created_at, updated_at`,
-      organizacion_id != null ? [next, id, organizacion_id] : [next, id]
-    );
+    const sets = [];
+    const vals = [];
+    if (cols.has("stage")) { sets.push(`stage = $${vals.length + 1}`); vals.push(next); }
+    if (cols.has("categoria")) { sets.push(`categoria = $${vals.length + 1}`); vals.push(next); }
+    if (cols.has("updated_at")) sets.push(`updated_at = NOW()`);
+
+    vals.push(id);
+    let where = `id = $${vals.length}`;
+    if (cols.has("organizacion_id") && organizacion_id != null) {
+      vals.push(organizacion_id);
+      where += ` AND organizacion_id = $${vals.length}`;
+    }
+
+    const r = await q(`UPDATE proyectos SET ${sets.join(", ")} WHERE ${where} RETURNING id`, vals);
     if (!r.rowCount) return res.status(404).json({ ok: false, message: "Proyecto no encontrado" });
 
-    const item = r.rows[0];
+    const { selectSQL } = await buildProjectSelect();
+    const item = (await q(`${selectSQL} WHERE p.id = $1`, [id])).rows[0];
     const isClosed = item.stage === "Won" || item.stage === "Lost";
 
     emitFlow(
       isClosed ? "crm.lead.closed" : "crm.lead.stage_changed",
       {
-        org_id: String(organizacion_id || ""),
+        org_id: String(item.organizacion_id || ""),
         idempotency_key: `lead:${item.id}:${isClosed ? "closed" : "stage"}:${item.stage}`,
         lead: {
           id: String(item.id),
@@ -521,35 +556,42 @@ router.patch("/:id/stage", authenticateToken, async (req, res) => {
 /* ============== PATCH /proyectos/:id/estimate ============== */
 router.patch("/:id/estimate", authenticateToken, async (req, res) => {
   try {
+    if (!(await hasTable("proyectos"))) return res.status(501).json({ ok: false, message: "Módulo de proyectos no instalado" });
+
     const bearer = getBearer(req);
     const { organizacion_id } = getUserFromReq(req);
     const id = toInt(req.params.id);
     if (id == null) return res.status(400).json({ ok: false, message: "ID inválido" });
 
-    const amount = N(req.body?.amount);
-    const currency = T(req.body?.currency);
+    const cols = await tableColumns("proyectos");
+    if (!cols.has("estimate_amount") && !cols.has("estimate_currency")) {
+      return res.status(501).json({ ok: false, message: "Schema no soporta estimate" });
+    }
 
-    const r = await q(
-      `UPDATE proyectos
-          SET estimate_amount=$1, estimate_currency=$2, updated_at=NOW()
-        WHERE id=$3 ${organizacion_id != null ? "AND organizacion_id = $4" : ""}
-        RETURNING
-          id, nombre, descripcion, descripcion AS notas, cliente_id, stage, categoria,
-          source, assignee, due_date,
-          estimate_url, estimate_file,
-          estimate_amount, estimate_currency,
-          prob_win, fecha_cierre_estimada, contacto_nombre,
-          usuario_email, organizacion_id, result, closed_at, created_at, updated_at`,
-      organizacion_id != null ? [amount, currency, id, organizacion_id] : [amount, currency, id]
-    );
+    const updates = {};
+    if (cols.has("estimate_amount")) updates.estimate_amount = N(req.body?.amount);
+    if (cols.has("estimate_currency")) updates.estimate_currency = T(req.body?.currency);
+
+    const { sets, values } = pickUpdate(cols, updates);
+    if (!sets.length) return res.status(400).json({ ok: false, message: "Nada para actualizar" });
+
+    values.push(id);
+    let where = `id = $${values.length}`;
+    if (cols.has("organizacion_id") && organizacion_id != null) {
+      values.push(organizacion_id);
+      where += ` AND organizacion_id = $${values.length}`;
+    }
+
+    const r = await q(`UPDATE proyectos SET ${sets.join(", ")} WHERE ${where} RETURNING id`, values);
     if (!r.rowCount) return res.status(404).json({ ok: false, message: "Proyecto no encontrado" });
 
-    const item = r.rows[0];
+    const { selectSQL } = await buildProjectSelect();
+    const item = (await q(`${selectSQL} WHERE p.id = $1`, [id])).rows[0];
 
     emitFlow(
       "crm.lead.estimated",
       {
-        org_id: String(organizacion_id || ""),
+        org_id: String(item.organizacion_id || ""),
         idempotency_key: `lead:${item.id}:estimate:${Number(item.updated_at ? new Date(item.updated_at).getTime() : Date.now())}`,
         lead: {
           id: String(item.id),
@@ -574,27 +616,25 @@ router.patch("/:id/estimate", authenticateToken, async (req, res) => {
 /* ============== DELETE /proyectos/:id ============== */
 router.delete("/:id", authenticateToken, async (req, res) => {
   try {
+    if (!(await hasTable("proyectos"))) return res.status(501).json({ ok: false, message: "Módulo de proyectos no instalado" });
+
     const bearer = getBearer(req);
     const { organizacion_id } = getUserFromReq(req);
     const id = toInt(req.params.id);
     if (id == null) return res.status(400).json({ ok: false, message: "ID inválido" });
 
-    // Tomar datos para emitir antes de borrar
+    const { selectSQL, cols } = await buildProjectSelect();
+
     const prev = await q(
-      `
-      ${SELECT_PROJECT}
-      WHERE p.id=$1
-        AND ($2::int IS NULL OR p.organizacion_id = $2)
-      `,
-      [id, organizacion_id]
+      `${selectSQL} WHERE p.id=$1 ${cols.has("organizacion_id") && organizacion_id != null ? "AND p.organizacion_id = $2" : ""}`,
+      cols.has("organizacion_id") && organizacion_id != null ? [id, organizacion_id] : [id]
     );
 
-    const r = await q(
-      `DELETE FROM proyectos
-        WHERE id = $1 ${organizacion_id != null ? "AND organizacion_id = $2" : ""}`,
-      organizacion_id != null ? [id, organizacion_id] : [id]
+    const del = await q(
+      `DELETE FROM proyectos WHERE id = $1 ${cols.has("organizacion_id") && organizacion_id != null ? "AND organizacion_id = $2" : ""}`,
+      cols.has("organizacion_id") && organizacion_id != null ? [id, organizacion_id] : [id]
     );
-    if (!r.rowCount) return res.status(404).json({ ok: false, message: "Proyecto no encontrado" });
+    if (!del.rowCount) return res.status(404).json({ ok: false, message: "Proyecto no encontrado" });
 
     if (prev.rowCount) {
       const p = prev.rows[0];
@@ -603,12 +643,7 @@ router.delete("/:id", authenticateToken, async (req, res) => {
         {
           org_id: String(p.organizacion_id || ""),
           idempotency_key: `lead:${p.id}:deleted`,
-          lead: {
-            id: String(p.id),
-            name: p.nombre,
-            stage: p.stage,
-            assignee: p.assignee ? { email: p.assignee } : null,
-          },
+          lead: { id: String(p.id), name: p.nombre, stage: p.stage, assignee: p.assignee ? { email: p.assignee } : null },
           meta: { source: "vex-crm", version: "v1" },
         },
         { bearer }

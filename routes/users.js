@@ -1,17 +1,21 @@
 // routes/users.js — Auth + Users CRUD (multi-tenant, ESM)
 import { Router } from "express";
-import { authenticateToken as auth } from "../middleware/auth.js";
+import { authenticateToken as auth, requireRole } from "../middleware/auth.js";
 import { q } from "../utils/db.js";
-import axios from "axios";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
+import { emit as emitFlow } from "../services/flows.client.js";
 
 const router = Router();
 
 /* -------------------- helpers -------------------- */
 const T = (v) => (v == null ? null : String(v).trim() || null);
-const E = (v) => (T(v)?.toLowerCase() ?? null); // email normalizado
+const E = (v) => (T(v)?.toLowerCase() ?? null);
 const ROLES = new Set(["owner", "admin", "member"]);
+
+// Opcional: alinear con tu middleware si seteás estos ENV
+const JWT_ISSUER = process.env.JWT_ISSUER || null;
+const JWT_AUDIENCE = process.env.JWT_AUDIENCE || null;
 
 if (!process.env.JWT_SECRET) {
   console.warn("[users] JWT_SECRET no seteado; usando valor por defecto (solo dev).");
@@ -19,16 +23,16 @@ if (!process.env.JWT_SECRET) {
 
 function signToken(u) {
   const secret = process.env.JWT_SECRET || "dev_jwt_secret_change_me";
-  return jwt.sign(
-    {
-      sub: String(u.id),
-      email: u.email,
-      organizacion_id: u.organizacion_id,
-      rol: u.rol || "member",
-    },
-    secret,
-    { expiresIn: "30d" }
-  );
+  const payload = {
+    sub: String(u.id),
+    email: u.email,
+    organizacion_id: u.organizacion_id,
+    rol: u.rol || "member",
+  };
+  const opts = { expiresIn: "30d" };
+  if (JWT_ISSUER) opts.issuer = JWT_ISSUER;
+  if (JWT_AUDIENCE) opts.audience = JWT_AUDIENCE;
+  return jwt.sign(payload, secret, opts);
 }
 
 const safeUser = (u) =>
@@ -42,33 +46,9 @@ const safeUser = (u) =>
         organizacion_id: u.organizacion_id,
         created_at: u.created_at,
         updated_at: u.updated_at,
+        last_login_at: u.last_login_at || null,
       }
     : null;
-
-function assertRole(req, res, roles = ["owner", "admin"]) {
-  const rol = req.usuario?.rol || "member";
-  if (!roles.includes(rol)) {
-    res.status(403).json({ ok: false, message: "Permisos insuficientes" });
-    return false;
-  }
-  return true;
-}
-
-// opcional: enviar a Flows si está configurado
-async function emitFlow(type, payload) {
-  const base = process.env.FLOWS_BASE_URL;
-  const token = process.env.FLOWS_BEARER;
-  if (!base || !token) return;
-  try {
-    await axios.post(
-      `${base.replace(/\/+$/, "")}/api/triggers/emit`,
-      { type, payload },
-      { headers: { Authorization: `Bearer ${token}` }, timeout: 8000 }
-    );
-  } catch (e) {
-    console.warn("[users.emitFlow]", e?.message || e);
-  }
-}
 
 async function regclassExists(name) {
   try {
@@ -79,10 +59,11 @@ async function regclassExists(name) {
   }
 }
 
-/** org resolver: JWT → header → query/body → lookup por email (único) → null */
+/** org resolver: JWT/req → headers → query/body → lookup por email único → null */
 async function resolveOrgId(req) {
   const raw =
     T(req.usuario?.organizacion_id) ||
+    T(req.organizacion_id) || // ← alineado con middleware que la setea directo
     T(req.headers?.["x-org-id"]) ||
     T(req.query?.organizacion_id) ||
     T(req.query?.organization_id) ||
@@ -97,7 +78,6 @@ async function resolveOrgId(req) {
     return Number.isFinite(n) ? n : null;
   }
 
-  // Lookup por email solo si es único (para mejorar UX de login)
   const email =
     E(req.body?.email) ||
     E(req.query?.email) ||
@@ -118,10 +98,8 @@ async function resolveOrgId(req) {
 }
 
 /* -------------------- schema (idempotente) -------------------- */
-/** Hace el schema resiliente aunque la migración no haya corrido todavía */
 async function ensureSchema() {
   await q(`
-    -- tabla base (sólo si NO existe)
     CREATE TABLE IF NOT EXISTS public.usuarios (
       id               SERIAL PRIMARY KEY,
       organizacion_id  INTEGER NOT NULL,
@@ -130,20 +108,20 @@ async function ensureSchema() {
       nombre           TEXT,
       rol              TEXT DEFAULT 'member',
       activo           BOOLEAN DEFAULT TRUE,
+      last_login_at    TIMESTAMPTZ,
       created_at       TIMESTAMPTZ DEFAULT now(),
       updated_at       TIMESTAMPTZ DEFAULT now(),
       CHECK (rol IN ('owner','admin','member'))
     );
 
-    -- columnas por compatibilidad (si existía con esquema viejo)
     ALTER TABLE public.usuarios
       ADD COLUMN IF NOT EXISTS nombre TEXT,
       ADD COLUMN IF NOT EXISTS rol TEXT DEFAULT 'member',
       ADD COLUMN IF NOT EXISTS activo BOOLEAN DEFAULT TRUE,
+      ADD COLUMN IF NOT EXISTS last_login_at TIMESTAMPTZ,
       ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT now(),
       ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT now();
 
-    -- índices/unique multi-tenant con email normalizado
     CREATE INDEX IF NOT EXISTS idx_usuarios_org ON public.usuarios (organizacion_id);
     CREATE UNIQUE INDEX IF NOT EXISTS uniq_usuarios_org_email_lower
       ON public.usuarios (organizacion_id, lower(email));
@@ -220,8 +198,10 @@ router.post("/login", async (req, res) => {
     const ok = await bcrypt.compare(pass, user.password_hash);
     if (!ok) return res.status(401).json({ ok: false, message: "Credenciales inválidas" });
 
+    await q(`UPDATE public.usuarios SET last_login_at = now(), updated_at = now() WHERE id = $1`, [user.id]).catch(() => {});
+
     const token = signToken(user);
-    res.json({ ok: true, token, user: safeUser(user) });
+    res.json({ ok: true, token, user: safeUser({ ...user, last_login_at: new Date().toISOString() }) });
   } catch (e) {
     console.error("[POST /users/login]", e?.stack || e?.message || e);
     res.status(500).json({ ok: false, message: "Error en login" });
@@ -243,33 +223,43 @@ router.get("/me", auth, async (req, res) => {
   }
 });
 
-/* ------------------------------------------------------------------
- * GET /users  —  Lista para dropdown "Asignado a"
- * Devuelve emails deduplicados desde usuarios y (si existen) proyectos.assignee y tareas.assignee
- * Acepta ?q= (search) y ?limit= (por defecto 50, máx 200)
- * ------------------------------------------------------------------ */
+/* -------------------- GET /users — dropdown “Asignado a” -------------------- */
 router.get("/", auth, async (req, res) => {
   try {
     const org = await resolveOrgId(req);
     if (org == null) return res.json([]);
 
     const search = req.query.q ? `%${String(req.query.q).trim()}%` : null;
-    const limit = Math.min(Number(req.query.limit ?? 50), 200);
+    const limit = Math.min(Number(req.query.limit ?? 50) || 50, 200);
 
     const hasProyectos = await regclassExists("proyectos");
     const hasTareas = await regclassExists("tareas");
 
     const pieces = [
-      `SELECT LOWER(email) AS email FROM public.usuarios WHERE organizacion_id = $1`,
+      `SELECT LOWER(email) AS email
+         FROM public.usuarios
+        WHERE organizacion_id = $1
+          AND activo = TRUE
+          AND COALESCE(email,'') <> ''`,
     ];
-    if (hasProyectos)
+
+    if (hasProyectos) {
       pieces.push(
-        `SELECT LOWER(assignee) AS email FROM public.proyectos WHERE organizacion_id = $1 AND COALESCE(assignee,'') <> ''`
+        `SELECT LOWER(assignee) AS email
+           FROM public.proyectos
+          WHERE organizacion_id = $1
+            AND COALESCE(assignee,'') <> ''`
       );
-    if (hasTareas)
+    }
+
+    if (hasTareas) {
       pieces.push(
-        `SELECT LOWER(assignee) AS email FROM public.tareas WHERE organizacion_id = $1 AND COALESCE(assignee,'') <> ''`
+        `SELECT LOWER(usuario_email) AS email
+           FROM public.tareas
+          WHERE organizacion_id = $1
+            AND COALESCE(usuario_email,'') <> ''`
       );
+    }
 
     const unionSQL = `
       WITH emails AS (
@@ -277,10 +267,10 @@ router.get("/", auth, async (req, res) => {
       )
       SELECT email,
              split_part(email,'@',1) AS nombre,
-             NULL::int AS id,
-             NULL::text AS rol,
-             TRUE AS activo,
-             $1::int AS organizacion_id,
+             NULL::int   AS id,
+             NULL::text  AS rol,
+             TRUE        AS activo,
+             $1::int     AS organizacion_id,
              NULL::timestamptz AS created_at,
              NULL::timestamptz AS updated_at
         FROM emails
@@ -298,14 +288,14 @@ router.get("/", auth, async (req, res) => {
   }
 });
 
-/* -------------------- GET /users/full (listado clásico por org) -------------------- */
+/* -------------------- GET /users/full -------------------- */
 router.get("/full", auth, async (req, res) => {
   try {
     const org = await resolveOrgId(req);
     if (org == null) return res.json([]);
 
     const r = await q(
-      `SELECT id, email, nombre, rol, activo, organizacion_id, created_at, updated_at
+      `SELECT id, email, nombre, rol, activo, organizacion_id, created_at, updated_at, last_login_at
          FROM public.usuarios
         WHERE organizacion_id = $1
         ORDER BY created_at DESC NULLS LAST, id DESC
@@ -320,16 +310,14 @@ router.get("/full", auth, async (req, res) => {
 });
 
 /* -------------------- PATCH /users/:id -------------------- */
-router.patch("/:id", auth, async (req, res) => {
+router.patch("/:id", auth, requireRole("owner", "admin"), async (req, res) => {
   try {
     const org = await resolveOrgId(req);
     if (org == null) return res.status(400).json({ ok: false, message: "organizacion_id requerido" });
-    if (!assertRole(req, res)) return;
 
     const id = Number(req.params.id);
     if (!id) return res.status(400).json({ ok: false, message: "ID inválido" });
 
-    // Traigo usuario actual para checks (rol actual)
     const cur = await q(
       `SELECT id, rol, activo FROM public.usuarios WHERE id=$1 AND organizacion_id=$2`,
       [id, org]
@@ -341,11 +329,9 @@ router.patch("/:id", auth, async (req, res) => {
     const values = [];
     let i = 1;
 
-    const wantEmail = req.body?.email;
-    if (wantEmail != null) {
-      const email = E(wantEmail);
+    if ("email" in (req.body || {})) {
+      const email = E(req.body.email);
       if (!email) return res.status(400).json({ ok: false, message: "Email inválido" });
-      // conflict check
       const c = await q(
         `SELECT 1 FROM public.usuarios WHERE organizacion_id = $1 AND lower(email) = lower($2) AND id <> $3`,
         [org, email, id]
@@ -355,16 +341,15 @@ router.patch("/:id", auth, async (req, res) => {
       values.push(email);
     }
 
-    if (req.body?.nombre != null) {
+    if ("nombre" in (req.body || {})) {
       sets.push(`nombre = $${i++}`);
       values.push(T(req.body.nombre));
     }
 
-    if (req.body?.rol != null) {
+    if ("rol" in (req.body || {})) {
       const newRol = (req.body.rol || "").toLowerCase();
       if (!ROLES.has(newRol)) return res.status(400).json({ ok: false, message: "Rol inválido" });
 
-      // Protección: no dejar la org sin owners
       if (current.rol === "owner" && newRol !== "owner") {
         const owners = await q(
           `SELECT COUNT(*)::int AS n FROM public.usuarios WHERE organizacion_id=$1 AND rol='owner' AND activo=TRUE`,
@@ -378,9 +363,8 @@ router.patch("/:id", auth, async (req, res) => {
       values.push(newRol);
     }
 
-    if (req.body?.activo != null) {
+    if ("activo" in (req.body || {})) {
       const toActive = !!req.body.activo;
-      // si desactivamos un owner y es el último → bloquear
       if (current.rol === "owner" && current.activo && !toActive) {
         const owners = await q(
           `SELECT COUNT(*)::int AS n FROM public.usuarios WHERE organizacion_id=$1 AND rol='owner' AND activo=TRUE`,
@@ -394,7 +378,7 @@ router.patch("/:id", auth, async (req, res) => {
       values.push(toActive);
     }
 
-    if (req.body?.password != null) {
+    if ("password" in (req.body || {})) {
       const pass = T(req.body.password);
       if (!pass || pass.length < 6) return res.status(400).json({ ok: false, message: "Password mínimo 6 caracteres" });
       const hash = await bcrypt.hash(pass, 10);
@@ -439,16 +423,14 @@ router.patch("/:id", auth, async (req, res) => {
 });
 
 /* -------------------- DELETE /users/:id (soft delete) -------------------- */
-router.delete("/:id", auth, async (req, res) => {
+router.delete("/:id", auth, requireRole("owner", "admin"), async (req, res) => {
   try {
     const org = await resolveOrgId(req);
     if (org == null) return res.status(400).json({ ok: false, message: "organizacion_id requerido" });
-    if (!assertRole(req, res)) return;
 
     const id = Number(req.params.id);
     if (!id) return res.status(400).json({ ok: false, message: "ID inválido" });
 
-    // Si es owner, evitar borrar el último
     const cur = await q(
       `SELECT rol, activo FROM public.usuarios WHERE id=$1 AND organizacion_id=$2`,
       [id, org]
