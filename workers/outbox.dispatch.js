@@ -1,4 +1,3 @@
-// workers/outbox.dispatch.js — ESM, seguro y idempotente
 import { q } from "../utils/db.js";
 import { emit as emitFlow } from "../services/flows.client.js";
 
@@ -6,9 +5,9 @@ let timer = null;
 let running = false;
 
 export async function startOutboxDispatcher(opts = {}) {
-  const intervalMs = Number(process.env.OUTBOX_INTERVAL_MS) || opts.intervalMs || 5000;
-  const maxBatch   = Number(process.env.OUTBOX_MAX_BATCH)   || opts.maxBatch   || 25;
-  const maxAttempts= Number(process.env.OUTBOX_MAX_ATTEMPTS)|| opts.maxAttempts|| 5;
+  const intervalMs  = Number(process.env.OUTBOX_INTERVAL_MS)   || opts.intervalMs  || 5000;
+  const maxBatch    = Number(process.env.OUTBOX_MAX_BATCH)     || opts.maxBatch    || 25;
+  const maxAttempts = Number(process.env.OUTBOX_MAX_ATTEMPTS)  || opts.maxAttempts || 5;
 
   const disabled = String(process.env.OUTBOX_DISABLED || "").toLowerCase();
   if (disabled === "1" || disabled === "true") {
@@ -22,57 +21,69 @@ export async function startOutboxDispatcher(opts = {}) {
   }
   running = true;
 
+  // Mantengo esto por robustez. No crea features, solo asegura la tabla si falta.
   await ensureSchema();
 
   async function tick() {
     if (!running) return;
+
     try {
-      // Tomamos lote de pendientes
-      const pending = await q(
-        `SELECT id, topic, payload, attempts
-           FROM public.outbox
+      // 1) Reclamamos el lote de manera atómica y segura entre múltiples workers.
+      const claimSql = `
+        WITH picked AS (
+          SELECT id
+          FROM public.outbox
           WHERE status = 'pending'
             AND scheduled_at <= now()
           ORDER BY id
-          LIMIT $1`,
-        [maxBatch]
-      );
+          FOR UPDATE SKIP LOCKED
+          LIMIT $1
+        )
+        UPDATE public.outbox o
+           SET status = 'processing',
+               updated_at = now()
+        FROM picked
+        WHERE o.id = picked.id
+        RETURNING o.id, o.topic, o.payload, o.attempts
+      `;
+      const claim = await q(claimSql, [maxBatch]);
+      const batch = claim.rows || [];
 
-      for (const row of pending.rows || []) {
+      // 2) Enviamos cada mensaje y marcamos resultado.
+      for (const row of batch) {
         const { id, topic, payload, attempts } = row;
-
-        // Marcamos processing (optimista)
-        await q(
-          `UPDATE public.outbox
-              SET status='processing', updated_at=now()
-            WHERE id=$1 AND status='pending'`,
-          [id]
-        );
-
         try {
           await deliver(topic, payload);
           await q(
             `UPDATE public.outbox
-                SET status='done', updated_at=now()
-              WHERE id=$1`,
+               SET status='done', updated_at=now()
+             WHERE id=$1`,
             [id]
           );
         } catch (err) {
           const nextAttempts = (attempts || 0) + 1;
           const failed = nextAttempts >= maxAttempts;
+          const nextStatus = failed ? "failed" : "pending";
+          const errTxt = (err?.stack || err?.message || String(err)).slice(0, 500);
+
           await q(
             `UPDATE public.outbox
                 SET status = $2,
                     attempts = $3,
-                    last_error = LEFT($4::text, 500),
-                    scheduled_at = CASE WHEN $2='pending'
-                                       THEN now() + make_interval(secs => 15 * $3)
-                                       ELSE scheduled_at END,
+                    last_error = $4,
+                    scheduled_at = CASE
+                                     WHEN $2 = 'pending'
+                                       THEN now() + (interval '15 seconds' * $3)
+                                     ELSE scheduled_at
+                                   END,
                     updated_at = now()
               WHERE id = $1`,
-            [id, failed ? "failed" : "pending", nextAttempts, err?.stack || err?.message || String(err)]
+            [id, nextStatus, nextAttempts, errTxt]
           );
-          if (failed) console.error("[outbox] giving up after max attempts", { id, topic });
+
+          if (failed) {
+            console.error("[outbox] giving up after max attempts", { id, topic });
+          }
         }
       }
     } catch (e) {
@@ -82,7 +93,7 @@ export async function startOutboxDispatcher(opts = {}) {
     }
   }
 
-  timer = setTimeout(tick, 500); // arranque suave
+  timer = setTimeout(tick, 500);
   console.log("[outbox] dispatcher started");
   return stopOutboxDispatcher;
 }
@@ -118,14 +129,15 @@ async function ensureSchema() {
 
 async function deliver(topic, payload) {
   if (!topic) throw new Error("Topic required");
+  const data = typeof payload === "string" ? JSON.parse(payload) : payload;
 
-  // Ruta simple: topics de flows: "flow.user.created" -> emitFlow("user.created", payload)
+  // Topics de flows: "flow.user.created" -> emitFlow("user.created", data)
   if (topic.startsWith("flow.")) {
-    const t = topic.slice(5); // quita "flow."
-    await emitFlow(t, payload);
+    const t = topic.slice(5);
+    await emitFlow(t, data);
     return;
   }
 
-  // Default: no-op + log para no romper nada
-  console.log("[outbox] delivered (noop)", { topic, hasPayload: payload != null });
+  // Default: noop con log
+  console.log("[outbox] delivered (noop)", { topic, hasPayload: data != null });
 }
