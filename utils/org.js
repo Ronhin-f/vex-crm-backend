@@ -1,24 +1,26 @@
-// utils/org.js — resolver ORGANIZACION como INTEGER (único source of truth)
+// utils/org.js — resolver de organización TEXT-safe con fallback (sin nocache)
 const T = (v) => (v == null ? null : String(v).trim() || null);
 
-export function getOrgId(req) {
-  const raw =
-    T(req.usuario?.organizacion_id) ||
-    T(req.organizacion_id) ||
-    T(req.headers?.["x-org-id"]) ||
-    T(req.query?.organizacion_id) ||
-    T(req.query?.organization_id) ||
-    T(req.query?.org_id) ||
-    T(req.body?.organizacion_id) ||
-    T(req.body?.organization_id) ||
-    T(req.body?.org_id) ||
-    null;
+export function getOrgText(req, opts = { require: false }) {
+  const fromToken =
+    T(req?.usuario?.organizacion_id) ||
+    T(req?.usuario?.org_id) || null;
 
-  const n = Number(raw);
-  if (!Number.isFinite(n)) throw new Error("organizacion_id requerido");
-  return n; // INTEGER
-}
+  const fromHeaders =
+    T(req?.headers?.["x-org-id"]) ||
+    T(req?.headers?.["x-organization-id"]) || null;
 
-export function hasOrg(req) {
-  try { return Number.isFinite(getOrgId(req)); } catch { return false; }
+  const fromParams =
+    T(req?.query?.organizacion_id) ||
+    T(req?.query?.organization_id) ||
+    T(req?.query?.org_id) ||
+    T(req?.body?.organizacion_id) ||
+    T(req?.body?.organization_id) ||
+    T(req?.body?.org_id) || null;
+
+  const fromEnv = T(process.env.DEFAULT_ORG_ID) || null;
+  const org = fromToken || fromHeaders || fromParams || fromEnv;
+
+  if (!org && opts?.require) throw new Error("organizacion_id requerido");
+  return org || null;
 }
