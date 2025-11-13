@@ -1,27 +1,24 @@
-// utils/org.js — Normalización de organizacion_id (TEXT) para rutas
-import { T } from "./parsers.js";
+// utils/org.js — resolver ORGANIZACION como INTEGER (único source of truth)
+const T = (v) => (v == null ? null : String(v).trim() || null);
 
-export function getOrgText(req) {
-  // prioridad: usuario autenticado > header > query > body
+export function getOrgId(req) {
   const raw =
-    T(req?.usuario?.organizacion_id) ||
-    T(req?.headers?.["x-org-id"]) ||
-    T(req?.query?.organizacion_id) ||
-    T(req?.body?.organizacion_id) ||
+    T(req.usuario?.organizacion_id) ||
+    T(req.organizacion_id) ||
+    T(req.headers?.["x-org-id"]) ||
+    T(req.query?.organizacion_id) ||
+    T(req.query?.organization_id) ||
+    T(req.query?.org_id) ||
+    T(req.body?.organizacion_id) ||
+    T(req.body?.organization_id) ||
+    T(req.body?.org_id) ||
     null;
 
-  if (raw == null) throw new Error("organizacion_id requerido");
-  // NO cast a number jamás. Siempre TEXT.
-  return String(raw);
+  const n = Number(raw);
+  if (!Number.isFinite(n)) throw new Error("organizacion_id requerido");
+  return n; // INTEGER
 }
 
-/**
- * Inyecta `organizacion_id` al params array y devuelve { sql, params }
- * Uso: const { sql, params } = withOrg("SELECT ... WHERE organizacion_id = $1", [org])
- * o  : const { sql, params } = withOrg("... WHERE ...", [], org)
- */
-export function withOrg(sql, params = [], orgMaybe) {
-  const org = orgMaybe ?? params[0];
-  if (!org) throw new Error("withOrg: faltó organizacion_id");
-  return { sql, params };
+export function hasOrg(req) {
+  try { return Number.isFinite(getOrgId(req)); } catch { return false; }
 }

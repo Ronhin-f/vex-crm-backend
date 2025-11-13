@@ -95,10 +95,9 @@ router.get("/kpis", authenticateToken, nocache, async (req, res) => {
 
     const hasClientes = await regclassExists("clientes");
     const hasTareas = await regclassExists("tareas");
-
     const PIPE = await pickPipelineTable();
 
-    // Si no hay ni clientes ni proyectos, devolvemos estructura vacía sin romper
+    // Sin clientes ni pipeline -> estructura vacía
     if (!hasClientes && !PIPE) {
       return res.json({
         range: { from: fromISO, to: toISO },
@@ -158,7 +157,7 @@ router.get("/kpis", authenticateToken, nocache, async (req, res) => {
              SELECT DISTINCT t.cliente_id
                FROM tareas t
               WHERE t.organizacion_id::text = $1::text
-                AND t.created_at >= $2::timestamptz AND t.created_at < $3::timestamptz
+                AND t.created_at BETWEEN $2::timestamptz AND $3::timestamptz
                 AND t.cliente_id IS NOT NULL
            ),
            base AS (
@@ -189,7 +188,7 @@ router.get("/kpis", authenticateToken, nocache, async (req, res) => {
         LEFT JOIN tareas t ON t.cliente_id = c.id
                             AND t.organizacion_id::text = $1::text
             WHERE c.organizacion_id::text = $1::text
-              AND c.created_at >= $2::timestamptz AND c.created_at < $3::timestamptz
+              AND c.created_at BETWEEN $2::timestamptz AND $3::timestamptz
             GROUP BY 1,3
          ),
          deltas AS (
@@ -250,17 +249,21 @@ router.get("/kpis", authenticateToken, nocache, async (req, res) => {
       // columnas candidatas
       const createdCol = pickOne(cols, ["created_at", "createdon", "created"]);
       const updatedCol = pickOne(cols, ["updated_at", "updatedon", "updated"]);
-      const closedCol = pickOne(cols, ["closed_at", "closedon", "closed"]);
-      const stageCol = pickOne(cols, ["stage", "estado", "etapa"]);
-      const resultCol = pickOne(cols, ["result", "resultado", "status"]);
+      const closedCol  = pickOne(cols, ["closed_at",  "closedon",  "closed"]);
+      const stageCol   = pickOne(cols, ["stage", "estado", "etapa"]);
+      const resultCol  = pickOne(cols, ["result", "resultado", "status"]);
 
-      const ownerCandidates = ["assignee", "owner", "usuario_email", "user_email", "email"];
-      const ownerExprParts = ownerCandidates.filter((c) => cols.has(c)).map((c) => `NULLIF(${c},'')`);
-      const ownerExpr = ownerExprParts.length ? `COALESCE(${ownerExprParts.join(", ")}, 'Unassigned')` : `'Unassigned'`;
+      const ownerCandidates = ["assignee","owner","usuario_email","user_email","email"];
+      const ownerExprParts = ownerCandidates.filter(c => cols.has(c)).map(c => `NULLIF(${c},'')`);
+      const ownerExpr = ownerExprParts.length
+        ? `COALESCE(${ownerExprParts.join(", ")}, 'Unassigned')`
+        : `'Unassigned'`;
 
-      const sourceCandidates = ["source", "origin", "lead_source", "origen"];
-      const sourceExprParts = sourceCandidates.filter((c) => cols.has(c)).map((c) => c);
-      const sourceExpr = sourceExprParts.length ? `COALESCE(${sourceExprParts.join(", ")}, 'Unknown')` : `'Unknown'`;
+      const sourceCandidates = ["source","origin","lead_source","origen"];
+      const sourceExprParts = sourceCandidates.filter(c => cols.has(c)).map(c => c);
+      const sourceExpr = sourceExprParts.length
+        ? `COALESCE(${sourceExprParts.join(", ")}, 'Unknown')`
+        : `'Unknown'`;
 
       // cláusulas de fecha (si no hay columna, consumimos $2/$3 con tautología)
       const dateCol = createdCol || updatedCol || closedCol;
@@ -268,13 +271,9 @@ router.get("/kpis", authenticateToken, nocache, async (req, res) => {
         ? `${dateCol} >= $2::timestamptz AND ${dateCol} < $3::timestamptz`
         : `($2::timestamptz IS NOT NULL AND $3::timestamptz IS NOT NULL)`;
 
-      // condiciones won/lost robustas (si no hay stage/result, solo lo que exista)
-      const wonCond = `(${stageCol ? `${stageCol} ~* '^(won|ganad)'` : "FALSE"}${
-        resultCol ? ` OR ${resultCol}='won'` : ""
-      })`;
-      const lostCond = `(${stageCol ? `${stageCol} ~* '^(lost|perdid)'` : "FALSE"}${
-        resultCol ? ` OR ${resultCol}='lost'` : ""
-      })`;
+      // condiciones won/lost robustas
+      const wonCond  = `(${stageCol ? `${stageCol} ~* '^(won|ganad)'` : "FALSE"}${resultCol ? ` OR ${resultCol}='won'` : ""})`;
+      const lostCond = `(${stageCol ? `${stageCol} ~* '^(lost|perdid)'` : "FALSE"}${resultCol ? ` OR ${resultCol}='lost'` : ""})`;
 
       const bySourceSQL = `
         WITH agg AS (
@@ -329,9 +328,9 @@ router.get("/kpis", authenticateToken, nocache, async (req, res) => {
           AND ${dateAggExpr} <  $3::timestamptz`,
         [orgId, fromISO, toISO]
       );
-      const wonTotal = num(wonLostAgg.rows?.[0]?.won, 0);
+      const wonTotal  = num(wonLostAgg.rows?.[0]?.won, 0);
       const lostTotal = num(wonLostAgg.rows?.[0]?.lost, 0);
-      const win_rate = (wonTotal + lostTotal) > 0 ? Math.round((wonTotal * 100) / (wonTotal + lostTotal)) : 0;
+      const win_rate  = (wonTotal + lostTotal) > 0 ? Math.round((wonTotal * 100) / (wonTotal + lostTotal)) : 0;
 
       const stagesAggSQL = `
         SELECT COALESCE(${stageCol ? stageCol : "'Uncategorized'"} ,'Uncategorized') AS stage, COUNT(*)::int AS total
@@ -438,7 +437,7 @@ router.get("/kpis", authenticateToken, nocache, async (req, res) => {
         `SELECT COUNT(*)::int AS n
            FROM clientes
           WHERE organizacion_id::text = $1::text
-            AND created_at >= $2::timestamptz AND created_at < $3::timestamptz
+            AND created_at BETWEEN $2::timestamptz AND $3::timestamptz
             AND (
               stage IN ('Qualified','Bid/Estimate Sent','Won') OR
               stage ~* '^(calificad|presup|ganad)'
@@ -451,7 +450,7 @@ router.get("/kpis", authenticateToken, nocache, async (req, res) => {
         `SELECT COUNT(*)::int AS n
            FROM clientes c
           WHERE c.organizacion_id::text = $1::text
-            AND c.created_at >= $2::timestamptz AND c.created_at < $3::timestamptz
+            AND c.created_at BETWEEN $2::timestamptz AND $3::timestamptz
             AND COALESCE(NULLIF(TRIM(c.email), ''), '') = ''
             AND COALESCE(NULLIF(TRIM(c.telefono), ''), '') = ''`,
         [orgId, fromISO, toISO]
@@ -462,7 +461,7 @@ router.get("/kpis", authenticateToken, nocache, async (req, res) => {
         `SELECT COUNT(*)::int AS n
            FROM clientes c
           WHERE c.organizacion_id::text = $1::text
-            AND c.created_at >= $2::timestamptz AND c.created_at < $3::timestamptz
+            AND c.created_at BETWEEN $2::timestamptz AND $3::timestamptz
             AND NOT EXISTS (
               SELECT 1 FROM tareas t
                WHERE t.cliente_id = c.id
@@ -476,7 +475,7 @@ router.get("/kpis", authenticateToken, nocache, async (req, res) => {
         `SELECT COUNT(*)::int AS n
            FROM clientes c
           WHERE c.organizacion_id::text = $1::text
-            AND c.created_at >= $2::timestamptz AND c.created_at < $3::timestamptz
+            AND c.created_at BETWEEN $2::timestamptz AND $3::timestamptz
             AND (
               c.stage IS NULL OR TRIM(c.stage) = '' OR
               NOT (c.stage ~* '(incoming|lead|entrante|unqualified|calificad|qualified|follow|seguim|perdid|lost|bid|estimate|presup|won|ganad)')
@@ -517,7 +516,7 @@ router.get("/kpis", authenticateToken, nocache, async (req, res) => {
         qualified: qualifiedCount,
         rate_pct: pct(qualifiedCount, totalContacts),
         uncontactable: { total: uncontactableCount, pct: pct(uncontactableCount, totalContacts) },
-        no_first_touch: { total: noFirstTouchCount, pct: pct(noFirstTouchCount, totalContacts) },
+        no_first_touch: { total: noFirstTouchCount, pct: pct(no_first_touchCount, totalContacts) }, // typo evitado
         uncategorized: { total: uncategorizedCount, pct: pct(uncategorizedCount, totalContacts) },
         stalled_in_incoming: { total: stalledIncomingCount, days: stalledDays },
       },

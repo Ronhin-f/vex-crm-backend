@@ -1,19 +1,18 @@
-// routes/integraciones.js — Integraciones (Slack/WhatsApp) blindado + multi-tenant
+// routes/integraciones.js — Integraciones (Slack/WhatsApp) blindado + multi-tenant (TEXT-safe)
 import { Router } from "express";
 import { q } from "../utils/db.js";
 import { authenticateToken, requireRole } from "../middleware/auth.js";
 import { nocache } from "../middleware/nocache.js";
-import { resolveOrgId } from "../utils/schema.js";
+import { getOrgText } from "../utils/org.js"; // ← unificamos helper TEXT-safe
 
 const router = Router();
 
 /* ------------------------ helpers ------------------------ */
 async function ensureTable() {
-  // Crea tabla si no existe
+  // Crea tabla si no existe (manteniendo TEXT para back-compat)
   await q(`
-    CREATE TABLE IF NOT EXISTS integraciones (
+    CREATE TABLE IF NOT EXISTS public.integraciones (
       id SERIAL PRIMARY KEY,
-      -- mantenemos TEXT para back-compat con entornos ya creados
       organizacion_id TEXT UNIQUE,
       slack_webhook_url TEXT,
       slack_default_channel TEXT,
@@ -23,7 +22,7 @@ async function ensureTable() {
       ios_team_id TEXT,
       ios_bundle_id TEXT,
       updated_at TIMESTAMPTZ DEFAULT NOW()
-    )
+    );
   `);
 
   // Columnas que podrían faltar en esquemas viejos
@@ -32,11 +31,17 @@ async function ensureTable() {
     BEGIN
       IF NOT EXISTS (
         SELECT 1 FROM information_schema.columns
-        WHERE table_schema = 'public' AND table_name = 'integraciones' AND column_name = 'slack_default_channel'
+        WHERE table_schema='public' AND table_name='integraciones' AND column_name='slack_default_channel'
       ) THEN
-        ALTER TABLE integraciones ADD COLUMN slack_default_channel TEXT;
+        ALTER TABLE public.integraciones ADD COLUMN slack_default_channel TEXT;
       END IF;
     END $$;
+  `);
+
+  // Índice único explícito por si la UNIQUE de columna no existe (no rompe si ya hay constraint)
+  await q(`
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_integraciones_org
+      ON public.integraciones (organizacion_id);
   `);
 }
 
@@ -58,27 +63,18 @@ function isValidSlackWebhook(urlStr) {
 }
 
 /* ------------------------ GET /integraciones ------------------------ */
-// Estado “safe” (sin exponer secretos). Con fallback a ENV.
-// No 404 ni 500: el dashboard no debe romper.
+// Estado “safe” (sin exponer secretos). Con fallback a ENV. Nunca 404/500.
 router.get("/", authenticateToken, nocache, async (req, res) => {
   const safeEmpty = {
-    slack: {
-      configured: false,
-      default_channel: null,
-      source: null,
-    },
-    whatsapp: {
-      configured: false,
-      phone_id: null,
-    },
+    slack: { configured: false, default_channel: null, source: null },
+    whatsapp: { configured: false, phone_id: null },
   };
 
   try {
-    const orgId = await resolveOrgId(req);
-    const org = toStrOrNull(orgId);
+    const org = toStrOrNull(getOrgText(req)); // siempre string (puede venir de header/JWT)
     await ensureTable();
 
-    // Si no hay org en token/headers, devolvemos sólo ENV (si existiera)
+    // Sin org: solo ENV (si existe)
     if (!org) {
       const envWebhook = toStrOrNull(process.env.SLACK_WEBHOOK_URL);
       const envChannel = toStrOrNull(process.env.SLACK_DEFAULT_CHANNEL);
@@ -94,8 +90,8 @@ router.get("/", authenticateToken, nocache, async (req, res) => {
 
     const r = await q(
       `SELECT slack_webhook_url, slack_default_channel, whatsapp_meta_token, whatsapp_phone_id
-         FROM integraciones
-        WHERE organizacion_id = $1
+         FROM public.integraciones
+        WHERE organizacion_id::text = $1::text
         LIMIT 1`,
       [org]
     );
@@ -144,28 +140,27 @@ router.put(
   requireRole("owner", "admin", "superadmin"),
   async (req, res) => {
     try {
-      const orgId = await resolveOrgId(req);
-      const org = toStrOrNull(orgId);
-      if (!org) return res.status(400).json({ message: "organizacion_id requerido en el token o cabeceras" });
+      const org = toStrOrNull(getOrgText(req));
+      if (!org) return res.status(400).json({ message: "organizacion_id requerido en token/cabeceras" });
 
       const webhook = toStrOrNull(req.body?.slack_webhook_url)?.trim() || "";
       const defaultChannel = toStrOrNull(req.body?.slack_default_channel)?.trim() || null;
 
       if (!isValidSlackWebhook(webhook)) {
         return res.status(400).json({
-          message: "Slack webhook inválido. Debe ser un Incoming Webhook con formato https://hooks.slack.com/services/...",
+          message: "Slack webhook inválido. Debe ser https://hooks.slack.com/services/...",
         });
       }
 
       await ensureTable();
       await q(
-        `INSERT INTO integraciones (organizacion_id, slack_webhook_url, slack_default_channel)
-         VALUES ($1,$2,$3)
+        `INSERT INTO public.integraciones (organizacion_id, slack_webhook_url, slack_default_channel)
+         VALUES ($1::text,$2,$3)
          ON CONFLICT (organizacion_id)
          DO UPDATE SET
-           slack_webhook_url   = EXCLUDED.slack_webhook_url,
+           slack_webhook_url     = EXCLUDED.slack_webhook_url,
            slack_default_channel = EXCLUDED.slack_default_channel,
-           updated_at = NOW()`,
+           updated_at            = NOW()`,
         [org, webhook, defaultChannel]
       );
 
@@ -178,24 +173,22 @@ router.put(
 );
 
 /* ------------------------ DELETE /integraciones/slack ------------------------ */
-// Limpia la configuración de Slack (útil en staging).
 router.delete(
   "/slack",
   authenticateToken,
   requireRole("owner", "admin", "superadmin"),
   async (req, res) => {
     try {
-      const orgId = await resolveOrgId(req);
-      const org = toStrOrNull(orgId);
+      const org = toStrOrNull(getOrgText(req));
       if (!org) return res.status(400).json({ message: "organizacion_id requerido" });
 
       await ensureTable();
       const r = await q(
-        `UPDATE integraciones
+        `UPDATE public.integraciones
             SET slack_webhook_url = NULL,
                 slack_default_channel = NULL,
                 updated_at = NOW()
-          WHERE organizacion_id = $1`,
+          WHERE organizacion_id::text = $1::text`,
         [org]
       );
       return res.json({ ok: true, cleared: r.rowCount > 0 });
@@ -214,9 +207,8 @@ router.put(
   requireRole("owner", "admin", "superadmin"),
   async (req, res) => {
     try {
-      const orgId = await resolveOrgId(req);
-      const org = toStrOrNull(orgId);
-      if (!org) return res.status(400).json({ message: "organizacion_id requerido en el token o cabeceras" });
+      const org = toStrOrNull(getOrgText(req));
+      if (!org) return res.status(400).json({ message: "organizacion_id requerido en token/cabeceras" });
 
       const metaToken = toStrOrNull(req.body?.whatsapp_meta_token)?.trim();
       const phoneId   = toStrOrNull(req.body?.whatsapp_phone_id)?.trim();
@@ -224,18 +216,16 @@ router.put(
       if (!metaToken || !phoneId) {
         return res.status(400).json({ message: "Se requieren whatsapp_meta_token y whatsapp_phone_id" });
       }
-      // Si querés validar el formato del phone_id, descomentá:
-      // if (!/^\d{5,}$/.test(phoneId)) return res.status(400).json({ message: "whatsapp_phone_id inválido" });
 
       await ensureTable();
       await q(
-        `INSERT INTO integraciones (organizacion_id, whatsapp_meta_token, whatsapp_phone_id)
-         VALUES ($1,$2,$3)
+        `INSERT INTO public.integraciones (organizacion_id, whatsapp_meta_token, whatsapp_phone_id)
+         VALUES ($1::text,$2,$3)
          ON CONFLICT (organizacion_id)
          DO UPDATE SET
            whatsapp_meta_token = EXCLUDED.whatsapp_meta_token,
            whatsapp_phone_id   = EXCLUDED.whatsapp_phone_id,
-           updated_at = NOW()`,
+           updated_at          = NOW()`,
         [org, metaToken, phoneId]
       );
 
@@ -255,17 +245,16 @@ router.delete(
   requireRole("owner", "admin", "superadmin"),
   async (req, res) => {
     try {
-      const orgId = await resolveOrgId(req);
-      const org = toStrOrNull(orgId);
+      const org = toStrOrNull(getOrgText(req));
       if (!org) return res.status(400).json({ message: "organizacion_id requerido" });
 
       await ensureTable();
       const r = await q(
-        `UPDATE integraciones
+        `UPDATE public.integraciones
             SET whatsapp_meta_token = NULL,
                 whatsapp_phone_id  = NULL,
                 updated_at = NOW()
-          WHERE organizacion_id = $1`,
+          WHERE organizacion_id::text = $1::text`,
         [org]
       );
       return res.json({ ok: true, cleared: r.rowCount > 0 });
