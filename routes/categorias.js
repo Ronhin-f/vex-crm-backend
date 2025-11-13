@@ -1,46 +1,88 @@
-// routes/categorias.js — Pipeline Categories (TEXT-safe, tenancy estricto)
+// routes/categorias.js — Pipeline Categories (TEXT-safe, tenancy estricto, sin deps externas)
 import { Router } from "express";
 import { q, CANON_CATS } from "../utils/db.js";
 import { authenticateToken } from "../middleware/auth.js";
-import { nocache } from "../middleware/nocache.js";
-import { hasTable, tableColumns } from "../utils/schema.js";
-import { getOrgText } from "../utils/org.js";
 
 const router = Router();
 
 /* ------------------------ helpers locales ------------------------ */
+const T = (v) => (v == null ? null : String(v).trim() || null);
+
 function firstText(...vals) {
   for (const v of vals) {
-    if (v == null) continue;
-    const s = String(v).trim();
+    const s = T(v);
     if (s) return s;
   }
   return null;
 }
 
+function getOrgText(req) {
+  return (
+    T(req.usuario?.organizacion_id) ||
+    T(req.headers["x-org-id"]) ||
+    T(req.query?.organizacion_id) ||
+    T(req.body?.organizacion_id) ||
+    null
+  );
+}
+
+async function regclassExists(name) {
+  try {
+    const r = await q(`SELECT to_regclass($1) IS NOT NULL AS ok`, [`public.${name}`]);
+    return !!r.rows?.[0]?.ok;
+  } catch {
+    return false;
+  }
+}
+async function hasTable(name) { return regclassExists(name); }
+
+async function tableColumns(name) {
+  try {
+    const r = await q(
+      `SELECT column_name FROM information_schema.columns
+       WHERE table_schema='public' AND table_name=$1`,
+      [name]
+    );
+    const set = new Set();
+    for (const row of r.rows || []) set.add(row.column_name);
+    return set;
+  } catch {
+    return new Set();
+  }
+}
+
+const sameOrg = (a, b) => T(a) !== null && T(b) !== null && String(a) === String(b);
+
 /* =========================== GET =========================== */
 /**
  * Devuelve categorías ordenadas.
- * - Si falta la tabla: lista virtual desde CANON_CATS (no rompe FE).
- * - Seed suave canónicas globales (NULL) con su orden.
- * - Mezcla globales + org (si hay) y ordena por CANON_CATS; desconocidas al final.
+ * - Si falta la tabla o columnas mínimas: lista virtual desde CANON_CATS (no rompe FE).
+ * - Seed suave canónicas globales (NULL) con su orden cuando la tabla está OK.
+ * - Mezcla globales + org y ordena por CANON_CATS; desconocidas al final.
  */
-router.get("/", authenticateToken, nocache, async (req, res) => {
+router.get("/", authenticateToken, async (req, res) => {
   try {
-    const orgId = getOrgText(req); // requerido y TEXT
+    const orgId = getOrgText(req); // TEXT
     const hasCats = await hasTable("categorias");
 
-    // Si no existe la tabla, devolvemos lista virtual canónica
-    if (!hasCats) {
-      const virtual = (CANON_CATS || []).map((nombre, i) => ({
-        id: null,
-        nombre,
-        organizacion_id: null,
-        created_at: null,
-        orden: i,
-      }));
-      return res.json(virtual);
-    }
+    // Lista virtual canónica (fallback)
+    const virtual = (CANON_CATS || []).map((nombre, i) => ({
+      id: null,
+      nombre,
+      organizacion_id: null,
+      created_at: null,
+      orden: i,
+    }));
+
+    if (!hasCats) return res.json(virtual);
+
+    // Columnas seguras
+    const cols = await tableColumns("categorias");
+    const hasOrgCol = cols.has("organizacion_id");
+    const hasNombre = cols.has("nombre");
+
+    // Si no están las mínimas, devolvemos virtual
+    if (!hasNombre || !hasOrgCol) return res.json(virtual);
 
     // Seed idempotente de canónicas globales (organizacion_id NULL)
     for (let i = 0; i < (CANON_CATS || []).length; i++) {
@@ -60,16 +102,10 @@ router.get("/", authenticateToken, nocache, async (req, res) => {
       );
     }
 
-    // Columnas seguras
-    const cols = await tableColumns("categorias");
-    const idSel = cols.has("id") ? "id" : "NULL::int AS id";
-    const nombreSel = cols.has("nombre") ? "nombre" : "NULL::text AS nombre";
-    const orgSel = cols.has("organizacion_id")
-      ? "organizacion_id"
-      : "NULL::text AS organizacion_id";
-    const createdSel = cols.has("created_at")
-      ? "created_at"
-      : "NULL::timestamptz AS created_at";
+    const idSel      = cols.has("id") ? "id" : "NULL::int AS id";
+    const nombreSel  = "nombre";
+    const orgSel     = "organizacion_id";
+    const createdSel = cols.has("created_at") ? "created_at" : "NULL::timestamptz AS created_at";
 
     const params = [orgId, CANON_CATS || []];
 
@@ -82,7 +118,7 @@ router.get("/", authenticateToken, nocache, async (req, res) => {
         ${createdSel},
         COALESCE(array_position($2::text[], nombre), 9999) AS orden
       FROM categorias
-      WHERE (organizacion_id IS NULL OR organizacion_id = $1)
+      WHERE (organizacion_id IS NULL OR organizacion_id::text = $1::text)
       ORDER BY orden ASC, nombre ASC
       `,
       params
@@ -219,8 +255,8 @@ router.delete("/:id", authenticateToken, async (req, res) => {
       return res.status(400).json({ message: "No se puede eliminar una categoría del pipeline" });
     }
 
-    // Solo puede borrar la org dueña (o global NO canónica si querés limpiar, pero evitamos efecto lateral)
-    if (row.organizacion_id !== orgId) {
+    // Solo puede borrar la org dueña
+    if (!sameOrg(row.organizacion_id, orgId)) {
       return res.status(403).json({ message: "No autorizado para eliminar esta categoría" });
     }
 
@@ -234,26 +270,31 @@ router.delete("/:id", authenticateToken, async (req, res) => {
         return res.status(501).json({ message: "Módulo de clientes no instalado; no se puede reasignar antes de borrar" });
       }
       const ccols = await tableColumns("clientes");
+      if (!ccols.has("organizacion_id")) {
+        return res.status(501).json({ message: "Tabla clientes no es multi-tenant (falta organizacion_id)" });
+      }
       const sets = [];
-      if (ccols.has("stage")) sets.push(`stage=$1`);
+      if (ccols.has("stage"))     sets.push(`stage=$1`);
       if (ccols.has("categoria")) sets.push(`categoria=$1`);
       if (!sets.length) {
         return res.status(501).json({ message: "Tabla clientes no tiene columnas stage/categoria para reasignar" });
       }
       const wheres = [];
       if (ccols.has("categoria")) wheres.push(`categoria=$2`);
-      if (ccols.has("stage")) wheres.push(`stage=$2`);
-      // solo dentro de la misma org
-      wheres.push(`organizacion_id = $3`);
+      if (ccols.has("stage"))     wheres.push(`stage=$2`);
 
       await q(
         `UPDATE clientes SET ${sets.join(", ")}, updated_at=NOW()
-         WHERE (${wheres.join(" OR ")})`,
+         WHERE (${wheres.join(" OR ")})
+           AND organizacion_id::text = $3::text`,
         [reassignTo, nombreActual, orgId]
       );
     }
 
-    await q(`DELETE FROM categorias WHERE id=$1 AND organizacion_id = $2`, [id, orgId]);
+    await q(
+      `DELETE FROM categorias WHERE id=$1 AND organizacion_id::text = $2::text`,
+      [id, orgId]
+    );
     res.json({ ok: true });
   } catch (e) {
     console.error("[DELETE /categorias/:id]", e?.stack || e?.message || e);
@@ -265,8 +306,8 @@ router.delete("/:id", authenticateToken, async (req, res) => {
 /**
  * PATCH /categorias/clientes/:id/move
  * Body: { stage?: string, categoria?: string }
- * - Requiere módulo clientes; no sembramos categorías aquí (no crítico).
- * - Actualiza stage y/o categoria si existen las columnas.
+ * - Requiere módulo clientes y columna organizacion_id; no sembramos categorías acá.
+ * - Actualiza stage y/o categoria si existen las columnas (ambas a $1).
  * - Restringido por `organizacion_id` TEXT.
  */
 router.patch("/clientes/:id/move", authenticateToken, async (req, res) => {
@@ -285,35 +326,32 @@ router.patch("/clientes/:id/move", authenticateToken, async (req, res) => {
       return res.status(501).json({ message: "Módulo de clientes no instalado" });
     }
     const ccols = await tableColumns("clientes");
+    if (!ccols.has("organizacion_id")) {
+      return res.status(501).json({ message: "Tabla clientes no es multi-tenant (falta organizacion_id)" });
+    }
+
     const sets = [];
-    const returning = [`id`, `nombre`];
-    const params = [nextRaw, orgId, id];
-    let i = 1;
-
-    if (ccols.has("stage")) {
-      sets.push(`stage=$${i++}`);
-      if (!returning.includes("stage")) returning.push("stage");
-    }
-    if (ccols.has("categoria")) {
-      sets.push(`categoria=$${i++}`);
-      if (!returning.includes("categoria")) returning.push("categoria");
-    }
-
+    if (ccols.has("stage"))     sets.push(`stage=$1`);
+    if (ccols.has("categoria")) sets.push(`categoria=$1`);
     if (!sets.length) {
       return res.status(501).json({
         message: "Tabla clientes no tiene columnas stage/categoria para mover en pipeline",
       });
     }
 
-    // WHERE por id y por org
+    const returning = ["id"];
+    if (ccols.has("nombre"))    returning.push("nombre");
+    if (ccols.has("stage"))     returning.push("stage");
+    if (ccols.has("categoria")) returning.push("categoria");
+
     const r = await q(
       `
       UPDATE clientes
          SET ${sets.join(", ")}, updated_at=NOW()
-       WHERE organizacion_id = $2 AND id = $3
+       WHERE organizacion_id::text = $2::text AND id = $3
        RETURNING ${returning.join(", ")}
       `,
-      params
+      [nextRaw, orgId, id]
     );
 
     if (!r.rowCount) return res.status(404).json({ message: "Cliente no encontrado" });

@@ -1,50 +1,64 @@
-// routes/proveedores.js — Proveedores/Subcontratistas (blindado + multi-tenant)
+// routes/proveedores.js — Proveedores/Subcontratistas (blindado + multi-tenant, TEXT-safe, sin deps fantasma)
 import { Router } from "express";
 import { q } from "../utils/db.js";
 import { authenticateToken } from "../middleware/auth.js";
-import { nocache } from "../middleware/nocache.js";
-import { hasTable, tableColumns } from "../utils/schema.js";
 
 const router = Router();
 
-/* ---------------------------- helpers ---------------------------- */
+/* ---------------------------- helpers inline ---------------------------- */
 const T = (v) => (v == null ? null : (String(v).trim() || null));
 
-function getOrg(req) {
-  const raw =
+function getOrgText(req) {
+  return (
     T(req.usuario?.organizacion_id) ||
-    T(req.organizacion_id) ||
     T(req.headers?.["x-org-id"]) ||
     T(req.query?.organizacion_id) ||
     T(req.body?.organizacion_id) ||
-    null;
-  const n = Number(raw);
-  return Number.isFinite(n) ? n : null;
+    null
+  );
 }
 function getUserFromReq(req) {
   const u = req.usuario || {};
   return {
     email: u.email ?? req.usuario_email ?? u.usuario_email ?? null,
-    organizacion_id: getOrg(req),
+    organizacion_id: getOrgText(req),
   };
 }
 function normTipo(v) {
   const s = String(v || "").trim().toLowerCase();
-  if (s === "proveedor" || s === "subcontratista") return s;
-  return null;
+  return s === "proveedor" || s === "subcontratista" ? s : null;
 }
-async function hasInfra() {
-  return await hasTable("proveedores");
+async function regclassExists(name) {
+  try {
+    const r = await q(`SELECT to_regclass($1) IS NOT NULL AS ok`, [`public.${name}`]);
+    return !!r.rows?.[0]?.ok;
+  } catch { return false; }
 }
+async function hasTable(name) { return regclassExists(name); }
+async function tableColumns(name) {
+  try {
+    const r = await q(
+      `SELECT column_name FROM information_schema.columns
+       WHERE table_schema='public' AND table_name=$1`,
+      [name]
+    );
+    return new Set((r.rows || []).map((x) => x.column_name));
+  } catch { return new Set(); }
+}
+async function hasInfra() { return await hasTable("proveedores"); }
 
 /* ============================== GET ============================== */
-// Respuesta suave: si no hay tabla => []
-router.get("/", authenticateToken, nocache, async (req, res) => {
+// Requiere org si existe columna de org; si no hay tabla => []
+router.get("/", authenticateToken, async (req, res) => {
   try {
     if (!(await hasInfra())) return res.status(200).json([]);
 
     const cols = await tableColumns("proveedores");
     const { organizacion_id } = getUserFromReq(req);
+    if (cols.has("organizacion_id") && !organizacion_id) {
+      return res.status(400).json({ message: "organizacion_id requerido" });
+    }
+
     const { tipo, q: qtext } = req.query || {};
 
     // SELECT seguro (alias si faltan columnas)
@@ -57,7 +71,7 @@ router.get("/", authenticateToken, nocache, async (req, res) => {
       direccion: cols.has("direccion") ? "p.direccion" : "NULL::text AS direccion",
       notas: cols.has("notas") ? "p.notas" : "NULL::text AS notas",
       usuario_email: cols.has("usuario_email") ? "p.usuario_email" : "NULL::text AS usuario_email",
-      organizacion_id: cols.has("organizacion_id") ? "p.organizacion_id" : "NULL::int AS organizacion_id",
+      organizacion_id: cols.has("organizacion_id") ? "p.organizacion_id" : "NULL::text AS organizacion_id",
       created_at: cols.has("created_at") ? "p.created_at" : "NULL::timestamptz AS created_at",
       updated_at: cols.has("updated_at") ? "p.updated_at" : "NULL::timestamptz AS updated_at",
     };
@@ -66,8 +80,8 @@ router.get("/", authenticateToken, nocache, async (req, res) => {
     const where = [];
 
     if (cols.has("organizacion_id") && organizacion_id != null) {
-      params.push(organizacion_id);
-      where.push(`p.organizacion_id = $${params.length}`);
+      params.push(String(organizacion_id));
+      where.push(`p.organizacion_id::text = $${params.length}::text`);
     }
     if (cols.has("tipo") && tipo) {
       const t = normTipo(tipo);
@@ -108,7 +122,7 @@ router.get("/", authenticateToken, nocache, async (req, res) => {
 });
 
 /* ============================== POST ============================= */
-// Si no hay tabla => 501 (módulo no instalado)
+// Si no hay tabla => 501 (módulo no instalado). Requiere org si la columna existe.
 router.post("/", authenticateToken, async (req, res) => {
   try {
     if (!(await hasInfra())) {
@@ -116,8 +130,12 @@ router.post("/", authenticateToken, async (req, res) => {
     }
     const cols = await tableColumns("proveedores");
     const { organizacion_id, email: usuario_email } = getUserFromReq(req);
-    let { nombre, tipo, email, telefono, direccion, notas } = req.body || {};
 
+    if (cols.has("organizacion_id") && !organizacion_id) {
+      return res.status(400).json({ message: "organizacion_id requerido" });
+    }
+
+    let { nombre, tipo, email, telefono, direccion, notas } = req.body || {};
     if (!nombre || !String(nombre).trim()) {
       return res.status(400).json({ message: "Nombre requerido" });
     }
@@ -130,8 +148,8 @@ router.post("/", authenticateToken, async (req, res) => {
       const params = [nombre];
       let where = `LOWER(nombre)=LOWER($1)`;
       if (cols.has("organizacion_id")) {
-        params.push(organizacion_id);
-        where += ` AND ($2::int IS NULL OR organizacion_id = $2)`;
+        params.push(String(organizacion_id));
+        where += ` AND organizacion_id::text = $2::text`;
       }
       const dup = await q(`SELECT 1 FROM proveedores WHERE ${where} LIMIT 1`, params);
       if (dup.rowCount) return res.status(409).json({ message: "Proveedor ya existe" });
@@ -145,24 +163,24 @@ router.post("/", authenticateToken, async (req, res) => {
       telefono: T(telefono),
       direccion: T(direccion),
       notas: T(notas),
-      usuario_email: cols.has("usuario_email") ? usuario_email : undefined,
-      organizacion_id: cols.has("organizacion_id") ? organizacion_id : undefined,
-      created_at: cols.has("created_at") ? new Date() : undefined,
-      updated_at: cols.has("updated_at") ? new Date() : undefined,
+      usuario_email: usuario_email,
+      organizacion_id: organizacion_id,
+      created_at: new Date(),
+      updated_at: new Date(),
     };
-    const keys = Object.entries(payload)
-      .filter(([, v]) => v !== undefined && (cols.has ?? (()=>true)) && cols.has(keys))
-      .map(([k]) => k); // (nota: corregimos abajo con cols.has)
 
     const fields = [];
     const values = [];
-    let i = 1;
     for (const [k, v] of Object.entries(payload)) {
-      if (v === undefined) continue;
-      if (!cols.has(k)) continue;
-      fields.push(k);
-      values.push(v);
-      i++;
+      if (v === undefined || v === null) {
+        // incluimos null solo si existe la columna y el valor aporta
+        if (!cols.has(k)) continue;
+        // permitimos null explícito (p.ej., notas)
+        fields.push(k); values.push(v);
+      } else {
+        if (!cols.has(k)) continue;
+        fields.push(k); values.push(v);
+      }
     }
     if (!fields.length) return res.status(500).json({ message: "Schema inválido en proveedores" });
 
@@ -170,27 +188,17 @@ router.post("/", authenticateToken, async (req, res) => {
     const r = await q(
       `INSERT INTO proveedores (${fields.join(",")})
        VALUES (${placeholders})
-       RETURNING id, ${
-         cols.has("nombre") ? "nombre" : "NULL::text AS nombre"
-       }, ${
-         cols.has("tipo") ? "tipo" : "NULL::text AS tipo"
-       }, ${
-         cols.has("email") ? "email" : "NULL::text AS email"
-       }, ${
-         cols.has("telefono") ? "CAST(telefono AS TEXT)" : "NULL::text AS telefono"
-       }, ${
-         cols.has("direccion") ? "direccion" : "NULL::text AS direccion"
-       }, ${
-         cols.has("notas") ? "notas" : "NULL::text AS notas"
-       }, ${
-         cols.has("usuario_email") ? "usuario_email" : "NULL::text AS usuario_email"
-       }, ${
-         cols.has("organizacion_id") ? "organizacion_id" : "NULL::int AS organizacion_id"
-       }, ${
-         cols.has("created_at") ? "created_at" : "NOW()::timestamptz AS created_at"
-       }, ${
-         cols.has("updated_at") ? "updated_at" : "NOW()::timestamptz AS updated_at"
-       }`,
+       RETURNING id,
+         ${cols.has("nombre") ? "nombre" : "NULL::text AS nombre"},
+         ${cols.has("tipo") ? "tipo" : "NULL::text AS tipo"},
+         ${cols.has("email") ? "email" : "NULL::text AS email"},
+         ${cols.has("telefono") ? "CAST(telefono AS TEXT)" : "NULL::text AS telefono"},
+         ${cols.has("direccion") ? "direccion" : "NULL::text AS direccion"},
+         ${cols.has("notas") ? "notas" : "NULL::text AS notas"},
+         ${cols.has("usuario_email") ? "usuario_email" : "NULL::text AS usuario_email"},
+         ${cols.has("organizacion_id") ? "organizacion_id" : "NULL::text AS organizacion_id"},
+         ${cols.has("created_at") ? "created_at" : "NOW()::timestamptz AS created_at"},
+         ${cols.has("updated_at") ? "updated_at" : "NOW()::timestamptz AS updated_at"}`,
       values
     );
     res.status(201).json(r.rows[0]);
@@ -215,12 +223,13 @@ router.patch("/:id", authenticateToken, async (req, res) => {
     const id = Number(req.params.id);
     if (!Number.isInteger(id)) return res.status(400).json({ message: "ID inválido" });
     const { organizacion_id } = getUserFromReq(req);
+    if (cols.has("organizacion_id") && !organizacion_id) {
+      return res.status(400).json({ message: "organizacion_id requerido" });
+    }
 
     const allowed = ["nombre","tipo","email","telefono","direccion","notas"];
     const sets = [];
     const vals = [];
-    let i = 1;
-
     for (const k of allowed) {
       if (!(k in (req.body || {}))) continue;
       if (!cols.has(k)) continue;
@@ -228,19 +237,16 @@ router.patch("/:id", authenticateToken, async (req, res) => {
       if (k === "tipo") {
         const t = normTipo(req.body[k]);
         if (!t) return res.status(400).json({ message: "tipo inválido" });
-        sets.push(`tipo = $${i++}`); vals.push(t);
+        sets.push(`tipo = $${vals.length + 1}`); vals.push(t);
       } else if (k === "nombre") {
         const v = String(req.body[k] || "").trim();
         if (!v) return res.status(400).json({ message: "nombre inválido" });
-        sets.push(`nombre = $${i++}`); vals.push(v);
+        sets.push(`nombre = $${vals.length + 1}`); vals.push(v);
       } else {
-        sets.push(`${k} = $${i++}`); vals.push(T(req.body[k]));
+        sets.push(`${k} = $${vals.length + 1}`); vals.push(T(req.body[k]));
       }
     }
-
-    if (cols.has("updated_at")) {
-      sets.push(`updated_at = NOW()`);
-    }
+    if (cols.has("updated_at")) sets.push(`updated_at = NOW()`);
     if (!sets.length) return res.status(400).json({ message: "Nada para actualizar" });
 
     // Dedupe si cambia nombre
@@ -250,8 +256,8 @@ router.patch("/:id", authenticateToken, async (req, res) => {
       const params = [candName, id];
       let where = `LOWER(nombre)=LOWER($1) AND id<>$2`;
       if (cols.has("organizacion_id")) {
-        params.push(organizacion_id);
-        where += ` AND ($3::int IS NULL OR organizacion_id = $3)`;
+        params.push(String(organizacion_id));
+        where += ` AND organizacion_id::text = $3::text`;
       }
       const dup = await q(`SELECT 1 FROM proveedores WHERE ${where} LIMIT 1`, params);
       if (dup.rowCount) return res.status(409).json({ message: "Proveedor duplicado" });
@@ -259,35 +265,25 @@ router.patch("/:id", authenticateToken, async (req, res) => {
 
     // Filtro por org si existe columna
     vals.push(id);
-    let where = `id = $${i++}`;
+    let where = `id = $${vals.length}`;
     if (cols.has("organizacion_id")) {
-      vals.push(organizacion_id);
-      where += ` AND ($${i++}::int IS NULL OR organizacion_id = $${i-1})`;
+      vals.push(String(organizacion_id));
+      where += ` AND organizacion_id::text = $${vals.length}::text`;
     }
 
     const r = await q(
       `UPDATE proveedores SET ${sets.join(", ")} WHERE ${where}
-       RETURNING id, ${
-         cols.has("nombre") ? "nombre" : "NULL::text AS nombre"
-       }, ${
-         cols.has("tipo") ? "tipo" : "NULL::text AS tipo"
-       }, ${
-         cols.has("email") ? "email" : "NULL::text AS email"
-       }, ${
-         cols.has("telefono") ? "CAST(telefono AS TEXT)" : "NULL::text AS telefono"
-       }, ${
-         cols.has("direccion") ? "direccion" : "NULL::text AS direccion"
-       }, ${
-         cols.has("notas") ? "notas" : "NULL::text AS notas"
-       }, ${
-         cols.has("usuario_email") ? "usuario_email" : "NULL::text AS usuario_email"
-       }, ${
-         cols.has("organizacion_id") ? "organizacion_id" : "NULL::int AS organizacion_id"
-       }, ${
-         cols.has("created_at") ? "created_at" : "NULL::timestamptz AS created_at"
-       }, ${
-         cols.has("updated_at") ? "updated_at" : "NULL::timestamptz AS updated_at"
-       }`,
+       RETURNING id,
+         ${cols.has("nombre") ? "nombre" : "NULL::text AS nombre"},
+         ${cols.has("tipo") ? "tipo" : "NULL::text AS tipo"},
+         ${cols.has("email") ? "email" : "NULL::text AS email"},
+         ${cols.has("telefono") ? "CAST(telefono AS TEXT)" : "NULL::text AS telefono"},
+         ${cols.has("direccion") ? "direccion" : "NULL::text AS direccion"},
+         ${cols.has("notas") ? "notas" : "NULL::text AS notas"},
+         ${cols.has("usuario_email") ? "usuario_email" : "NULL::text AS usuario_email"},
+         ${cols.has("organizacion_id") ? "organizacion_id" : "NULL::text AS organizacion_id"},
+         ${cols.has("created_at") ? "created_at" : "NULL::timestamptz AS created_at"},
+         ${cols.has("updated_at") ? "updated_at" : "NULL::timestamptz AS updated_at"}`,
       vals
     );
     if (!r.rowCount) return res.status(404).json({ message: "Proveedor no encontrado" });
@@ -311,13 +307,17 @@ router.delete("/:id", authenticateToken, async (req, res) => {
 
     const id = Number(req.params.id);
     if (!Number.isInteger(id)) return res.status(400).json({ message: "ID inválido" });
+
     const { organizacion_id } = getUserFromReq(req);
+    if (cols.has("organizacion_id") && !organizacion_id) {
+      return res.status(400).json({ message: "organizacion_id requerido" });
+    }
 
     const params = [id];
     let where = `id = $1`;
     if (cols.has("organizacion_id")) {
-      params.push(organizacion_id);
-      where += ` AND ($2::int IS NULL OR organizacion_id = $2)`;
+      params.push(String(organizacion_id));
+      where += ` AND organizacion_id::text = $2::text`;
     }
 
     const r = await q(`DELETE FROM proveedores WHERE ${where}`, params);

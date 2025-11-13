@@ -1,10 +1,9 @@
-// routes/proyectos.assign.js — Assign robusto (multi-tenant + schema-agnostic)
+// routes/proyectos.assign.js — Assign robusto (multi-tenant + schema-agnostic, TEXT-safe, sin deps fantasma)
 import { Router } from "express";
 import { q } from "../utils/db.js";
 import { authenticateToken } from "../middleware/auth.js";
 import { emit as emitFlow } from "../services/flows.client.js";
 import { ensureFollowupForAssignment } from "../services/followups.service.js";
-import { hasTable, tableColumns } from "../utils/schema.js";
 
 const router = Router();
 
@@ -15,44 +14,69 @@ const T = (v) => {
   return s.length ? s : null;
 };
 const E = (v) => (T(v)?.toLowerCase() ?? null); // email normalizado
-
 const toInt = (v) => {
   const n = Number(v);
   return Number.isFinite(n) ? (n | 0) : null;
 };
 
-function getOrg(req) {
-  const raw =
+function getOrgText(req) {
+  return (
     T(req.usuario?.organizacion_id) ||
     T(req.organizacion_id) ||
     T(req.headers?.["x-org-id"]) ||
     T(req.query?.organizacion_id) ||
     T(req.body?.organizacion_id) ||
-    null;
-  const n = Number(raw);
-  return Number.isFinite(n) ? n : null;
+    null
+  );
 }
-
 function getUserFromReq(req) {
   const u = req.usuario || {};
   return {
     email: u.email ?? u.usuario_email ?? req.usuario_email ?? null,
-    organizacion_id: getOrg(req),
+    organizacion_id: getOrgText(req),
   };
 }
-
 function getBearer(req) {
   return req.headers?.authorization || null;
 }
 
-async function maybeClientBelongsToOrg(clienteId, orgId) {
+// Infra helpers 
+async function regclassExists(name) {
+  try {
+    const r = await q(`SELECT to_regclass($1) IS NOT NULL AS ok`, [`public.${name}`]);
+    return !!r.rows?.[0]?.ok;
+  } catch {
+    return false;
+  }
+}
+async function hasTable(name) {
+  return regclassExists(name);
+}
+async function tableColumns(name) {
+  try {
+    const r = await q(
+      `SELECT column_name
+         FROM information_schema.columns
+        WHERE table_schema='public' AND table_name=$1`,
+      [name]
+    );
+    return new Set((r.rows || []).map((x) => x.column_name));
+  } catch {
+    return new Set();
+  }
+}
+
+// Valida que el cliente pertenezca a la org (si la columna existe)
+async function maybeClientBelongsToOrg(clienteId, orgText) {
   if (!clienteId) return { ok: false, reason: "no_id" };
   if (!(await hasTable("clientes"))) return { ok: false, reason: "no_clientes_table" };
+  const cols = await tableColumns("clientes");
+
   const params = [clienteId];
   let where = `id = $1`;
-  if (orgId != null) {
-    params.push(orgId);
-    where += ` AND organizacion_id = $2`;
+  if (cols.has("organizacion_id") && orgText != null) {
+    params.push(String(orgText));
+    where += ` AND organizacion_id::text = $2::text`;
   }
   const r = await q(`SELECT 1 FROM clientes WHERE ${where} LIMIT 1`, params);
   return { ok: r.rowCount > 0, reason: r.rowCount ? "ok" : "not_found_or_wrong_org" };
@@ -71,14 +95,12 @@ async function maybeClientBelongsToOrg(clienteId, orgId) {
  */
 router.patch("/:id/assign", authenticateToken, async (req, res) => {
   try {
-    // Infra mínima
     if (!(await hasTable("proyectos"))) {
       return res.status(501).json({ ok: false, error: "modulo_proyectos_no_instalado" });
     }
 
     const bearer = getBearer(req);
     const { organizacion_id } = getUserFromReq(req);
-
     const id = toInt(req.params.id);
     if (id == null) return res.status(400).json({ ok: false, error: "id_invalido" });
 
@@ -86,18 +108,19 @@ router.patch("/:id/assign", authenticateToken, async (req, res) => {
     const asignado_email = E(asignado_email_raw);
     const in_cliente_id = toInt(req.body?.cliente_id);
     const linkIn = T(req.body?.link);
-
     if (!asignado_email) {
       return res.status(400).json({ ok: false, error: "asignado_email_requerido" });
     }
 
-    // Columnas disponibles en proyectos
     const cols = await tableColumns("proyectos");
     const canAssignee = cols.has("assignee");
     const canUsuario  = cols.has("usuario_email");
     const canCliente  = cols.has("cliente_id");
     const canUpdated  = cols.has("updated_at");
 
+    if (cols.has("organizacion_id") && !organizacion_id) {
+      return res.status(400).json({ ok: false, error: "organizacion_id_requerido" });
+    }
     if (!canAssignee && !canUsuario && !canCliente) {
       return res.status(501).json({
         ok: false,
@@ -106,21 +129,24 @@ router.patch("/:id/assign", authenticateToken, async (req, res) => {
       });
     }
 
-    // 1) Traer proyecto (guardia por organización si existe columna)
+    // 1) Traer proyecto de tu org (si aplica)
     const paramsSel = [id];
-    let whereSel = `id = $1`;
+    let whereSel = `p.id = $1`;
     if (cols.has("organizacion_id") && organizacion_id != null) {
-      paramsSel.push(organizacion_id);
-      whereSel += ` AND organizacion_id = $2`;
+      paramsSel.push(String(organizacion_id));
+      whereSel += ` AND p.organizacion_id::text = $2::text`;
     }
     const pr = await q(
-      `SELECT id, nombre, ${cols.has("organizacion_id") ? "organizacion_id" : "NULL::int AS organizacion_id"},
-              ${canCliente ? "cliente_id" : "NULL::int AS cliente_id"},
-              ${canAssignee ? "assignee" : "NULL::text AS assignee"},
-              ${canUsuario ? "usuario_email" : "NULL::text AS usuario_email"}
-         FROM proyectos
-        WHERE ${whereSel}
-        LIMIT 1`,
+      `SELECT
+         p.id,
+         ${cols.has("nombre") ? "p.nombre" : "NULL::text AS nombre"},
+         ${cols.has("organizacion_id") ? "p.organizacion_id" : "NULL::text AS organizacion_id"},
+         ${canCliente ? "p.cliente_id" : "NULL::int AS cliente_id"},
+         ${canAssignee ? "p.assignee" : "NULL::text AS assignee"},
+         ${canUsuario ? "p.usuario_email" : "NULL::text AS usuario_email"}
+       FROM proyectos p
+       WHERE ${whereSel}
+       LIMIT 1`,
       paramsSel
     );
     const proyecto = pr.rows?.[0];
@@ -128,11 +154,14 @@ router.patch("/:id/assign", authenticateToken, async (req, res) => {
       return res.status(404).json({ ok: false, error: "proyecto_no_encontrado" });
     }
 
-    // 2) Validar/Resolver cliente_id
-    let warnings = [];
+    // 2) Resolver cliente_id (si vino y pertenece a tu org)
+    const warnings = [];
     let resolvedClienteId = proyecto.cliente_id ?? null;
     if (canCliente && in_cliente_id != null) {
-      const belongs = await maybeClientBelongsToOrg(in_cliente_id, cols.has("organizacion_id") ? organizacion_id : null);
+      const belongs = await maybeClientBelongsToOrg(
+        in_cliente_id,
+        cols.has("organizacion_id") ? organizacion_id : null
+      );
       if (belongs.ok) {
         resolvedClienteId = in_cliente_id;
       } else {
@@ -140,48 +169,42 @@ router.patch("/:id/assign", authenticateToken, async (req, res) => {
       }
     }
 
-    // 3) Construir UPDATE dinámico según columnas existentes
+    // 3) UPDATE dinámico
     const sets = [];
     const vals = [];
-    let i = 1;
-
-    if (canAssignee) { sets.push(`assignee = $${i++}`); vals.push(asignado_email); }
-    if (canUsuario)  { sets.push(`usuario_email = $${i++}`); vals.push(asignado_email); }
+    if (canAssignee) { sets.push(`assignee = $${vals.length + 1}`); vals.push(asignado_email); }
+    if (canUsuario)  { sets.push(`usuario_email = $${vals.length + 1}`); vals.push(asignado_email); }
     if (canCliente && resolvedClienteId != null) {
-      sets.push(`cliente_id = $${i++}`); vals.push(resolvedClienteId);
+      sets.push(`cliente_id = $${vals.length + 1}`); vals.push(resolvedClienteId);
     }
     if (canUpdated)  { sets.push(`updated_at = NOW()`); }
 
-    if (!sets.length) {
-      // Nada para cambiar: seguimos con side-effects igualmente
-      warnings.push("sin_cambios_en_db");
-    }
-
-    // WHERE update con guardia de org si aplica
+    // WHERE de update
+    let whereUpd = `id = $${vals.length + 1}`;
     vals.push(id);
-    let whereUpd = `id = $${i++}`;
     if (cols.has("organizacion_id") && organizacion_id != null) {
-      vals.push(organizacion_id);
-      whereUpd += ` AND organizacion_id = $${i++}`;
+      whereUpd += ` AND organizacion_id::text = $${vals.length + 1}::text`;
+      vals.push(String(organizacion_id));
     }
 
     if (sets.length) {
       const upd = await q(
-        `UPDATE proyectos SET ${sets.join(", ")} WHERE ${whereUpd}
-         RETURNING id`,
+        `UPDATE proyectos SET ${sets.join(", ")} WHERE ${whereUpd} RETURNING id`,
         vals
       );
       if (!upd.rowCount) {
         return res.status(404).json({ ok: false, error: "proyecto_no_encontrado" });
       }
+    } else {
+      warnings.push("sin_cambios_en_db");
     }
 
-    // 4) Link “view” (fallbacks)
+    // 4) Link “view”
     const base = process.env.VEX_CRM_URL || process.env.VEX_CORE_URL || "";
     const safeBase = base ? base.replace(/\/+$/, "") : "";
     const viewLink = linkIn || (safeBase ? `${safeBase}/proyectos/${id}` : "(sin link)");
 
-    // 5) Side-effects en best-effort
+    // 5) Side-effects (best-effort)
     try {
       await ensureFollowupForAssignment({
         organizacion_id: proyecto.organizacion_id ?? organizacion_id ?? null,

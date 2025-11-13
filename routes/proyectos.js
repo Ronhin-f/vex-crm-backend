@@ -1,19 +1,14 @@
-// routes/proyectos.js — Oportunidades/Proyectos (blindado + multi-tenant + schema-agnostic)
+// routes/proyectos.js — Oportunidades/Proyectos (blindado + multi-tenant + schema-agnostic, TEXT-safe)
 import { Router } from "express";
 import { q, CANON_CATS } from "../utils/db.js";
 import { authenticateToken } from "../middleware/auth.js";
 import { emit as emitFlow } from "../services/flows.client.js";
-import { hasTable, tableColumns } from "../utils/schema.js";
 
 const router = Router();
 
 /* ---------------------------- helpers ---------------------------- */
-const T = (v) => (v == null ? null : String(v).trim() || null);
-const N = (v) => {
-  if (v == null || v === "") return null;
-  const n = +v;
-  return Number.isFinite(n) ? n : null;
-};
+const T = (v) => (v == null ? null : (String(v).trim() || null));
+const N = (v) => { if (v == null || v === "") return null; const n = +v; return Number.isFinite(n) ? n : null; };
 const D = (v) => { if (!v) return null; const d = new Date(v); return isNaN(d.getTime()) ? null : d.toISOString(); };
 const toInt = (v) => { const n = Number(v); return Number.isInteger(n) ? n : null; };
 const getBearer = (req) => req.headers?.authorization || null;
@@ -36,6 +31,30 @@ function getUserFromReq(req) {
     email: (u.email ?? req.usuario_email ?? u.usuario_email ?? null) || null,
     organizacion_id: getOrg(req),
   };
+}
+
+async function regclassExists(name) {
+  try {
+    const r = await q(`SELECT to_regclass($1) IS NOT NULL AS ok`, [`public.${name}`]);
+    return !!r.rows?.[0]?.ok;
+  } catch { return false; }
+}
+async function hasTable(name) { return regclassExists(name); }
+async function tableColumns(name) {
+  try {
+    const r = await q(
+      `SELECT column_name FROM information_schema.columns WHERE table_schema='public' AND table_name=$1`,
+      [name]
+    );
+    return new Set((r.rows || []).map(x => x.column_name));
+  } catch { return new Set(); }
+}
+
+// Filtro multi-tenant TEXT-safe (si la tabla tiene org_id)
+function orgFilterText(cols, alias, orgId) {
+  if (!cols.has("organizacion_id")) return { where: [], params: [] };
+  if (orgId == null) return { where: ["1=0"], params: [] }; // evita mezclar tenants
+  return { where: [`${alias}.organizacion_id::text = $${1}::text`], params: [String(orgId)] };
 }
 
 function exp(cols, name, type) {
@@ -75,28 +94,18 @@ async function buildProjectSelect() {
   ];
   return { cols, selectSQL: `SELECT\n  ${parts.join(",\n  ")}\nFROM proyectos p`, orderBy: orderExpr(cols) };
 }
-
 function pickInsert(cols, obj) {
-  const fields = [];
-  const values = [];
-  for (const [k, v] of Object.entries(obj)) {
-    if (cols.has(k)) { fields.push(k); values.push(v); }
-  }
+  const fields = [], values = [];
+  for (const [k, v] of Object.entries(obj)) { if (cols.has(k)) { fields.push(k); values.push(v); } }
   return { fields, values };
 }
-
 function pickUpdate(cols, obj) {
-  const sets = [];
-  const values = [];
-  let i = 1;
+  const sets = [], values = []; let i = 1;
   for (const [k, v] of Object.entries(obj)) {
     if (!cols.has(k)) continue;
-    sets.push(`${k} = $${i++}`);
-    values.push(v);
+    sets.push(`${k} = $${i++}`); values.push(v);
   }
-  if (cols.has("updated_at")) {
-    sets.push(`updated_at = NOW()`);
-  }
+  if (cols.has("updated_at")) sets.push(`updated_at = NOW()`);
   return { sets, values };
 }
 
@@ -119,12 +128,11 @@ router.get("/options", authenticateToken, async (req, res) => {
     // sources
     let sources = [];
     if (cols.has("source")) {
-      const ps = [];
       const wh = [`p.source IS NOT NULL`, `p.source <> ''`];
-      if (cols.has("organizacion_id") && organizacion_id != null) {
-        ps.push(organizacion_id); wh.unshift(`p.organizacion_id = $${ps.length}`);
-      }
-      const src = await q(`SELECT DISTINCT p.source AS v FROM proyectos p ${wh.length ? "WHERE " + wh.join(" AND ") : ""} ORDER BY 1`, ps);
+      const params = [];
+      const of = orgFilterText(cols, "p", organizacion_id);
+      if (of.where.length) { wh.unshift(of.where[0]); params.push(...of.params); }
+      const src = await q(`SELECT DISTINCT p.source AS v FROM proyectos p ${wh.length ? "WHERE " + wh.join(" AND ") : ""} ORDER BY 1`, params);
       sources = (src.rows || []).map(r => r.v).filter(Boolean);
     }
     const defaults = ["Website","Referral","Email","WhatsApp","Phone","Instagram","Facebook","Google Ads","LinkedIn","Cold Outreach","Event","Walk-in"];
@@ -133,11 +141,10 @@ router.get("/options", authenticateToken, async (req, res) => {
     // assignees
     let assignees = [];
     if (cols.has("assignee")) {
-      const pa = [];
       const wha = [`p.assignee IS NOT NULL`, `p.assignee <> ''`];
-      if (cols.has("organizacion_id") && organizacion_id != null) {
-        pa.push(organizacion_id); wha.unshift(`p.organizacion_id = $${pa.length}`);
-      }
+      const pa = [];
+      const of = orgFilterText(cols, "p", organizacion_id);
+      if (of.where.length) { wha.unshift(of.where[0]); pa.push(...of.params); }
       const asg = await q(`SELECT DISTINCT p.assignee AS v FROM proyectos p ${wha.length ? "WHERE " + wha.join(" AND ") : ""} ORDER BY 1`, pa);
       assignees = (asg.rows || []).map(r => String(r.v || "").toLowerCase()).filter(Boolean);
     }
@@ -150,7 +157,7 @@ router.get("/options", authenticateToken, async (req, res) => {
   }
 });
 
-/* ============== GET /proyectos ============== */
+/* ============== GET /proyectos (lista) ============== */
 router.get("/", authenticateToken, async (req, res) => {
   try {
     if (!(await hasTable("proyectos"))) return res.status(200).json({ ok: true, items: [] });
@@ -167,28 +174,30 @@ router.get("/", authenticateToken, async (req, res) => {
     limit = Math.max(1, Math.min(2000, Number(limit) || 1000));
     offset = Math.max(0, Number(offset) || 0);
 
-    const params = [];
     const where = [];
+    const params = [];
 
-    if (cols.has("organizacion_id") && organizacion_id != null) { params.push(organizacion_id); where.push(`p.organizacion_id = $${params.length}`); }
+    // org TEXT-safe
+    const of = orgFilterText(cols, "p", organizacion_id);
+    if (of.where.length) { where.push(of.where[0]); params.push(...of.params); }
+
     if (stage && (cols.has("stage") || cols.has("categoria"))) {
       params.push(String(stage));
       where.push(`${cols.has("stage") ? "p.stage" : "p.categoria"} = $${params.length}`);
     }
-    if (cliente_id != null && cliente_id !== "" && cols.has("cliente_id")) { params.push(Number(cliente_id)); where.push(`p.cliente_id = $${params.length}`); }
+    if (cliente_id != null && cliente_id !== "" && cols.has("cliente_id")) {
+      params.push(Number(cliente_id));
+      where.push(`p.cliente_id = $${params.length}`);
+    }
     if (source && cols.has("source")) { params.push(String(source)); where.push(`p.source = $${params.length}`); }
     if (assignee && cols.has("assignee")) { params.push(String(assignee)); where.push(`p.assignee = $${params.length}`); }
     if (String(only_due) === "1" && cols.has("due_date")) { where.push("p.due_date IS NOT NULL"); }
 
     if (qtext) {
       const qv = `%${String(qtext).trim()}%`;
-      if (cols.has("descripcion")) {
-        params.push(qv); const i = params.length;
-        where.push(`(p.nombre ILIKE $${i} OR p.descripcion ILIKE $${i})`);
-      } else {
-        params.push(qv); const i = params.length;
-        where.push(`(p.nombre ILIKE $${i})`);
-      }
+      params.push(qv); const i = params.length;
+      if (cols.has("descripcion")) where.push(`(p.nombre ILIKE $${i} OR p.descripcion ILIKE $${i})`);
+      else where.push(`(p.nombre ILIKE $${i})`);
     }
 
     params.push(limit, offset);
@@ -206,34 +215,7 @@ router.get("/", authenticateToken, async (req, res) => {
   }
 });
 
-/* ============== GET /proyectos/:id ============== */
-router.get("/:id", authenticateToken, async (req, res) => {
-  try {
-    if (!(await hasTable("proyectos"))) return res.status(404).json({ ok: false, message: "Proyecto no encontrado" });
-
-    const { organizacion_id } = getUserFromReq(req);
-    const id = toInt(req.params.id);
-    if (id == null) return res.status(400).json({ ok: false, message: "ID inválido" });
-
-    const { selectSQL, cols } = await buildProjectSelect();
-
-    const params = [id];
-    let where = `p.id = $1`;
-    if (cols.has("organizacion_id") && organizacion_id != null) {
-      params.push(organizacion_id);
-      where += ` AND p.organizacion_id = $2`;
-    }
-
-    const r = await q(`${selectSQL} WHERE ${where}`, params);
-    if (!r.rowCount) return res.status(404).json({ ok: false, message: "Proyecto no encontrado" });
-    res.json({ ok: true, item: r.rows[0] });
-  } catch (e) {
-    console.error("[GET /proyectos/:id]", e?.stack || e?.message || e);
-    res.status(500).json({ ok: false, message: "Error obteniendo proyecto" });
-  }
-});
-
-/* ============== GET /proyectos/kanban ============== */
+/* ============== GET /proyectos/kanban (debe ir antes de :id) ============== */
 router.get("/kanban", authenticateToken, async (req, res) => {
   try {
     if (!(await hasTable("proyectos"))) {
@@ -248,23 +230,21 @@ router.get("/kanban", authenticateToken, async (req, res) => {
     const assignee = req.query?.assignee ?? req.query?.responsable ?? null;
     const only_due = req.query?.only_due;
 
-    const params = [];
     const where = [];
+    const params = [];
 
-    if (cols.has("organizacion_id") && organizacion_id != null) { params.push(organizacion_id); where.push(`p.organizacion_id = $${params.length}`); }
+    const of = orgFilterText(cols, "p", organizacion_id);
+    if (of.where.length) { where.push(of.where[0]); params.push(...of.params); }
+
     if (source && cols.has("source")) { params.push(String(source)); where.push(`p.source = $${params.length}`); }
     if (assignee && cols.has("assignee")) { params.push(String(assignee)); where.push(`p.assignee = $${params.length}`); }
     if (String(only_due) === "1" && cols.has("due_date")) { where.push("p.due_date IS NOT NULL"); }
 
     if (qtext) {
       const qv = `%${String(qtext).trim()}%`;
-      if (cols.has("descripcion")) {
-        params.push(qv); const i = params.length;
-        where.push(`(p.nombre ILIKE $${i} OR p.descripcion ILIKE $${i})`);
-      } else {
-        params.push(qv); const i = params.length;
-        where.push(`(p.nombre ILIKE $${i})`);
-      }
+      params.push(qv); const i = params.length;
+      if (cols.has("descripcion")) where.push(`(p.nombre ILIKE $${i} OR p.descripcion ILIKE $${i})`);
+      else where.push(`(p.nombre ILIKE $${i})`);
     }
 
     const r = await q(
@@ -298,6 +278,31 @@ router.get("/kanban", authenticateToken, async (req, res) => {
   } catch (e) {
     console.error("[GET /proyectos/kanban]", e?.stack || e?.message || e);
     res.json({ ok: true, order: CANON_CATS, columns: CANON_CATS.map((s) => ({ key: s, title: s, items: [], count: 0 })) });
+  }
+});
+
+/* ============== GET /proyectos/:id ============== */
+router.get("/:id", authenticateToken, async (req, res) => {
+  try {
+    if (!(await hasTable("proyectos"))) return res.status(404).json({ ok: false, message: "Proyecto no encontrado" });
+
+    const { organizacion_id } = getUserFromReq(req);
+    const id = toInt(req.params.id);
+    if (id == null) return res.status(400).json({ ok: false, message: "ID inválido" });
+
+    const { selectSQL, cols } = await buildProjectSelect();
+
+    const params = [id];
+    let where = `p.id = $1`;
+    const of = orgFilterText(cols, "p", organizacion_id);
+    if (of.where.length) { where += ` AND ${of.where[0]}`; params.push(...of.params); }
+
+    const r = await q(`${selectSQL} WHERE ${where}`, params);
+    if (!r.rowCount) return res.status(404).json({ ok: false, message: "Proyecto no encontrado" });
+    res.json({ ok: true, item: r.rows[0] });
+  } catch (e) {
+    console.error("[GET /proyectos/:id]", e?.stack || e?.message || e);
+    res.status(500).json({ ok: false, message: "Error obteniendo proyecto" });
   }
 });
 
@@ -355,12 +360,11 @@ router.post("/", authenticateToken, async (req, res) => {
       fecha_cierre_estimada: D(fecha_cierre_estimada),
       contacto_nombre: T(contacto_nombre),
       usuario_email: emailNorm(usuario_email),
-      organizacion_id: organizacion_id,
+      organizacion_id: organizacion_id, // insert como número si existe la columna
     };
     if (cols.has("created_at")) payload.created_at = new Date();
     if (cols.has("updated_at")) payload.updated_at = new Date();
 
-    // Sólo insertar columnas existentes
     const { fields, values } = pickInsert(cols, payload);
     if (!fields.length) return res.status(501).json({ ok: false, message: "Schema inválido: no hay columnas insertables" });
 
@@ -368,7 +372,6 @@ router.post("/", authenticateToken, async (req, res) => {
     const ins = await q(`INSERT INTO proyectos (${fields.join(",")}) VALUES (${placeholders}) RETURNING id`, values);
     const newId = ins.rows[0].id;
 
-    // Releer con SELECT blindado
     const { selectSQL } = await buildProjectSelect();
     const item = (await q(`${selectSQL} WHERE p.id = $1`, [newId])).rows[0];
 
@@ -451,11 +454,13 @@ router.patch("/:id", authenticateToken, async (req, res) => {
     const { sets, values } = pickUpdate(cols, updates);
     if (!sets.length) return res.status(400).json({ ok: false, message: "Nada para actualizar" });
 
+    // WHERE TEXT-safe
     values.push(id);
     let where = `id = $${values.length}`;
-    if (cols.has("organizacion_id") && organizacion_id != null) {
-      values.push(organizacion_id);
-      where += ` AND organizacion_id = $${values.length}`;
+    if (cols.has("organizacion_id")) {
+      if (organizacion_id == null) return res.status(400).json({ ok: false, message: "organizacion_id requerido" });
+      values.push(String(organizacion_id));
+      where += ` AND organizacion_id::text = $${values.length}::text`;
     }
 
     const ret = await q(`UPDATE proyectos SET ${sets.join(", ")} WHERE ${where} RETURNING id`, values);
@@ -514,11 +519,13 @@ router.patch("/:id/stage", authenticateToken, async (req, res) => {
     if (cols.has("categoria")) { sets.push(`categoria = $${vals.length + 1}`); vals.push(next); }
     if (cols.has("updated_at")) sets.push(`updated_at = NOW()`);
 
+    // WHERE TEXT-safe
     vals.push(id);
     let where = `id = $${vals.length}`;
-    if (cols.has("organizacion_id") && organizacion_id != null) {
-      vals.push(organizacion_id);
-      where += ` AND organizacion_id = $${vals.length}`;
+    if (cols.has("organizacion_id")) {
+      if (organizacion_id == null) return res.status(400).json({ ok: false, message: "organizacion_id requerido" });
+      vals.push(String(organizacion_id));
+      where += ` AND organizacion_id::text = $${vals.length}::text`;
     }
 
     const r = await q(`UPDATE proyectos SET ${sets.join(", ")} WHERE ${where} RETURNING id`, vals);
@@ -575,11 +582,13 @@ router.patch("/:id/estimate", authenticateToken, async (req, res) => {
     const { sets, values } = pickUpdate(cols, updates);
     if (!sets.length) return res.status(400).json({ ok: false, message: "Nada para actualizar" });
 
+    // WHERE TEXT-safe
     values.push(id);
     let where = `id = $${values.length}`;
-    if (cols.has("organizacion_id") && organizacion_id != null) {
-      values.push(organizacion_id);
-      where += ` AND organizacion_id = $${values.length}`;
+    if (cols.has("organizacion_id")) {
+      if (organizacion_id == null) return res.status(400).json({ ok: false, message: "organizacion_id requerido" });
+      values.push(String(organizacion_id));
+      where += ` AND organizacion_id::text = $${values.length}::text`;
     }
 
     const r = await q(`UPDATE proyectos SET ${sets.join(", ")} WHERE ${where} RETURNING id`, values);
@@ -625,15 +634,22 @@ router.delete("/:id", authenticateToken, async (req, res) => {
 
     const { selectSQL, cols } = await buildProjectSelect();
 
-    const prev = await q(
-      `${selectSQL} WHERE p.id=$1 ${cols.has("organizacion_id") && organizacion_id != null ? "AND p.organizacion_id = $2" : ""}`,
-      cols.has("organizacion_id") && organizacion_id != null ? [id, organizacion_id] : [id]
-    );
+    // Traigo previo con guardia TEXT-safe
+    const paramsPrev = [id];
+    let wherePrev = `p.id=$1`;
+    const of = orgFilterText(cols, "p", organizacion_id);
+    if (of.where.length) { wherePrev += ` AND ${of.where[0]}`; paramsPrev.push(...of.params); }
+    const prev = await q(`${selectSQL} WHERE ${wherePrev}`, paramsPrev);
 
-    const del = await q(
-      `DELETE FROM proyectos WHERE id = $1 ${cols.has("organizacion_id") && organizacion_id != null ? "AND organizacion_id = $2" : ""}`,
-      cols.has("organizacion_id") && organizacion_id != null ? [id, organizacion_id] : [id]
-    );
+    // Delete con guardia TEXT-safe
+    const paramsDel = [id];
+    let whereDel = `id = $1`;
+    if (cols.has("organizacion_id")) {
+      if (organizacion_id == null) return res.status(400).json({ ok: false, message: "organizacion_id requerido" });
+      paramsDel.push(String(organizacion_id));
+      whereDel += ` AND organizacion_id::text = $2::text`;
+    }
+    const del = await q(`DELETE FROM proyectos WHERE ${whereDel}`, paramsDel);
     if (!del.rowCount) return res.status(404).json({ ok: false, message: "Proyecto no encontrado" });
 
     if (prev.rowCount) {

@@ -1,62 +1,74 @@
-// routes/tareas.js — Blindado + multi-tenant + schema-agnostic
+// routes/tareas.js — Blindado + multi-tenant + schema-agnostic (TEXT-safe, sin utils/schema)
 import { Router } from "express";
 import { q } from "../utils/db.js";
 import { authenticateToken } from "../middleware/auth.js";
 import { emit as emitFlow } from "../services/flows.client.js";
-import { hasTable, tableColumns } from "../utils/schema.js";
 
 const router = Router();
 
 /* ------------------------ helpers ------------------------ */
 const T = (v) => (v == null ? null : String(v).trim() || null);
-function getOrg(req) {
+const coerceText = (v) => { const s = T(v); return s && s.length ? s : null; };
+function coerceDate(v) { if (!v) return null; const d = new Date(v); return isNaN(d.getTime()) ? null : d.toISOString(); }
+function toInt(v) { const n = Number(v); return Number.isInteger(n) ? n : null; }
+
+// Org TEXT-safe
+function getOrgText(req) {
   const raw =
-    req.usuario?.organizacion_id ??
-    req.organizacion_id ??
-    req.headers?.["x-org-id"] ??
-    req.query?.organizacion_id ??
-    req.body?.organizacion_id ??
+    T(req.usuario?.organizacion_id) ||
+    T(req.organizacion_id) ||
+    T(req.headers?.["x-org-id"]) ||
+    T(req.query?.organizacion_id) ||
+    T(req.body?.organizacion_id) ||
     null;
-  const n = Number(raw);
-  return Number.isFinite(n) ? n : null;
+  return raw ? String(raw) : null;
 }
 function getUserFromReq(req) {
   const u = req.usuario || {};
   return {
     email: u.email ?? u.usuario_email ?? req.usuario_email ?? null,
-    organizacion_id: getOrg(req),
+    organizacion_id: getOrgText(req),
   };
 }
-function getBearer(req) {
-  return req.headers?.authorization || null;
-}
-function coerceText(v) {
-  if (v == null) return null;
-  const s = String(v).trim();
-  return s.length ? s : null;
-}
-function coerceDate(v) {
-  if (!v) return null;
-  const d = new Date(v);
-  return isNaN(d.getTime()) ? null : d.toISOString();
-}
-function toInt(v) {
-  const n = Number(v);
-  return Number.isInteger(n) ? n : null;
-}
+function getBearer(req) { return req.headers?.authorization || null; }
 
 /* ---------- dominios ---------- */
 const VALID_ESTADOS = ["todo", "doing", "waiting", "done"];
 const VALID_PRIORIDADES = ["alta", "media", "baja"];
-const normEstado = (v) => (VALID_ESTADOS.includes(String(v)) ? String(v) : "todo");
+const normEstado = (v) => {
+  const x = String(v ?? "todo").toLowerCase();
+  return VALID_ESTADOS.includes(x) ? x : "todo";
+};
 const normPrioridad = (v) => {
-  const p = (coerceText(v) || "media").toLowerCase();
+  const p = String(coerceText(v) ?? "media").toLowerCase();
   return VALID_PRIORIDADES.includes(p) ? p : "media";
 };
 
+/* ---------- introspección local (sin utils/schema) ---------- */
+async function hasTable(tableName) {
+  const { rows } = await q(`SELECT to_regclass($1) IS NOT NULL AS ok`, [tableName]);
+  return !!rows?.[0]?.ok;
+}
+// cache columnas 30s
+const _colsCache = new Map(); // tableName -> { at:number, set:Set<string> }
+const COLS_TTL_MS = 30_000;
+async function tableColumns(tableName) {
+  const now = Date.now();
+  const hit = _colsCache.get(tableName);
+  if (hit && now - hit.at < COLS_TTL_MS) return hit.set;
+  const { rows } = await q(
+    `SELECT column_name FROM information_schema.columns
+       WHERE table_schema = current_schema() AND table_name = $1`,
+    [tableName]
+  );
+  const set = new Set((rows || []).map(r => String(r.column_name)));
+  _colsCache.set(tableName, { at: now, set });
+  return set;
+}
+
 /* ---------- schema utils ---------- */
 function exp(cols, name, type) {
-  return cols.has(name) ? name : `NULL::${type} AS ${name}`;
+  return cols.has(name) ? `t.${name}` : `NULL::${type} AS ${name}`;
 }
 function pickInsert(cols, obj) {
   const fields = [], values = [];
@@ -82,7 +94,8 @@ function orderSql(cols) {
     : `1`;
   const dueExpr = cols.has("vence_en") ? `COALESCE(t.vence_en, '2099-01-01') ASC` : `1`;
   const ordenExpr = cols.has("orden") ? `t.orden ASC` : `1`;
-  return `${estadoCase}, ${prioridadCase}, ${dueExpr}, ${ordenExpr}, t.created_at DESC NULLS LAST, t.id DESC`;
+  const createdExpr = cols.has("created_at") ? `t.created_at DESC NULLS LAST` : `t.id DESC`;
+  return `${estadoCase}, ${prioridadCase}, ${dueExpr}, ${ordenExpr}, ${createdExpr}, t.id DESC`;
 }
 
 /* =========================== GET LIST =========================== */
@@ -93,7 +106,7 @@ router.get("/", authenticateToken, async (req, res) => {
     const hasClientes = await hasTable("clientes");
 
     if (!tCols.has("organizacion_id")) {
-      // No exponemos datos si no podemos filtrar por tenant
+      // sin columna de org => no exponemos
       return res.status(501).json([]);
     }
 
@@ -104,7 +117,7 @@ router.get("/", authenticateToken, async (req, res) => {
     const where = [];
 
     params.push(organizacion_id);
-    where.push(`t.organizacion_id = $${params.length}`);
+    where.push(`t.organizacion_id::text = $${params.length}::text`);
 
     if (estado && tCols.has("estado") && VALID_ESTADOS.includes(String(estado))) {
       params.push(String(estado));
@@ -147,11 +160,13 @@ router.get("/", authenticateToken, async (req, res) => {
       exp(tCols, "updated_at", "timestamptz"),
       exp(tCols, "cliente_id", "int"),
       exp(tCols, "usuario_email", "text"),
-      hasClientes ? `c.nombre AS cliente_nombre` : `NULL::text AS cliente_nombre`,
+      hasClientes && tCols.has("cliente_id")
+        ? `c.nombre AS cliente_nombre`
+        : `NULL::text AS cliente_nombre`,
     ].join(", ");
 
     const joinClientes = hasClientes && tCols.has("cliente_id")
-      ? `LEFT JOIN clientes c ON c.id = t.cliente_id AND (${tCols.has("organizacion_id") ? "c.organizacion_id = t.organizacion_id" : "1=1"})`
+      ? `LEFT JOIN clientes c ON c.id = t.cliente_id AND (c.organizacion_id::text = t.organizacion_id::text)`
       : ``;
 
     const r = await q(
@@ -203,7 +218,7 @@ router.get("/:id", authenticateToken, async (req, res) => {
       `
       SELECT ${select}
       FROM tareas t
-      WHERE t.id = $1 AND t.organizacion_id = $2
+      WHERE t.id = $1 AND t.organizacion_id::text = $2::text
       `,
       [id, organizacion_id]
     );
@@ -260,7 +275,7 @@ router.post("/", authenticateToken, async (req, res) => {
     if (tCols.has("orden")) {
       if (orden == null) {
         const r = await q(
-          `SELECT COALESCE(MAX(orden),0) AS m FROM tareas WHERE estado = $1 AND organizacion_id = $2`,
+          `SELECT COALESCE(MAX(orden),0) AS m FROM tareas WHERE estado = $1 AND organizacion_id::text = $2::text`,
           [payload.estado, organizacion_id]
         );
         payload.orden = (r.rows?.[0]?.m ?? 0) + 1;
@@ -278,20 +293,21 @@ router.post("/", authenticateToken, async (req, res) => {
     const placeholders = fields.map((_, i) => `$${i + 1}`).join(",");
     const ins = await q(
       `INSERT INTO tareas (${fields.join(",")}) VALUES (${placeholders})
-       RETURNING id, ${[
-         exp(tCols, "titulo", "text"),
-         exp(tCols, "descripcion", "text"),
-         exp(tCols, "cliente_id", "int"),
-         exp(tCols, "estado", "text"),
-         exp(tCols, "prioridad", "text"),
-         exp(tCols, "orden", "int"),
-         exp(tCols, "vence_en", "timestamptz"),
-         exp(tCols, "completada", "bool"),
-         exp(tCols, "created_at", "timestamptz"),
-         exp(tCols, "updated_at", "timestamptz"),
-         exp(tCols, "usuario_email", "text"),
-       ].join(", ")}`
-      ,
+       RETURNING id, ${
+         [
+           exp(tCols, "titulo", "text"),
+           exp(tCols, "descripcion", "text"),
+           exp(tCols, "cliente_id", "int"),
+           exp(tCols, "estado", "text"),
+           exp(tCols, "prioridad", "text"),
+           exp(tCols, "orden", "int"),
+           exp(tCols, "vence_en", "timestamptz"),
+           exp(tCols, "completada", "bool"),
+           exp(tCols, "created_at", "timestamptz"),
+           exp(tCols, "updated_at", "timestamptz"),
+           exp(tCols, "usuario_email", "text"),
+         ].join(", ")
+       }`,
       values
     );
 
@@ -368,7 +384,7 @@ async function updateTaskGeneric(req, res, { emptyAsComplete = false } = {}) {
       let nextOrden = null;
       if (tCols.has("orden")) {
         const rOrden = await q(
-          `SELECT COALESCE(MAX(orden),0) AS m FROM tareas WHERE estado='done' AND organizacion_id = $1`,
+          `SELECT COALESCE(MAX(orden),0) AS m FROM tareas WHERE estado='done' AND organizacion_id::text = $1::text`,
           [organizacion_id]
         );
         nextOrden = (rOrden.rows?.[0]?.m ?? 0) + 1;
@@ -380,7 +396,7 @@ async function updateTaskGeneric(req, res, { emptyAsComplete = false } = {}) {
 
       const rDone = await q(
         `UPDATE tareas SET ${sets.join(", ")}
-         WHERE id=$1 AND organizacion_id=$2
+         WHERE id=$1 AND organizacion_id::text=$2::text
          RETURNING ${[
            "id",
            exp(tCols, "titulo", "text"),
@@ -430,7 +446,7 @@ async function updateTaskGeneric(req, res, { emptyAsComplete = false } = {}) {
       `
       UPDATE tareas
          SET ${sets.join(", ")}
-       WHERE id = $${values.length - 1} AND organizacion_id = $${values.length}
+       WHERE id = $${values.length - 1} AND organizacion_id::text = $${values.length}::text
        RETURNING ${[
          "id",
          exp(tCols, "titulo", "text"),
@@ -494,7 +510,6 @@ router.patch("/:id/assign", authenticateToken, async (req, res) => {
     if (!(await hasTable("tareas"))) return res.status(501).json({ message: "Módulo de tareas no instalado" });
     const tCols = await tableColumns("tareas");
     if (!tCols.has("organizacion_id")) return res.status(501).json({ message: "Schema sin organizacion_id" });
-
     if (!tCols.has("usuario_email")) return res.status(400).json({ message: "Schema no soporta asignación" });
 
     const bearer = getBearer(req);
@@ -512,7 +527,7 @@ router.patch("/:id/assign", authenticateToken, async (req, res) => {
       `
       UPDATE tareas
          SET ${sets.join(", ")}
-       WHERE id = $2 AND organizacion_id = $3
+       WHERE id = $2 AND organizacion_id::text = $3::text
        RETURNING ${[
          "id",
          exp(tCols, "titulo", "text"),
@@ -588,7 +603,7 @@ router.patch("/:id/toggle", authenticateToken, async (req, res) => {
         exp(tCols, "usuario_email", "text"),
       ].join(", ")}
         FROM tareas t
-       WHERE t.id=$1 AND t.organizacion_id=$2
+       WHERE t.id=$1 AND t.organizacion_id::text=$2::text
       `,
       [id, organizacion_id]
     );
@@ -600,7 +615,7 @@ router.patch("/:id/toggle", authenticateToken, async (req, res) => {
     let nuevaOrden = row.orden ?? null;
     if (!row.completada && tCols.has("orden")) {
       const rOrden = await q(
-        `SELECT COALESCE(MAX(orden),0) AS m FROM tareas WHERE estado='done' AND organizacion_id=$1`,
+        `SELECT COALESCE(MAX(orden),0) AS m FROM tareas WHERE estado='done' AND organizacion_id::text=$1::text`,
         [organizacion_id]
       );
       nuevaOrden = (rOrden.rows?.[0]?.m ?? 0) + 1;
@@ -618,7 +633,7 @@ router.patch("/:id/toggle", authenticateToken, async (req, res) => {
       `
       UPDATE tareas
          SET ${sets.join(", ")}
-       WHERE id=$2 AND organizacion_id=$3
+       WHERE id=$2 AND organizacion_id::text=$3::text
        RETURNING ${[
          "id",
          exp(tCols, "titulo", "text"),
@@ -709,7 +724,7 @@ router.patch("/reorder", authenticateToken, async (req, res) => {
                ${tCols.has("updated_at") ? "updated_at = NOW()," : ""}
                organizacion_id = organizacion_id
          WHERE id IN (${inHolders.join(", ")})
-           AND organizacion_id = $${params.length}
+           AND organizacion_id::text = $${params.length}::text
          RETURNING id, ${[
            exp(tCols, "titulo", "text"),
            exp(tCols, "estado", "text"),
@@ -729,7 +744,7 @@ router.patch("/reorder", authenticateToken, async (req, res) => {
         UPDATE tareas
            SET estado = $1
          WHERE id = ANY($2::int[])
-           AND organizacion_id = $3
+           AND organizacion_id::text = $3::text
          RETURNING id, ${[
            exp(tCols, "titulo", "text"),
            exp(tCols, "estado", "text"),
@@ -797,14 +812,14 @@ router.delete("/:id", authenticateToken, async (req, res) => {
         exp(tCols, "vence_en", "timestamptz"),
         exp(tCols, "usuario_email", "text"),
       ].join(", ")}
-        FROM tareas
-       WHERE id=$1 AND organizacion_id=$2
+        FROM tareas t
+       WHERE t.id=$1 AND t.organizacion_id::text=$2::text
       `,
       [id, organizacion_id]
     );
 
     const r = await q(
-      `DELETE FROM tareas WHERE id = $1 AND organizacion_id = $2`,
+      `DELETE FROM tareas WHERE id = $1 AND organizacion_id::text = $2::text`,
       [id, organizacion_id]
     );
 

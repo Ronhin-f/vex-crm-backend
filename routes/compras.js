@@ -2,21 +2,50 @@
 import { Router } from "express";
 import { q } from "../utils/db.js";
 import { authenticateToken } from "../middleware/auth.js";
-import { nocache } from "../middleware/nocache.js";
-import {
-  T,
-  resolveOrgId,
-  hasTable,
-  tableColumns,
-} from "../utils/schema.js";
 
 const router = Router();
 
 /* -------------------------- helpers -------------------------- */
+const T = (v) => (v == null ? null : String(v).trim() || null);
 
 function getUserEmail(req) {
   const u = req.usuario || {};
   return u.email ?? req.usuario_email ?? u.usuario ?? null;
+}
+
+function getOrgText(req) {
+  return (
+    T(req.usuario?.organizacion_id) ||
+    T(req.headers["x-org-id"]) ||
+    T(req.query?.organizacion_id) ||
+    T(req.body?.organizacion_id) ||
+    null
+  );
+}
+
+async function regclassExists(name) {
+  try {
+    const r = await q(`SELECT to_regclass($1) IS NOT NULL AS ok`, [`public.${name}`]);
+    return !!r.rows?.[0]?.ok;
+  } catch {
+    return false;
+  }
+}
+async function hasTable(name) { return regclassExists(name); }
+
+async function tableColumns(name) {
+  try {
+    const r = await q(
+      `SELECT column_name FROM information_schema.columns
+       WHERE table_schema='public' AND table_name=$1`,
+      [name]
+    );
+    const set = new Set();
+    for (const row of r.rows || []) set.add(row.column_name);
+    return set;
+  } catch {
+    return new Set();
+  }
 }
 
 async function hasInfra() {
@@ -79,11 +108,11 @@ async function recalcTotal(compraId) {
  * Lista "flat" de items de compra con datos de la compra padre.
  * Si no está instalado el módulo, devuelve [] (sin romper FE).
  */
-router.get("/", authenticateToken, nocache, async (req, res) => {
+router.get("/", authenticateToken, async (req, res) => {
   try {
     if (!(await hasInfra())) return res.json([]);
 
-    const orgId = await resolveOrgId(req);
+    const orgId = getOrgText(req);
     if (!orgId) return res.status(400).json({ message: "organizacion_id requerido" });
 
     const cCols = await tableColumns("compras");
@@ -97,9 +126,7 @@ router.get("/", authenticateToken, nocache, async (req, res) => {
       ? "COALESCE(ci.precio_unitario,0)"
       : "0";
     const impuesto = iCols.has("impuesto") ? "COALESCE(ci.impuesto,0)" : "0";
-    const ci_obs = iCols.has("observacion")
-      ? "ci.observacion"
-      : "NULL::text";
+    const ci_obs = iCols.has("observacion") ? "ci.observacion" : "NULL::text";
 
     const compra_id = cCols.has("id") ? "c.id" : "NULL::int";
     const proveedor = cCols.has("proveedor") ? "c.proveedor" : "NULL::text";
@@ -108,18 +135,14 @@ router.get("/", authenticateToken, nocache, async (req, res) => {
     const moneda = cCols.has("moneda") ? "c.moneda" : "'ARS'";
     const total = cCols.has("total") ? "COALESCE(c.total,0)" : "0";
     const fecha = cCols.has("fecha") ? "c.fecha" : "NULL::timestamptz";
-    const created_at = cCols.has("created_at")
-      ? "c.created_at"
-      : "NULL::timestamptz";
-    const updated_at = cCols.has("updated_at")
-      ? "c.updated_at"
-      : "NULL::timestamptz";
+    const created_at = cCols.has("created_at") ? "c.created_at" : "NULL::timestamptz";
+    const updated_at = cCols.has("updated_at") ? "c.updated_at" : "NULL::timestamptz";
 
     const where = [];
     const params = [];
     if (cCols.has("organizacion_id")) {
       params.push(orgId);
-      where.push(`c.organizacion_id = $${params.length}`);
+      where.push(`c.organizacion_id::text = $${params.length}::text`);
     }
 
     const sql = `
@@ -164,7 +187,7 @@ router.post("/", authenticateToken, async (req, res) => {
     if (!(await hasInfra()))
       return res.status(501).json({ message: "Módulo de compras no instalado" });
 
-    const orgId = await resolveOrgId(req);
+    const orgId = getOrgText(req);
     if (!orgId) return res.status(400).json({ message: "organizacion_id requerido" });
     const userEmail = getUserEmail(req);
 
@@ -203,7 +226,7 @@ router.post("/", authenticateToken, async (req, res) => {
       }
       if (cCols.has("organizacion_id")) {
         params.push(orgId);
-        wh.push(`c.organizacion_id = $${params.length}`);
+        wh.push(`c.organizacion_id::text = $${params.length}::text`);
       }
       const f = await q(
         `SELECT c.id FROM compras c WHERE ${wh.join(" AND ")} LIMIT 1`,
@@ -302,7 +325,7 @@ router.patch("/:id", authenticateToken, async (req, res) => {
     if (!(await hasInfra()))
       return res.status(501).json({ message: "Módulo de compras no instalado" });
 
-    const orgId = await resolveOrgId(req);
+    const orgId = getOrgText(req);
     if (!orgId) return res.status(400).json({ message: "organizacion_id requerido" });
 
     const id = Number(req.params.id);
@@ -319,7 +342,7 @@ router.patch("/:id", authenticateToken, async (req, res) => {
                      WHERE ci.id = $1`;
     if (cCols.has("organizacion_id")) {
       paramsCheck.push(orgId);
-      checkSQL += ` AND c.organizacion_id = $2`;
+      checkSQL += ` AND c.organizacion_id::text = $2::text`;
     }
     const check = await q(checkSQL, paramsCheck);
     if (!check.rowCount) return res.status(404).json({ message: "Item no encontrado" });
@@ -385,7 +408,7 @@ router.delete("/:id", authenticateToken, async (req, res) => {
     if (!(await hasInfra()))
       return res.status(501).json({ message: "Módulo de compras no instalado" });
 
-    const orgId = await resolveOrgId(req);
+    const orgId = getOrgText(req);
     if (!orgId) return res.status(400).json({ message: "organizacion_id requerido" });
 
     const id = Number(req.params.id);
@@ -402,7 +425,7 @@ router.delete("/:id", authenticateToken, async (req, res) => {
                    WHERE ci.id = $1`;
     if (cCols.has("organizacion_id")) {
       paramsSel.push(orgId);
-      selSQL += ` AND c.organizacion_id = $2`;
+      selSQL += ` AND c.organizacion_id::text = $2::text`;
     }
     const sel = await q(selSQL, paramsSel);
     if (!sel.rowCount) return res.status(404).json({ message: "Item no encontrado" });
@@ -413,17 +436,21 @@ router.delete("/:id", authenticateToken, async (req, res) => {
     const delItem = await q(`DELETE FROM compra_items WHERE id = $1`, [id]);
     if (!delItem.rowCount) return res.status(404).json({ message: "Item no encontrado" });
 
-    // ¿Quedan items?
-    const c = await q(
-      `SELECT 1 FROM compra_items WHERE ${iCols.has("compra_id") ? "compra_id" : "NULL"} = $1 LIMIT 1`,
-      [compraId]
-    );
+    // ¿Quedan items? (solo si existe compra_id en la tabla)
+    let quedanItems = true;
+    if (iCols.has("compra_id")) {
+      const c = await q(
+        `SELECT 1 FROM compra_items WHERE compra_id = $1 LIMIT 1`,
+        [compraId]
+      );
+      quedanItems = c.rowCount > 0;
+    }
 
-    if (!c.rowCount) {
+    if (!quedanItems) {
       // No quedan items → eliminar compra si la tabla lo permite (scoped por org cuando exista)
       if (cCols.has("id")) {
         if (cCols.has("organizacion_id")) {
-          await q(`DELETE FROM compras WHERE id = $1 AND organizacion_id = $2`, [compraId, orgId]);
+          await q(`DELETE FROM compras WHERE id = $1 AND organizacion_id::text = $2::text`, [compraId, orgId]);
         } else {
           await q(`DELETE FROM compras WHERE id = $1`, [compraId]);
         }

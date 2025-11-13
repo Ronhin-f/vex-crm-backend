@@ -2,176 +2,225 @@
 import { Router } from "express";
 import { q, pool } from "../utils/db.js";
 import { authenticateToken } from "../middleware/auth.js";
-import { nocache } from "../middleware/nocache.js";
-import { T, resolveOrgId, hasTable, tableColumns } from "../utils/schema.js";
 
 const router = Router();
 
-/* -------------------------- helpers -------------------------- */
-async function hasInfra() {
-  const hasCt = await hasTable("contactos");
-  const hasCl = await hasTable("clientes");
-  return hasCt && hasCl;
+/* -------------------------- helpers inline -------------------------- */
+const T = (v) => (v == null ? null : String(v).trim() || null);
+
+function getOrgText(req) {
+  return (
+    T(req.usuario?.organizacion_id) ||
+    T(req.headers["x-org-id"]) ||
+    T(req.query?.organizacion_id) ||
+    T(req.body?.organizacion_id) ||
+    null
+  );
+}
+
+async function regclassExists(name) {
+  try {
+    const r = await q(`SELECT to_regclass($1) IS NOT NULL AS ok`, [`public.${name}`]);
+    return !!r.rows?.[0]?.ok;
+  } catch {
+    return false;
+  }
+}
+async function hasTable(name) { return regclassExists(name); }
+
+async function tableColumns(name) {
+  try {
+    const r = await q(
+      `SELECT column_name FROM information_schema.columns
+       WHERE table_schema='public' AND table_name=$1`,
+      [name]
+    );
+    return new Set((r.rows || []).map((x) => x.column_name));
+  } catch {
+    return new Set();
+  }
 }
 
 function bool(v) {
   return v === true || v === "true" || v === 1 || v === "1";
 }
 
+async function hasInfra() {
+  const hasCt = await hasTable("contactos");
+  const hasCl = await hasTable("clientes");
+  return hasCt && hasCl;
+}
+
 /* ============================ GET ============================ */
 /** Lista los contactos de un cliente (valida organización) */
-router.get(
-  "/clientes/:clienteId/contactos",
-  authenticateToken,
-  nocache,
-  async (req, res) => {
-    try {
-      if (!(await hasInfra())) return res.json({ ok: true, items: [] });
+router.get("/clientes/:clienteId/contactos", authenticateToken, async (req, res) => {
+  try {
+    if (!(await hasInfra())) return res.json({ ok: true, items: [] });
 
-      const orgId = await resolveOrgId(req);
-      if (!orgId) return res.status(400).json({ ok: false, error: "organizacion_id requerido" });
+    const orgId = getOrgText(req);
+    if (!orgId) return res.status(400).json({ ok: false, error: "organizacion_id requerido" });
 
-      const clienteId = Number(req.params.clienteId);
-      if (!Number.isInteger(clienteId) || clienteId <= 0) {
-        return res.status(400).json({ ok: false, error: "clienteId inválido" });
-      }
-
-      // Cliente debe pertenecer a tu organización (si la columna existe)
-      const cCols = await tableColumns("clientes");
-      const params = [clienteId];
-      let ownSQL = `SELECT 1 FROM clientes WHERE id=$1`;
-      if (cCols.has("organizacion_id")) {
-        params.push(orgId);
-        ownSQL += ` AND organizacion_id=$2`;
-      }
-      const own = await q(ownSQL, params);
-      if (!own.rowCount) {
-        return res.status(404).json({ ok: false, error: "cliente no encontrado" });
-      }
-
-      const r = await q(
-        `SELECT id, cliente_id, nombre, email, telefono, cargo, rol, es_principal, notas,
-                usuario_email, organizacion_id, created_at, updated_at
-           FROM contactos
-          WHERE cliente_id=$1
-          ORDER BY es_principal DESC, nombre ASC NULLS LAST, id ASC`,
-        [clienteId]
-      );
-      return res.json({ ok: true, items: r.rows || [] });
-    } catch (e) {
-      console.error("[GET /clientes/:id/contactos]", e?.stack || e?.message || e);
-      return res.status(200).json({ ok: true, items: [] });
+    const clienteId = Number(req.params.clienteId);
+    if (!Number.isInteger(clienteId) || clienteId <= 0) {
+      return res.status(400).json({ ok: false, error: "clienteId inválido" });
     }
+
+    // Cliente debe pertenecer a tu organización (si la columna existe)
+    const cCols = await tableColumns("clientes");
+    const ownParams = [clienteId];
+    let ownSQL = `SELECT 1 FROM clientes WHERE id=$1`;
+    if (cCols.has("organizacion_id")) {
+      ownParams.push(orgId);
+      ownSQL += ` AND organizacion_id::text = $2::text`;
+    }
+    const own = await q(ownSQL, ownParams);
+    if (!own.rowCount) {
+      return res.status(404).json({ ok: false, error: "cliente no encontrado" });
+    }
+
+    // Select blindado de contactos
+    const ctCols = await tableColumns("contactos");
+    const S = (col, type = "text") => {
+      if (ctCols.has(col)) return `ct.${col}`;
+      if (type === "int") return `NULL::int`;
+      if (type === "timestamptz") return `NULL::timestamptz`;
+      if (type === "bool") return `FALSE`;
+      return `NULL::text`;
+    };
+
+    const rows = await q(
+      `
+      SELECT
+        ${S("id","int")}              AS id,
+        ${S("cliente_id","int")}      AS cliente_id,
+        ${S("nombre")}                AS nombre,
+        ${S("email")}                 AS email,
+        ${S("telefono")}              AS telefono,
+        ${S("cargo")}                 AS cargo,
+        ${S("rol")}                   AS rol,
+        ${S("es_principal","bool")}   AS es_principal,
+        ${S("notas")}                 AS notas,
+        ${S("usuario_email")}         AS usuario_email,
+        ${S("organizacion_id")}       AS organizacion_id,
+        ${S("created_at","timestamptz")} AS created_at,
+        ${S("updated_at","timestamptz")} AS updated_at
+      FROM contactos ct
+      WHERE ${ctCols.has("cliente_id") ? "ct.cliente_id" : "NULL"} = $1
+      ORDER BY
+        ${ctCols.has("es_principal") ? "ct.es_principal DESC," : ""} 
+        ${ctCols.has("nombre") ? "ct.nombre ASC NULLS LAST," : ""} 
+        ${ctCols.has("id") ? "ct.id ASC" : "1"}
+      `,
+      [clienteId]
+    );
+
+    return res.json({ ok: true, items: rows.rows || [] });
+  } catch (e) {
+    console.error("[GET /clientes/:id/contactos]", e?.stack || e?.message || e);
+    return res.status(200).json({ ok: true, items: [] });
   }
-);
+});
 
 /* ============================ POST =========================== */
 /** Crea un contacto bajo un cliente (si no hay principal, este pasa a serlo) */
-router.post(
-  "/clientes/:clienteId/contactos",
-  authenticateToken,
-  async (req, res) => {
-    const client = await pool.connect();
-    try {
-      if (!(await hasInfra()))
-        return res.status(501).json({ ok: false, error: "Módulo de contactos no instalado" });
+router.post("/clientes/:clienteId/contactos", authenticateToken, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    if (!(await hasInfra()))
+      return res.status(501).json({ ok: false, error: "Módulo de contactos no instalado" });
 
-      const orgId = await resolveOrgId(req);
-      if (!orgId) return res.status(400).json({ ok: false, error: "organizacion_id requerido" });
+    const orgId = getOrgText(req);
+    if (!orgId) return res.status(400).json({ ok: false, error: "organizacion_id requerido" });
 
-      const clienteId = Number(req.params.clienteId);
-      if (!Number.isInteger(clienteId) || clienteId <= 0) {
-        return res.status(400).json({ ok: false, error: "clienteId inválido" });
-      }
-
-      // Verifica que el cliente sea tuyo (si existe la columna)
-      const cCols = await tableColumns("clientes");
-      const params = [clienteId];
-      let ownSQL = `SELECT organizacion_id FROM clientes WHERE id=$1`;
-      if (cCols.has("organizacion_id")) {
-        params.push(orgId);
-        ownSQL += ` AND organizacion_id=$2`;
-      }
-      const c = await q(ownSQL, params);
-      if (!c.rowCount)
-        return res.status(404).json({ ok: false, error: "cliente no encontrado" });
-
-      const organizacion_id = c.rows[0].organizacion_id ?? orgId ?? null;
-      const usuario_email =
-        req.usuario?.email ?? req.usuario?.usuario_email ?? req.usuario_email ?? null;
-
-      let { nombre, email, telefono, cargo, rol, es_principal = false, notas } = req.body || {};
-      if (!T(nombre) && !T(email) && !T(telefono)) {
-        return res.status(400).json({ ok: false, error: "nombre, email o teléfono requerido" });
-      }
-
-      const ctCols = await tableColumns("contactos");
-
-      await client.query("BEGIN");
-
-      // ¿Existe algún principal? (solo si la columna existe)
-      let makePrimary = false;
-      if (ctCols.has("es_principal")) {
-        const hasPrincipal = await client.query(
-          `SELECT 1 FROM contactos WHERE cliente_id=$1 AND es_principal=TRUE LIMIT 1`,
-          [clienteId]
-        );
-        makePrimary = hasPrincipal.rowCount ? bool(es_principal) : true;
-      }
-
-      // Inserta dinámicamente
-      const fields = [];
-      const vals = [];
-      function add(col, val) {
-        if (ctCols.has(col)) {
-          fields.push(col);
-          vals.push(val);
-        }
-      }
-      add("cliente_id", clienteId);
-      add("nombre", T(nombre));
-      add("email", T(email));
-      add("telefono", T(telefono));
-      add("cargo", T(cargo));
-      add("rol", T(rol));
-      if (ctCols.has("es_principal")) add("es_principal", makePrimary);
-      add("notas", T(notas));
-      add("usuario_email", usuario_email);
-      add("organizacion_id", organizacion_id);
-      if (ctCols.has("created_at")) add("created_at", new Date());
-      if (ctCols.has("updated_at")) add("updated_at", new Date());
-
-      if (!fields.length) {
-        await client.query("ROLLBACK");
-        return res.status(501).json({ ok: false, error: "Schema inválido en contactos" });
-      }
-      const placeholders = fields.map((_, i) => `$${i + 1}`);
-      const ins = await client.query(
-        `INSERT INTO contactos (${fields.join(",")}) VALUES (${placeholders.join(",")}) RETURNING *`,
-        vals
-      );
-      const contacto = ins.rows[0];
-
-      // Si marcamos como principal, apagar los demás (misma TX)
-      if (ctCols.has("es_principal") && contacto?.es_principal) {
-        await client.query(
-          `UPDATE contactos SET es_principal=FALSE, updated_at = COALESCE(updated_at, NOW())
-            WHERE cliente_id=$1 AND id<>$2`,
-          [clienteId, contacto.id]
-        );
-      }
-
-      await client.query("COMMIT");
-      return res.status(201).json({ ok: true, item: contacto });
-    } catch (e) {
-      await client.query("ROLLBACK");
-      console.error("[POST /clientes/:id/contactos]", e?.stack || e?.message || e);
-      return res.status(500).json({ ok: false, error: "Error creando contacto" });
-    } finally {
-      client.release();
+    const clienteId = Number(req.params.clienteId);
+    if (!Number.isInteger(clienteId) || clienteId <= 0) {
+      return res.status(400).json({ ok: false, error: "clienteId inválido" });
     }
+
+    // Verifica que el cliente sea tuyo (si existe la columna)
+    const cCols = await tableColumns("clientes");
+    const params = [clienteId];
+    let ownSQL = `SELECT organizacion_id FROM clientes WHERE id=$1`;
+    if (cCols.has("organizacion_id")) {
+      params.push(orgId);
+      ownSQL += ` AND organizacion_id::text = $2::text`;
+    }
+    const c = await q(ownSQL, params);
+    if (!c.rowCount)
+      return res.status(404).json({ ok: false, error: "cliente no encontrado" });
+
+    const organizacion_id = c.rows[0].organizacion_id ?? orgId ?? null;
+    const usuario_email =
+      req.usuario?.email ?? req.usuario?.usuario_email ?? req.usuario_email ?? null;
+
+    let { nombre, email, telefono, cargo, rol, es_principal = false, notas } = req.body || {};
+    if (!T(nombre) && !T(email) && !T(telefono)) {
+      return res.status(400).json({ ok: false, error: "nombre, email o teléfono requerido" });
+    }
+
+    const ctCols = await tableColumns("contactos");
+    await client.query("BEGIN");
+
+    // ¿Existe algún principal? (solo si la columna existe)
+    let makePrimary = false;
+    if (ctCols.has("es_principal")) {
+      const hasPrincipal = await client.query(
+        `SELECT 1 FROM contactos WHERE cliente_id=$1 AND es_principal=TRUE LIMIT 1`,
+        [clienteId]
+      );
+      makePrimary = hasPrincipal.rowCount ? bool(es_principal) : true;
+    }
+
+    // Inserta dinámicamente
+    const fields = [];
+    const vals = [];
+    const add = (col, val) => { if (ctCols.has(col)) { fields.push(col); vals.push(val); } };
+
+    add("cliente_id", clienteId);
+    add("nombre", T(nombre));
+    add("email", T(email));
+    add("telefono", T(telefono));
+    add("cargo", T(cargo));
+    add("rol", T(rol));
+    if (ctCols.has("es_principal")) add("es_principal", makePrimary);
+    add("notas", T(notas));
+    add("usuario_email", usuario_email);
+    add("organizacion_id", organizacion_id);
+    if (ctCols.has("created_at")) add("created_at", new Date());
+    if (ctCols.has("updated_at")) add("updated_at", new Date());
+
+    if (!fields.length) {
+      await client.query("ROLLBACK");
+      return res.status(501).json({ ok: false, error: "Schema inválido en contactos" });
+    }
+
+    const placeholders = fields.map((_, i) => `$${i + 1}`);
+    const ins = await client.query(
+      `INSERT INTO contactos (${fields.join(",")}) VALUES (${placeholders.join(",")}) RETURNING *`,
+      vals
+    );
+    const contacto = ins.rows[0];
+
+    // Si marcamos como principal, apagar los demás (misma TX)
+    if (ctCols.has("es_principal") && contacto?.es_principal) {
+      await client.query(
+        `UPDATE contactos
+            SET es_principal=FALSE${ctCols.has("updated_at") ? ", updated_at=NOW()" : ""}
+          WHERE cliente_id=$1 AND id<>$2`,
+        [clienteId, contacto.id]
+      );
+    }
+
+    await client.query("COMMIT");
+    return res.status(201).json({ ok: true, item: contacto });
+  } catch (e) {
+    await client.query("ROLLBACK");
+    console.error("[POST /clientes/:id/contactos]", e?.stack || e?.message || e);
+    return res.status(500).json({ ok: false, error: "Error creando contacto" });
+  } finally {
+    client.release();
   }
-);
+});
 
 /* ============================ PATCH ========================== */
 /** Edita un contacto (si es_principal=true, apaga al resto) */
@@ -181,7 +230,7 @@ router.patch("/contactos/:id", authenticateToken, async (req, res) => {
     if (!(await hasInfra()))
       return res.status(501).json({ ok: false, error: "Módulo de contactos no instalado" });
 
-    const orgId = await resolveOrgId(req);
+    const orgId = getOrgText(req);
     if (!orgId) return res.status(400).json({ ok: false, error: "organizacion_id requerido" });
 
     const id = Number(req.params.id);
@@ -199,7 +248,7 @@ router.patch("/contactos/:id", authenticateToken, async (req, res) => {
                    WHERE ct.id=$1`;
     if (cCols.has("organizacion_id")) {
       params.push(orgId);
-      curSQL += ` AND c.organizacion_id=$2`;
+      curSQL += ` AND c.organizacion_id::text = $2::text`;
     }
     const cur = await q(curSQL, params);
     if (!cur.rowCount)
@@ -221,9 +270,7 @@ router.patch("/contactos/:id", authenticateToken, async (req, res) => {
         vals.push(T(req.body[k]));
       }
     }
-    if (ctCols.has("updated_at")) {
-      sets.push(`updated_at = NOW()`);
-    }
+    if (ctCols.has("updated_at")) sets.push(`updated_at = NOW()`);
     if (!sets.length)
       return res.status(400).json({ ok: false, error: "nada para actualizar" });
 
@@ -242,8 +289,9 @@ router.patch("/contactos/:id", authenticateToken, async (req, res) => {
 
     if (ctCols.has("es_principal") && contacto.es_principal) {
       await client.query(
-        `UPDATE contactos SET es_principal=FALSE, updated_at = COALESCE(updated_at, NOW())
-           WHERE cliente_id=$1 AND id<>$2`,
+        `UPDATE contactos
+            SET es_principal=FALSE${ctCols.has("updated_at") ? ", updated_at=NOW()" : ""}
+          WHERE cliente_id=$1 AND id<>$2`,
         [cliente_id, contacto.id]
       );
     }
@@ -267,7 +315,7 @@ router.delete("/contactos/:id", authenticateToken, async (req, res) => {
     if (!(await hasInfra()))
       return res.status(501).json({ ok: false, error: "Módulo de contactos no instalado" });
 
-    const orgId = await resolveOrgId(req);
+    const orgId = getOrgText(req);
     if (!orgId) return res.status(400).json({ ok: false, error: "organizacion_id requerido" });
 
     const id = Number(req.params.id);
@@ -285,7 +333,7 @@ router.delete("/contactos/:id", authenticateToken, async (req, res) => {
                    WHERE ct.id=$1`;
     if (cCols.has("organizacion_id")) {
       params.push(orgId);
-      curSQL += ` AND c.organizacion_id=$2`;
+      curSQL += ` AND c.organizacion_id::text = $2::text`;
     }
     const cur = await q(curSQL, params);
     if (!cur.rowCount)
@@ -303,14 +351,17 @@ router.delete("/contactos/:id", authenticateToken, async (req, res) => {
         `SELECT id
            FROM contactos
           WHERE cliente_id=$1
-          ORDER BY nombre ASC NULLS LAST, id ASC
+          ORDER BY ${ctCols.has("nombre") ? "nombre ASC NULLS LAST," : ""} id ASC
           LIMIT 1`,
         [cliente_id]
       );
       if (nxt.rowCount) {
-        await client.query(`UPDATE contactos SET es_principal=TRUE WHERE id=$1`, [nxt.rows[0].id]);
         await client.query(
-          `UPDATE contactos SET es_principal=FALSE WHERE cliente_id=$1 AND id<>$2`,
+          `UPDATE contactos SET es_principal=TRUE${ctCols.has("updated_at") ? ", updated_at=NOW()" : ""} WHERE id=$1`,
+          [nxt.rows[0].id]
+        );
+        await client.query(
+          `UPDATE contactos SET es_principal=FALSE${ctCols.has("updated_at") ? ", updated_at=NOW()" : ""} WHERE cliente_id=$1 AND id<>$2`,
           [cliente_id, nxt.rows[0].id]
         );
       }

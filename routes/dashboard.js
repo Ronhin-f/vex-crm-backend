@@ -1,13 +1,25 @@
-// routes/dashboard.js — Dashboard KPIs (multi-tenant, TEXT-safe, sin nocache)
+// routes/dashboard.js — Dashboard KPIs (multi-tenant, TEXT-safe, sin nocache, sin utils externos)
 import { Router } from "express";
 import { q } from "../utils/db.js";
 import { authenticateToken as auth } from "../middleware/auth.js";
-import { hasTable, tableColumns } from "../utils/schema.js";
-import { getOrgText } from "../utils/org.js";
 
 const router = Router();
 
 /* ------------------------ helpers ------------------------ */
+const T = (v) => (v == null ? null : String(v).trim() || null);
+
+/** Obtiene org como TEXT desde token/header/query/body (sin castear a int) */
+function getOrgText(req) {
+  return (
+    T(req.usuario?.organizacion_id) ||
+    T(req.headers["x-org-id"]) ||
+    T(req.query?.organizacion_id) ||
+    T(req.body?.organizacion_id) ||
+    null
+  );
+}
+
+/** ¿Existe regclass (tabla/vista) en schema public? */
 async function regclassExists(name) {
   try {
     const r = await q(`SELECT to_regclass($1) IS NOT NULL AS ok`, [`public.${name}`]);
@@ -16,6 +28,28 @@ async function regclassExists(name) {
     return false;
   }
 }
+
+/** Alias semántico para tablas (usa regclass) */
+async function hasTable(name) {
+  return regclassExists(name);
+}
+
+/** Set de columnas de tabla/vista en public */
+async function tableColumns(name) {
+  try {
+    const r = await q(
+      `SELECT column_name FROM information_schema.columns
+       WHERE table_schema='public' AND table_name=$1`,
+      [name]
+    );
+    const set = new Set();
+    for (const row of r.rows || []) set.add(row.column_name);
+    return set;
+  } catch {
+    return new Set();
+  }
+}
+
 const num = (v, d = 0) => (Number.isFinite(+v) ? +v : d);
 
 function pickOne(set, candidates) {
@@ -78,11 +112,11 @@ router.get("/", auth, async (req, res) => {
     const hasInvoices   = await hasTable("invoices");
     const hasARView     = await regclassExists("v_ar_aging");
 
-    const colsClientes  = hasClientes  ? await tableColumns("clientes")         : new Set();
-    const colsTareas    = hasTareas    ? await tableColumns("tareas")           : new Set();
-    const colsProyectos = hasProyectos ? await tableColumns("proyectos")        : new Set();
-    const colsInvoices  = hasInvoices  ? await tableColumns("invoices")         : new Set();
-    const colsAR        = hasARView    ? await tableColumns("v_ar_aging")       : new Set();
+    const colsClientes  = hasClientes  ? await tableColumns("clientes")   : new Set();
+    const colsTareas    = hasTareas    ? await tableColumns("tareas")     : new Set();
+    const colsProyectos = hasProyectos ? await tableColumns("proyectos")  : new Set();
+    const colsInvoices  = hasInvoices  ? await tableColumns("invoices")   : new Set();
+    const colsAR        = hasARView    ? await tableColumns("v_ar_aging") : new Set();
 
     /* ======= Totales base ======= */
     try {
@@ -299,7 +333,8 @@ router.get("/", auth, async (req, res) => {
 
         if (!top.length && hasProyectos) {
           const { where: wp, params: pp } = orgFilterText(colsProyectos, orgId);
-          const joinOrg = (colsClientes.has("organizacion_id") && colsProyectos.has("organizacion_id"))
+          const colsCli = colsClientes; // ya calculado
+          const joinOrg = (colsCli.has("organizacion_id") && colsProyectos.has("organizacion_id"))
             ? ` AND (c.organizacion_id::text = p.organizacion_id::text)` : ``;
 
           const rTopP = await q(
@@ -307,8 +342,8 @@ router.get("/", auth, async (req, res) => {
             SELECT
               COALESCE(c.id, p.cliente_id) AS id,
               COALESCE(c.nombre, p.nombre)  AS nombre,
-              ${colsClientes.has("email") ? "COALESCE(c.email, NULL) AS email" : "NULL::text AS email"},
-              ${colsClientes.has("telefono") ? "COALESCE(c.telefono, NULL) AS telefono" : "NULL::text AS telefono"},
+              ${colsCli.has("email") ? "COALESCE(c.email, NULL) AS email" : "NULL::text AS email"},
+              ${colsCli.has("telefono") ? "COALESCE(c.telefono, NULL) AS telefono" : "NULL::text AS telefono"},
               ${colsProyectos.has("created_at") ? "p.created_at" : "NULL::timestamptz AS created_at"}
             FROM proyectos p
             LEFT JOIN clientes c ON c.id = p.cliente_id${joinOrg}
