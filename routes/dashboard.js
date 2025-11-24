@@ -1,4 +1,4 @@
-// routes/dashboard.js — Dashboard KPIs (multi-tenant, TEXT-safe, sin nocache, sin utils externos)
+// Backend/routes/dashboard.js
 import { Router } from "express";
 import { q } from "../utils/db.js";
 import { authenticateToken as auth } from "../middleware/auth.js";
@@ -39,7 +39,7 @@ async function tableColumns(name) {
   try {
     const r = await q(
       `SELECT column_name FROM information_schema.columns
-       WHERE table_schema='public' AND table_name=$1`,
+        WHERE table_schema='public' AND table_name=$1`,
       [name]
     );
     const set = new Set();
@@ -79,7 +79,7 @@ function orgFilterText(cols, orgId) {
  * Dashboard payload:
  *  - metrics: {
  *      won, lost, win_rate, unqualified,
- *      followups_7d, overdue,
+ *      followups_7d, proximos_7d, overdue,
  *      total_clientes, total_tareas, total_proyectos,
  *      contactability, first_touch_p50_min, first_touch_avg_min,
  *      ar_total, ar_overdue_amount, ar_overdue_count, ar_due_next_7, ar_dso_days
@@ -90,13 +90,24 @@ function orgFilterText(cols, orgId) {
 router.get("/", auth, async (req, res) => {
   const out = {
     metrics: {
-      won: 0, lost: 0, win_rate: 0,
+      won: 0,
+      lost: 0,
+      win_rate: 0,
       unqualified: 0,
-      followups_7d: 0, overdue: 0,
-      total_clientes: 0, total_tareas: 0, total_proyectos: 0,
+      followups_7d: 0,
+      proximos_7d: 0,
+      overdue: 0,
+      total_clientes: 0,
+      total_tareas: 0,
+      total_proyectos: 0,
       contactability: 0,
-      first_touch_p50_min: 0, first_touch_avg_min: 0,
-      ar_total: 0, ar_overdue_amount: 0, ar_overdue_count: 0, ar_due_next_7: 0, ar_dso_days: 0,
+      first_touch_p50_min: 0,
+      first_touch_avg_min: 0,
+      ar_total: 0,
+      ar_overdue_amount: 0,
+      ar_overdue_count: 0,
+      ar_due_next_7: 0,
+      ar_dso_days: 0,
     },
     topClientes: [],
     proximosSeguimientos: [],
@@ -106,66 +117,77 @@ router.get("/", auth, async (req, res) => {
     const orgId = getOrgText(req);
 
     /* ======= Detección de tablas/columnas ======= */
-    const hasClientes   = await hasTable("clientes");
-    const hasTareas     = await hasTable("tareas");
-    const hasProyectos  = await hasTable("proyectos");
-    const hasInvoices   = await hasTable("invoices");
-    const hasARView     = await regclassExists("v_ar_aging");
+    const hasClientes = await hasTable("clientes");
+    const hasTareas = await hasTable("tareas");
+    const hasProyectos = await hasTable("proyectos");
+    const hasInvoices = await hasTable("invoices");
+    const hasARView = await regclassExists("v_ar_aging");
 
-    const colsClientes  = hasClientes  ? await tableColumns("clientes")   : new Set();
-    const colsTareas    = hasTareas    ? await tableColumns("tareas")     : new Set();
-    const colsProyectos = hasProyectos ? await tableColumns("proyectos")  : new Set();
-    const colsInvoices  = hasInvoices  ? await tableColumns("invoices")   : new Set();
-    const colsAR        = hasARView    ? await tableColumns("v_ar_aging") : new Set();
+    const colsClientes = hasClientes ? await tableColumns("clientes") : new Set();
+    const colsTareas = hasTareas ? await tableColumns("tareas") : new Set();
+    const colsProyectos = hasProyectos ? await tableColumns("proyectos") : new Set();
+    const colsInvoices = hasInvoices ? await tableColumns("invoices") : new Set();
+    const colsAR = hasARView ? await tableColumns("v_ar_aging") : new Set();
 
     /* ======= Totales base ======= */
     try {
       if (hasClientes) {
         const { where, params } = orgFilterText(colsClientes, orgId);
-        const r = await q(`SELECT COUNT(*)::int AS total FROM clientes ${where.length ? "WHERE " + where.join(" AND ") : ""}`, params);
+        const r = await q(
+          `SELECT COUNT(*)::int AS total FROM clientes ${where.length ? "WHERE " + where.join(" AND ") : ""}`,
+          params
+        );
         out.metrics.total_clientes = num(r.rows?.[0]?.total, 0);
       }
       if (hasTareas) {
         const { where, params } = orgFilterText(colsTareas, orgId);
-        const r = await q(`SELECT COUNT(*)::int AS total FROM tareas ${where.length ? "WHERE " + where.join(" AND ") : ""}`, params);
+        const r = await q(
+          `SELECT COUNT(*)::int AS total FROM tareas ${where.length ? "WHERE " + where.join(" AND ") : ""}`,
+          params
+        );
         out.metrics.total_tareas = num(r.rows?.[0]?.total, 0);
       }
       if (hasProyectos) {
         const { where, params } = orgFilterText(colsProyectos, orgId);
-        const r = await q(`SELECT COUNT(*)::int AS total FROM proyectos ${where.length ? "WHERE " + where.join(" AND ") : ""}`, params);
+        const r = await q(
+          `SELECT COUNT(*)::int AS total FROM proyectos ${where.length ? "WHERE " + where.join(" AND ") : ""}`,
+          params
+        );
         out.metrics.total_proyectos = num(r.rows?.[0]?.total, 0);
       }
-    } catch { /* deja 0 */ }
+    } catch {
+      /* deja 0 */
+    }
 
     /* ======= Won/Lost/Unqualified (proyectos si existen) ======= */
     try {
       if (hasProyectos) {
-        const stageCol  = pickOne(colsProyectos, ["stage", "estado", "etapa"]);
+        const stageCol = pickOne(colsProyectos, ["stage", "estado", "etapa"]);
         const resultCol = pickOne(colsProyectos, ["result", "resultado", "status"]);
         if (stageCol || resultCol) {
-          const wonCond  = `(${stageCol ? `${stageCol} ~* '^(won|ganad)'` : "FALSE"}${resultCol ? ` OR ${resultCol}='won'` : ""})`;
+          const wonCond = `(${stageCol ? `${stageCol} ~* '^(won|ganad)'` : "FALSE"}${resultCol ? ` OR ${resultCol}='won'` : ""})`;
           const lostCond = `(${stageCol ? `${stageCol} ~* '^(lost|perdid)'` : "FALSE"}${resultCol ? ` OR ${resultCol}='lost'` : ""})`;
-          const unqCond  = `(${stageCol ? `${stageCol} ~* 'unqualif|no calif|no_calif'` : "FALSE"}${resultCol ? ` OR ${resultCol}='unqualified'` : ""})`;
+          const unqCond = `(${stageCol ? `${stageCol} ~* 'unqualif|no calif|no_calif'` : "FALSE"}${resultCol ? ` OR ${resultCol}='unqualified'` : ""})`;
 
           const { where, params } = orgFilterText(colsProyectos, orgId);
           const r = await q(
             `
-            SELECT
-              SUM(CASE WHEN ${wonCond}  THEN 1 ELSE 0 END)::int AS won,
-              SUM(CASE WHEN ${lostCond} THEN 1 ELSE 0 END)::int AS lost,
-              SUM(CASE WHEN ${unqCond}  THEN 1 ELSE 0 END)::int AS unqualified
-            FROM proyectos
-            ${where.length ? "WHERE " + where.join(" AND ") : ""}
-            `,
+              SELECT
+                SUM(CASE WHEN ${wonCond}  THEN 1 ELSE 0 END)::int AS won,
+                SUM(CASE WHEN ${lostCond} THEN 1 ELSE 0 END)::int AS lost,
+                SUM(CASE WHEN ${unqCond}  THEN 1 ELSE 0 END)::int AS unqualified
+              FROM proyectos
+              ${where.length ? "WHERE " + where.join(" AND ") : ""}
+              `,
             params
           );
-          const won  = num(r.rows?.[0]?.won, 0);
+          const won = num(r.rows?.[0]?.won, 0);
           const lost = num(r.rows?.[0]?.lost, 0);
-          const unq  = num(r.rows?.[0]?.unqualified, 0);
+          const unq = num(r.rows?.[0]?.unqualified, 0);
           out.metrics.won = won;
           out.metrics.lost = lost;
           out.metrics.unqualified = unq;
-          out.metrics.win_rate = (won + lost) > 0 ? Math.round((won * 100) / (won + lost)) : 0;
+          out.metrics.win_rate = won + lost > 0 ? Math.round((won * 100) / (won + lost)) : 0;
         }
       }
     } catch {}
@@ -177,19 +199,20 @@ router.get("/", auth, async (req, res) => {
         const extra = where.length ? ` AND ${where.join(" AND ")}` : "";
         const r = await q(
           `
-          SELECT
-            SUM(CASE WHEN completada = FALSE AND vence_en IS NOT NULL
-                      AND vence_en <= NOW() + INTERVAL '7 days'
-                      AND vence_en >= NOW() THEN 1 ELSE 0 END)::int AS f7,
-            SUM(CASE WHEN completada = FALSE AND vence_en IS NOT NULL
-                      AND vence_en < NOW() THEN 1 ELSE 0 END)::int AS overdue
-          FROM tareas
-          WHERE TRUE ${extra}
-          `,
+            SELECT
+              SUM(CASE WHEN completada = FALSE AND vence_en IS NOT NULL
+                        AND vence_en <= NOW() + INTERVAL '7 days'
+                        AND vence_en >= NOW() THEN 1 ELSE 0 END)::int AS f7,
+              SUM(CASE WHEN completada = FALSE AND vence_en IS NOT NULL
+                        AND vence_en < NOW() THEN 1 ELSE 0 END)::int AS overdue
+            FROM tareas
+            WHERE TRUE ${extra}
+            `,
           params
         );
         out.metrics.followups_7d = num(r.rows?.[0]?.f7, 0);
-        out.metrics.overdue      = num(r.rows?.[0]?.overdue, 0);
+        out.metrics.proximos_7d = out.metrics.followups_7d;
+        out.metrics.overdue = num(r.rows?.[0]?.overdue, 0);
       }
     } catch {}
 
@@ -197,27 +220,27 @@ router.get("/", auth, async (req, res) => {
     try {
       if (hasClientes) {
         const hasEmail = colsClientes.has("email");
-        const hasTel   = colsClientes.has("telefono");
+        const hasTel = colsClientes.has("telefono");
         const { where, params } = orgFilterText(colsClientes, orgId);
         const w = where.length ? `WHERE ${where.join(" AND ")}` : "";
 
         let contactExpr = "NULL";
         if (hasEmail && hasTel) contactExpr = `COALESCE(NULLIF(TRIM(email),''), NULLIF(TRIM(telefono),''))`;
-        else if (hasEmail)      contactExpr = `NULLIF(TRIM(email),'')`;
-        else if (hasTel)        contactExpr = `NULLIF(TRIM(telefono),'')`;
+        else if (hasEmail) contactExpr = `NULLIF(TRIM(email),'')`;
+        else if (hasTel) contactExpr = `NULLIF(TRIM(telefono),'')`;
 
         const r = await q(
           `
-          SELECT
-            COUNT(*)::int AS total,
-            SUM(CASE WHEN ${contactExpr} IS NOT NULL THEN 1 ELSE 0 END)::int AS contactable
-          FROM clientes
-          ${w}
-          `,
+            SELECT
+              COUNT(*)::int AS total,
+              SUM(CASE WHEN ${contactExpr} IS NOT NULL THEN 1 ELSE 0 END)::int AS contactable
+            FROM clientes
+            ${w}
+            `,
           params
         );
         const totalCli = num(r.rows?.[0]?.total, 0);
-        const contact  = num(r.rows?.[0]?.contactable, 0);
+        const contact = num(r.rows?.[0]?.contactable, 0);
         out.metrics.contactability = totalCli > 0 ? Math.round((contact * 100) / totalCli) : 0;
       }
     } catch {}
@@ -230,26 +253,26 @@ router.get("/", auth, async (req, res) => {
 
         // Si ambas tienen organizacion_id, forzamos join por org también
         const joinOrg =
-          (colsClientes.has("organizacion_id") && colsTareas.has("organizacion_id"))
+          colsClientes.has("organizacion_id") && colsTareas.has("organizacion_id")
             ? ` AND t.organizacion_id::text = c.organizacion_id::text`
             : ``;
 
         const r = await q(
           `
-          WITH firsts AS (
-            SELECT c.id AS cliente_id,
-                   EXTRACT(EPOCH FROM (MIN(t.created_at) - c.created_at))/60.0 AS mins
-            FROM clientes c
-            JOIN tareas   t ON t.cliente_id = c.id${joinOrg}
-            ${condCli}
-            GROUP BY c.id, c.created_at
-            HAVING MIN(t.created_at) IS NOT NULL AND c.created_at IS NOT NULL
-          )
-          SELECT
-            COALESCE(ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY mins)::numeric), 0) AS p50,
-            COALESCE(ROUND(AVG(mins)::numeric), 0) AS avg
-          FROM firsts
-          `,
+            WITH firsts AS (
+              SELECT c.id AS cliente_id,
+                    EXTRACT(EPOCH FROM (MIN(t.created_at) - c.created_at))/60.0 AS mins
+              FROM clientes c
+              JOIN tareas   t ON t.cliente_id = c.id${joinOrg}
+              ${condCli}
+              GROUP BY c.id, c.created_at
+              HAVING MIN(t.created_at) IS NOT NULL AND c.created_at IS NOT NULL
+            )
+            SELECT
+              COALESCE(ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY mins)::numeric), 0) AS p50,
+              COALESCE(ROUND(AVG(mins)::numeric), 0) AS avg
+            FROM firsts
+            `,
           pc
         );
         out.metrics.first_touch_p50_min = num(r.rows?.[0]?.p50, 0);
@@ -269,30 +292,30 @@ router.get("/", auth, async (req, res) => {
         }
         sql += ` LIMIT 1`;
         const v = (await q(sql, params)).rows?.[0] || {};
-        out.metrics.ar_total          = num(v.ar_total, 0);
+        out.metrics.ar_total = num(v.ar_total, 0);
         out.metrics.ar_overdue_amount = num(v.overdue_amount, 0);
-        out.metrics.ar_overdue_count  = num(v.overdue_count, 0);
-        out.metrics.ar_due_next_7     = num(v.due_next_7, 0);
+        out.metrics.ar_overdue_count = num(v.overdue_count, 0);
+        out.metrics.ar_due_next_7 = num(v.due_next_7, 0);
       } else if (hasInvoices) {
         const { where, params } = orgFilterText(colsInvoices, orgId);
         const w = where.length ? ` AND ${where.join(" AND ")}` : "";
         const base = await q(
           `
-          SELECT
-            SUM(GREATEST(amount_total - amount_paid,0)) AS ar_total,
-            COUNT(*) FILTER (WHERE (now()::date - due_date) > 0)::int AS overdue_count,
-            SUM(GREATEST(amount_total - amount_paid,0)) FILTER (WHERE (now()::date - due_date) > 0) AS overdue_amount,
-            SUM(GREATEST(amount_total - amount_paid,0)) FILTER (WHERE due_date BETWEEN now()::date AND (now()::date + 7)) AS due_next_7
-          FROM invoices
-          WHERE status IN ('sent','partial','overdue') ${w}
-          `,
+            SELECT
+              SUM(GREATEST(amount_total - amount_paid,0)) AS ar_total,
+              COUNT(*) FILTER (WHERE (now()::date - due_date) > 0)::int AS overdue_count,
+              SUM(GREATEST(amount_total - amount_paid,0)) FILTER (WHERE (now()::date - due_date) > 0) AS overdue_amount,
+              SUM(GREATEST(amount_total - amount_paid,0)) FILTER (WHERE due_date BETWEEN now()::date AND (now()::date + 7)) AS due_next_7
+            FROM invoices
+            WHERE status IN ('sent','partial','overdue') ${w}
+            `,
           params
         );
         const v = base.rows?.[0] || {};
-        out.metrics.ar_total          = num(v.ar_total, 0);
+        out.metrics.ar_total = num(v.ar_total, 0);
         out.metrics.ar_overdue_amount = num(v.overdue_amount, 0);
-        out.metrics.ar_overdue_count  = num(v.overdue_count, 0);
-        out.metrics.ar_due_next_7     = num(v.due_next_7, 0);
+        out.metrics.ar_overdue_count = num(v.overdue_count, 0);
+        out.metrics.ar_due_next_7 = num(v.due_next_7, 0);
       }
 
       // DSO simple: AR / (ventas_últimos_30 / 30)
@@ -301,11 +324,11 @@ router.get("/", auth, async (req, res) => {
         const w = where.length ? ` AND ${where.join(" AND ")}` : "";
         const s30 = await q(
           `
-          SELECT COALESCE(SUM(amount_total),0) AS s
-          FROM invoices
-          WHERE issue_date >= (now()::date - INTERVAL '30 days')
-            AND status IN ('sent','partial','paid','overdue') ${w}
-          `,
+            SELECT COALESCE(SUM(amount_total),0) AS s
+            FROM invoices
+            WHERE issue_date >= (now()::date - INTERVAL '30 days')
+              AND status IN ('sent','partial','paid','overdue') ${w}
+            `,
           params
         );
         const sales = num(s30.rows?.[0]?.s, 0);
@@ -320,37 +343,39 @@ router.get("/", auth, async (req, res) => {
         const { where, params } = orgFilterText(colsClientes, orgId);
         const hasCreatedAt = colsClientes.has("created_at");
         const sqlTop = `
-          SELECT id, nombre,
-                 ${colsClientes.has("email") ? "email" : "NULL::text AS email"},
-                 ${colsClientes.has("telefono") ? "telefono" : "NULL::text AS telefono"},
-                 ${hasCreatedAt ? "created_at" : "NULL::timestamptz AS created_at"}
-          FROM clientes
-          ${where.length ? "WHERE " + where.join(" AND ") : ""}
-          ORDER BY ${hasCreatedAt ? "created_at DESC NULLS LAST" : "id DESC"}
-          LIMIT 5
-        `;
+            SELECT id, nombre,
+                  ${colsClientes.has("email") ? "email" : "NULL::text AS email"},
+                  ${colsClientes.has("telefono") ? "telefono" : "NULL::text AS telefono"},
+                  ${hasCreatedAt ? "created_at" : "NULL::timestamptz AS created_at"}
+            FROM clientes
+            ${where.length ? "WHERE " + where.join(" AND ") : ""}
+            ORDER BY ${hasCreatedAt ? "created_at DESC NULLS LAST" : "id DESC"}
+            LIMIT 5
+          `;
         let top = (await q(sqlTop, params)).rows || [];
 
         if (!top.length && hasProyectos) {
           const { where: wp, params: pp } = orgFilterText(colsProyectos, orgId);
           const colsCli = colsClientes; // ya calculado
-          const joinOrg = (colsCli.has("organizacion_id") && colsProyectos.has("organizacion_id"))
-            ? ` AND (c.organizacion_id::text = p.organizacion_id::text)` : ``;
+          const joinOrg =
+            colsCli.has("organizacion_id") && colsProyectos.has("organizacion_id")
+              ? ` AND (c.organizacion_id::text = p.organizacion_id::text)`
+              : ``;
 
           const rTopP = await q(
             `
-            SELECT
-              COALESCE(c.id, p.cliente_id) AS id,
-              COALESCE(c.nombre, p.nombre)  AS nombre,
-              ${colsCli.has("email") ? "COALESCE(c.email, NULL) AS email" : "NULL::text AS email"},
-              ${colsCli.has("telefono") ? "COALESCE(c.telefono, NULL) AS telefono" : "NULL::text AS telefono"},
-              ${colsProyectos.has("created_at") ? "p.created_at" : "NULL::timestamptz AS created_at"}
-            FROM proyectos p
-            LEFT JOIN clientes c ON c.id = p.cliente_id${joinOrg}
-            ${wp.length ? "WHERE " + wp.join(" AND ") : ""}
-            ORDER BY ${colsProyectos.has("created_at") ? "p.created_at DESC NULLS LAST," : ""} p.id DESC
-            LIMIT 5
-            `,
+              SELECT
+                COALESCE(c.id, p.cliente_id) AS id,
+                COALESCE(c.nombre, p.nombre)  AS nombre,
+                ${colsCli.has("email") ? "COALESCE(c.email, NULL) AS email" : "NULL::text AS email"},
+                ${colsCli.has("telefono") ? "COALESCE(c.telefono, NULL) AS telefono" : "NULL::text AS telefono"},
+                ${colsProyectos.has("created_at") ? "p.created_at" : "NULL::timestamptz AS created_at"}
+              FROM proyectos p
+              LEFT JOIN clientes c ON c.id = p.cliente_id${joinOrg}
+              ${wp.length ? "WHERE " + wp.join(" AND ") : ""}
+              ORDER BY ${colsProyectos.has("created_at") ? "p.created_at DESC NULLS LAST," : ""} p.id DESC
+              LIMIT 5
+              `,
             pp
           );
           top = rTopP.rows || [];
@@ -368,27 +393,27 @@ router.get("/", auth, async (req, res) => {
         const colsCli = joinCli ? await tableColumns("clientes") : new Set();
 
         const joinOrg =
-          (colsTareas.has("organizacion_id") && colsCli.has("organizacion_id"))
+          colsTareas.has("organizacion_id") && colsCli.has("organizacion_id")
             ? ` AND c.organizacion_id::text = t.organizacion_id::text`
             : ``;
 
         const r = await q(
           `
-          SELECT
-            t.id, 
-            ${colsTareas.has("titulo") ? "t.titulo" : "NULL::text AS titulo"},
-            ${colsTareas.has("descripcion") ? "t.descripcion" : "NULL::text AS descripcion"},
-            t.vence_en, t.completada,
-            ${colsTareas.has("cliente_id") ? "t.cliente_id" : "NULL::int AS cliente_id"},
-            ${joinCli && colsCli.has("nombre") ? "c.nombre AS cliente_nombre" : "NULL::text AS cliente_nombre"}
-          FROM tareas t
-          ${joinCli ? `LEFT JOIN clientes c ON c.id = t.cliente_id${joinOrg}` : ""}
-          WHERE t.completada = FALSE
-            AND t.vence_en IS NOT NULL
-            AND t.vence_en <= NOW() + INTERVAL '7 days' ${w}
-          ORDER BY t.vence_en ASC NULLS LAST, t.id DESC
-          LIMIT 20
-          `,
+            SELECT
+              t.id, 
+              ${colsTareas.has("titulo") ? "t.titulo" : "NULL::text AS titulo"},
+              ${colsTareas.has("descripcion") ? "t.descripcion" : "NULL::text AS descripcion"},
+              t.vence_en, t.completada,
+              ${colsTareas.has("cliente_id") ? "t.cliente_id" : "NULL::int AS cliente_id"},
+              ${joinCli && colsCli.has("nombre") ? "c.nombre AS cliente_nombre" : "NULL::text AS cliente_nombre"}
+            FROM tareas t
+            ${joinCli ? `LEFT JOIN clientes c ON c.id = t.cliente_id${joinOrg}` : ""}
+            WHERE t.completada = FALSE
+              AND t.vence_en IS NOT NULL
+              AND t.vence_en <= NOW() + INTERVAL '7 days' ${w}
+            ORDER BY t.vence_en ASC NULLS LAST, t.id DESC
+            LIMIT 20
+            `,
           params
         );
         out.proximosSeguimientos = r.rows || [];

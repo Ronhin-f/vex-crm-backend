@@ -1,4 +1,4 @@
-// routes/analytics.js — KPIs CRM (ESM) TEXT-safe
+// Backend/routes/analytics.js
 import { Router } from "express";
 import { q } from "../utils/db.js";
 import { authenticateToken } from "../middleware/auth.js";
@@ -249,21 +249,17 @@ router.get("/kpis", authenticateToken, nocache, async (req, res) => {
       // columnas candidatas
       const createdCol = pickOne(cols, ["created_at", "createdon", "created"]);
       const updatedCol = pickOne(cols, ["updated_at", "updatedon", "updated"]);
-      const closedCol  = pickOne(cols, ["closed_at",  "closedon",  "closed"]);
-      const stageCol   = pickOne(cols, ["stage", "estado", "etapa"]);
-      const resultCol  = pickOne(cols, ["result", "resultado", "status"]);
+      const closedCol = pickOne(cols, ["closed_at", "closedon", "closed"]);
+      const stageCol = pickOne(cols, ["stage", "estado", "etapa"]);
+      const resultCol = pickOne(cols, ["result", "resultado", "status"]);
 
-      const ownerCandidates = ["assignee","owner","usuario_email","user_email","email"];
-      const ownerExprParts = ownerCandidates.filter(c => cols.has(c)).map(c => `NULLIF(${c},'')`);
-      const ownerExpr = ownerExprParts.length
-        ? `COALESCE(${ownerExprParts.join(", ")}, 'Unassigned')`
-        : `'Unassigned'`;
+      const ownerCandidates = ["assignee", "owner", "usuario_email", "user_email", "email"];
+      const ownerExprParts = ownerCandidates.filter((c) => cols.has(c)).map((c) => `NULLIF(${c},'')`);
+      const ownerExpr = ownerExprParts.length ? `COALESCE(${ownerExprParts.join(", ")}, 'Unassigned')` : `'Unassigned'`;
 
-      const sourceCandidates = ["source","origin","lead_source","origen"];
-      const sourceExprParts = sourceCandidates.filter(c => cols.has(c)).map(c => c);
-      const sourceExpr = sourceExprParts.length
-        ? `COALESCE(${sourceExprParts.join(", ")}, 'Unknown')`
-        : `'Unknown'`;
+      const sourceCandidates = ["source", "origin", "lead_source", "origen"];
+      const sourceExprParts = sourceCandidates.filter((c) => cols.has(c)).map((c) => c);
+      const sourceExpr = sourceExprParts.length ? `COALESCE(${sourceExprParts.join(", ")}, 'Unknown')` : `'Unknown'`;
 
       // cláusulas de fecha (si no hay columna, consumimos $2/$3 con tautología)
       const dateCol = createdCol || updatedCol || closedCol;
@@ -272,7 +268,7 @@ router.get("/kpis", authenticateToken, nocache, async (req, res) => {
         : `($2::timestamptz IS NOT NULL AND $3::timestamptz IS NOT NULL)`;
 
       // condiciones won/lost robustas
-      const wonCond  = `(${stageCol ? `${stageCol} ~* '^(won|ganad)'` : "FALSE"}${resultCol ? ` OR ${resultCol}='won'` : ""})`;
+      const wonCond = `(${stageCol ? `${stageCol} ~* '^(won|ganad)'` : "FALSE"}${resultCol ? ` OR ${resultCol}='won'` : ""})`;
       const lostCond = `(${stageCol ? `${stageCol} ~* '^(lost|perdid)'` : "FALSE"}${resultCol ? ` OR ${resultCol}='lost'` : ""})`;
 
       const bySourceSQL = `
@@ -328,9 +324,9 @@ router.get("/kpis", authenticateToken, nocache, async (req, res) => {
           AND ${dateAggExpr} <  $3::timestamptz`,
         [orgId, fromISO, toISO]
       );
-      const wonTotal  = num(wonLostAgg.rows?.[0]?.won, 0);
+      const wonTotal = num(wonLostAgg.rows?.[0]?.won, 0);
       const lostTotal = num(wonLostAgg.rows?.[0]?.lost, 0);
-      const win_rate  = (wonTotal + lostTotal) > 0 ? Math.round((wonTotal * 100) / (wonTotal + lostTotal)) : 0;
+      const win_rate = wonTotal + lostTotal > 0 ? Math.round((wonTotal * 100) / (wonTotal + lostTotal)) : 0;
 
       const stagesAggSQL = `
         SELECT COALESCE(${stageCol ? stageCol : "'Uncategorized'"} ,'Uncategorized') AS stage, COUNT(*)::int AS total
@@ -516,7 +512,7 @@ router.get("/kpis", authenticateToken, nocache, async (req, res) => {
         qualified: qualifiedCount,
         rate_pct: pct(qualifiedCount, totalContacts),
         uncontactable: { total: uncontactableCount, pct: pct(uncontactableCount, totalContacts) },
-        no_first_touch: { total: noFirstTouchCount, pct: pct(no_first_touchCount, totalContacts) }, // typo evitado
+        no_first_touch: { total: noFirstTouchCount, pct: pct(noFirstTouchCount, totalContacts) },
         uncategorized: { total: uncategorizedCount, pct: pct(uncategorizedCount, totalContacts) },
         stalled_in_incoming: { total: stalledIncomingCount, days: stalledDays },
       },
