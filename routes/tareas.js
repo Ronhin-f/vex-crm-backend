@@ -35,6 +35,7 @@ function getBearer(req) { return req.headers?.authorization || null; }
 /* ---------- dominios ---------- */
 const VALID_ESTADOS = ["todo", "doing", "waiting", "done"];
 const VALID_PRIORIDADES = ["alta", "media", "baja"];
+const KANBAN_ORDER = ["todo", "doing", "waiting", "done"];
 const normEstado = (v) => {
   const x = String(v ?? "todo").toLowerCase();
   return VALID_ESTADOS.includes(x) ? x : "todo";
@@ -96,6 +97,21 @@ function orderSql(cols) {
   const ordenExpr = cols.has("orden") ? `t.orden ASC` : `1`;
   const createdExpr = cols.has("created_at") ? `t.created_at DESC NULLS LAST` : `t.id DESC`;
   return `${estadoCase}, ${prioridadCase}, ${dueExpr}, ${ordenExpr}, ${createdExpr}, t.id DESC`;
+}
+
+function emptyKanban() {
+  return {
+    ok: true,
+    items: [],
+    columns: { todo: [], doing: [], waiting: [], done: [] },
+    order: KANBAN_ORDER,
+    lanes: [
+      { id: "todo", title: "Por hacer", items: [] },
+      { id: "doing", title: "En curso", items: [] },
+      { id: "waiting", title: "En espera", items: [] },
+      { id: "done", title: "Hecho", items: [] },
+    ],
+  };
 }
 
 /* =========================== GET LIST =========================== */
@@ -185,6 +201,90 @@ router.get("/", authenticateToken, async (req, res) => {
   } catch (e) {
     console.error("[GET /tareas]", e?.stack || e?.message || e);
     res.status(200).json([]);
+  }
+});
+
+/* ======================= GET /tareas/kanban (alias) ======================= */
+router.get("/kanban", authenticateToken, async (req, res) => {
+  try {
+    if (!(await hasTable("tareas"))) return res.status(200).json(emptyKanban());
+    const tCols = await tableColumns("tareas");
+    const hasClientes = await hasTable("clientes");
+    const cCols = hasClientes ? await tableColumns("clientes") : new Set();
+
+    const { organizacion_id } = getUserFromReq(req);
+    const params = [];
+    const where = [];
+    if (tCols.has("organizacion_id") && organizacion_id != null) {
+      params.push(organizacion_id);
+      where.push(`t.organizacion_id::text = $${params.length}::text`);
+    }
+
+    const sel = (col, asType = "text") => {
+      if (tCols.has(col)) return `t.${col}`;
+      if (asType === "timestamptz") return "NULL::timestamptz";
+      if (asType === "int") return "NULL::int";
+      if (asType === "bool") return "FALSE::boolean";
+      return "NULL::text";
+    };
+
+    const r = await q(
+      `SELECT
+         ${sel("id", "int")} AS id,
+         ${sel("titulo")} AS titulo,
+         ${sel("descripcion")} AS descripcion,
+         ${
+           tCols.has("estado")
+             ? "t.estado"
+             : tCols.has("completada")
+               ? "CASE WHEN t.completada THEN 'done' ELSE 'todo' END AS estado"
+               : "'todo' AS estado"
+         },
+         ${tCols.has("orden") ? "t.orden" : "0 AS orden"},
+         ${sel("completada", "bool")} AS completada,
+         ${sel("vence_en", "timestamptz")} AS vence_en,
+         ${sel("created_at", "timestamptz")} AS created_at,
+         ${sel("cliente_id", "int")} AS cliente_id,
+         ${sel("usuario_email")} AS usuario_email,
+         ${hasClientes && cCols.has("nombre") ? "c.nombre" : "NULL::text"} AS cliente_nombre
+       FROM tareas t
+       ${hasClientes ? "LEFT JOIN clientes c ON c.id = t.cliente_id" : ""}
+       ${where.length ? "WHERE " + where.join(" AND ") : ""}
+       ORDER BY ${tCols.has("estado") ? "t.estado ASC," : ""} ${tCols.has("orden") ? "t.orden ASC," : ""} ${tCols.has("created_at") ? "t.created_at DESC NULLS LAST," : ""} t.id DESC`,
+      params
+    );
+
+    const rows = r.rows || [];
+    const items = rows.map((row) => ({
+      id: row.id,
+      titulo: row.titulo,
+      descripcion: row.descripcion,
+      estado: row.estado || "todo",
+      orden: row.orden ?? 0,
+      completada: !!row.completada,
+      vence_en: row.vence_en,
+      created_at: row.created_at,
+      cliente_id: row.cliente_id,
+      cliente_nombre: row.cliente_nombre || null,
+      usuario_email: row.usuario_email || null,
+    }));
+
+    const columns = { todo: [], doing: [], waiting: [], done: [] };
+    for (const it of items) {
+      const lane = columns[it.estado] ? it.estado : "todo";
+      columns[lane].push(it);
+    }
+    const lanes = [
+      { id: "todo", title: "Por hacer", items: columns.todo },
+      { id: "doing", title: "En curso", items: columns.doing },
+      { id: "waiting", title: "En espera", items: columns.waiting },
+      { id: "done", title: "Hecho", items: columns.done },
+    ];
+
+    res.json({ ok: true, items, columns, order: KANBAN_ORDER, lanes });
+  } catch (e) {
+    console.error("[GET /tareas/kanban]", e?.stack || e?.message || e);
+    res.status(200).json(emptyKanban());
   }
 });
 
@@ -339,6 +439,88 @@ router.post("/", authenticateToken, async (req, res) => {
   }
 });
 
+/* ================= PATCH /tareas/:id/state (alias kanban) ================= */
+router.patch("/:id/state", authenticateToken, async (req, res) => {
+  try {
+    if (!(await hasTable("tareas"))) return res.status(404).json({ message: "Tabla tareas no existe" });
+    const tCols = await tableColumns("tareas");
+    const { organizacion_id } = getUserFromReq(req);
+
+    const id = toInt(req.params.id);
+    let { estado, orden } = req.body || {};
+    if (id == null) return res.status(400).json({ message: "ID inválido" });
+
+    estado = normEstado(estado);
+
+    if (orden == null && tCols.has("orden")) {
+      const p = [estado];
+      let w = `estado = $1`;
+      if (tCols.has("organizacion_id") && organizacion_id != null) {
+        p.push(organizacion_id);
+        w += ` AND organizacion_id::text = $${p.length}::text`;
+      }
+      const mr = await q(`SELECT COALESCE(MAX(orden),0) AS m FROM tareas WHERE ${w}`, p);
+      orden = (mr.rows?.[0]?.m ?? 0) + 1;
+    } else if (orden == null) {
+      orden = 0;
+    }
+
+    const sets = [];
+    const params = [];
+    let idx = 1;
+
+    if (tCols.has("estado")) {
+      sets.push(`estado = $${idx++}`);
+      params.push(estado);
+    }
+    if (tCols.has("orden")) {
+      sets.push(`orden = $${idx++}`);
+      params.push(orden);
+    }
+    if (tCols.has("completada")) {
+      sets.push(`completada = $${idx++}`);
+      params.push(estado === "done");
+    }
+    if (tCols.has("updated_at")) {
+      sets.push(`updated_at = NOW()`);
+    }
+
+    params.push(id);
+    let where = `id = $${idx++}`;
+    if (tCols.has("organizacion_id") && organizacion_id != null) {
+      params.push(organizacion_id);
+      where += ` AND organizacion_id::text = $${idx++}::text`;
+    }
+
+    // Placeholder extra para computar estado en RETURNING si no hay columna
+    const estadoParamIndex = params.length + 1;
+    params.push(estado);
+
+    const r = await q(
+      `UPDATE tareas SET ${sets.join(", ")} WHERE ${where}
+       RETURNING
+         id,
+         ${tCols.has("titulo") ? "titulo" : "NULL::text AS titulo"},
+         ${tCols.has("descripcion") ? "descripcion" : "NULL::text AS descripcion"},
+         ${tCols.has("cliente_id") ? "cliente_id" : "NULL::int AS cliente_id"},
+         ${tCols.has("usuario_email") ? "usuario_email" : "NULL::text AS usuario_email"},
+         ${tCols.has("vence_en") ? "vence_en" : "NULL::timestamptz AS vence_en"},
+         ${tCols.has("prioridad") ? "prioridad" : "NULL::text AS prioridad"},
+         ${tCols.has("created_at") ? "created_at" : "NULL::timestamptz AS created_at"},
+         ${tCols.has("updated_at") ? "updated_at" : "NULL::timestamptz AS updated_at"},
+         ${tCols.has("estado") ? "estado" : `CASE WHEN $${estadoParamIndex}='done' THEN 'done' ELSE 'todo' END AS estado`},
+         ${tCols.has("orden") ? "orden" : "0 AS orden"},
+         ${tCols.has("completada") ? "completada" : `($${estadoParamIndex}='done') AS completada`}`,
+      params
+    );
+    if (!r.rowCount) return res.status(404).json({ message: "Tarea no encontrada" });
+    res.json(r.rows[0]);
+  } catch (e) {
+    console.error("[PATCH /tareas/:id/state]", e?.stack || e?.message || e);
+    res.status(500).json({ message: "Error moviendo tarea" });
+  }
+});
+
 /* ========== UPDATE genérico: PATCH y PUT comparten lógica ========== */
 async function updateTaskGeneric(req, res, { emptyAsComplete = false } = {}) {
   try {
@@ -397,20 +579,22 @@ async function updateTaskGeneric(req, res, { emptyAsComplete = false } = {}) {
       const rDone = await q(
         `UPDATE tareas SET ${sets.join(", ")}
          WHERE id=$1 AND organizacion_id::text=$2::text
-         RETURNING ${[
-           "id",
-           exp(tCols, "titulo", "text"),
-           exp(tCols, "descripcion", "text"),
-           exp(tCols, "cliente_id", "int"),
-           exp(tCols, "estado", "text"),
-           exp(tCols, "prioridad", "text"),
-           exp(tCols, "orden", "int"),
-           exp(tCols, "vence_en", "timestamptz"),
-           exp(tCols, "completada", "bool"),
-           exp(tCols, "created_at", "timestamptz"),
-           exp(tCols, "updated_at", "timestamptz"),
-           exp(tCols, "usuario_email", "text"),
-         ].join(", ")}`,
+         RETURNING ${
+           [
+             "id",
+             exp(tCols, "titulo", "text"),
+             exp(tCols, "descripcion", "text"),
+             exp(tCols, "cliente_id", "int"),
+             exp(tCols, "estado", "text"),
+             exp(tCols, "prioridad", "text"),
+             exp(tCols, "orden", "int"),
+             exp(tCols, "vence_en", "timestamptz"),
+             exp(tCols, "completada", "bool"),
+             exp(tCols, "created_at", "timestamptz"),
+             exp(tCols, "updated_at", "timestamptz"),
+             exp(tCols, "usuario_email", "text"),
+           ].join(", ")
+         }`,
         [id, organizacion_id]
       );
       if (!rDone.rowCount) return res.status(404).json({ message: "Tarea no encontrada" });
@@ -447,20 +631,22 @@ async function updateTaskGeneric(req, res, { emptyAsComplete = false } = {}) {
       UPDATE tareas
          SET ${sets.join(", ")}
        WHERE id = $${values.length - 1} AND organizacion_id::text = $${values.length}::text
-       RETURNING ${[
-         "id",
-         exp(tCols, "titulo", "text"),
-         exp(tCols, "descripcion", "text"),
-         exp(tCols, "cliente_id", "int"),
-         exp(tCols, "estado", "text"),
-         exp(tCols, "prioridad", "text"),
-         exp(tCols, "orden", "int"),
-         exp(tCols, "vence_en", "timestamptz"),
-         exp(tCols, "completada", "bool"),
-         exp(tCols, "created_at", "timestamptz"),
-         exp(tCols, "updated_at", "timestamptz"),
-         exp(tCols, "usuario_email", "text"),
-       ].join(", ")}
+       RETURNING ${
+         [
+           "id",
+           exp(tCols, "titulo", "text"),
+           exp(tCols, "descripcion", "text"),
+           exp(tCols, "cliente_id", "int"),
+           exp(tCols, "estado", "text"),
+           exp(tCols, "prioridad", "text"),
+           exp(tCols, "orden", "int"),
+           exp(tCols, "vence_en", "timestamptz"),
+           exp(tCols, "completada", "bool"),
+           exp(tCols, "created_at", "timestamptz"),
+           exp(tCols, "updated_at", "timestamptz"),
+           exp(tCols, "usuario_email", "text"),
+         ].join(", ")
+       }
       `,
       values
     );
@@ -528,20 +714,22 @@ router.patch("/:id/assign", authenticateToken, async (req, res) => {
       UPDATE tareas
          SET ${sets.join(", ")}
        WHERE id = $2 AND organizacion_id::text = $3::text
-       RETURNING ${[
-         "id",
-         exp(tCols, "titulo", "text"),
-         exp(tCols, "descripcion", "text"),
-         exp(tCols, "cliente_id", "int"),
-         exp(tCols, "estado", "text"),
-         exp(tCols, "prioridad", "text"),
-         exp(tCols, "orden", "int"),
-         exp(tCols, "vence_en", "timestamptz"),
-         exp(tCols, "completada", "bool"),
-         exp(tCols, "created_at", "timestamptz"),
-         exp(tCols, "updated_at", "timestamptz"),
-         exp(tCols, "usuario_email", "text"),
-       ].join(", ")}
+       RETURNING ${
+         [
+           "id",
+           exp(tCols, "titulo", "text"),
+           exp(tCols, "descripcion", "text"),
+           exp(tCols, "cliente_id", "int"),
+           exp(tCols, "estado", "text"),
+           exp(tCols, "prioridad", "text"),
+           exp(tCols, "orden", "int"),
+           exp(tCols, "vence_en", "timestamptz"),
+           exp(tCols, "completada", "bool"),
+           exp(tCols, "created_at", "timestamptz"),
+           exp(tCols, "updated_at", "timestamptz"),
+           exp(tCols, "usuario_email", "text"),
+         ].join(", ")
+       }
       `,
       [usuario_email, id, organizacion_id]
     );
@@ -592,16 +780,18 @@ router.patch("/:id/toggle", authenticateToken, async (req, res) => {
 
     const cur = await q(
       `
-      SELECT ${[
-        "id",
-        exp(tCols, "completada", "bool"),
-        exp(tCols, "estado", "text"),
-        exp(tCols, "prioridad", "text"),
-        exp(tCols, "orden", "int"),
-        exp(tCols, "vence_en", "timestamptz"),
-        exp(tCols, "titulo", "text"),
-        exp(tCols, "usuario_email", "text"),
-      ].join(", ")}
+      SELECT ${
+        [
+          "id",
+          exp(tCols, "completada", "bool"),
+          exp(tCols, "estado", "text"),
+          exp(tCols, "prioridad", "text"),
+          exp(tCols, "orden", "int"),
+          exp(tCols, "vence_en", "timestamptz"),
+          exp(tCols, "titulo", "text"),
+          exp(tCols, "usuario_email", "text"),
+        ].join(", ")
+      }
         FROM tareas t
        WHERE t.id=$1 AND t.organizacion_id::text=$2::text
       `,
@@ -634,20 +824,22 @@ router.patch("/:id/toggle", authenticateToken, async (req, res) => {
       UPDATE tareas
          SET ${sets.join(", ")}
        WHERE id=$2 AND organizacion_id::text=$3::text
-       RETURNING ${[
-         "id",
-         exp(tCols, "titulo", "text"),
-         exp(tCols, "descripcion", "text"),
-         exp(tCols, "cliente_id", "int"),
-         exp(tCols, "estado", "text"),
-         exp(tCols, "prioridad", "text"),
-         exp(tCols, "orden", "int"),
-         exp(tCols, "vence_en", "timestamptz"),
-         exp(tCols, "completada", "bool"),
-         exp(tCols, "created_at", "timestamptz"),
-         exp(tCols, "updated_at", "timestamptz"),
-         exp(tCols, "usuario_email", "text"),
-       ].join(", ")}
+       RETURNING ${
+         [
+           "id",
+           exp(tCols, "titulo", "text"),
+           exp(tCols, "descripcion", "text"),
+           exp(tCols, "cliente_id", "int"),
+           exp(tCols, "estado", "text"),
+           exp(tCols, "prioridad", "text"),
+           exp(tCols, "orden", "int"),
+           exp(tCols, "vence_en", "timestamptz"),
+           exp(tCols, "completada", "bool"),
+           exp(tCols, "created_at", "timestamptz"),
+           exp(tCols, "updated_at", "timestamptz"),
+           exp(tCols, "usuario_email", "text"),
+         ].join(", ")
+       }
       `,
       params
     );
@@ -725,15 +917,17 @@ router.patch("/reorder", authenticateToken, async (req, res) => {
                organizacion_id = organizacion_id
          WHERE id IN (${inHolders.join(", ")})
            AND organizacion_id::text = $${params.length}::text
-         RETURNING id, ${[
-           exp(tCols, "titulo", "text"),
-           exp(tCols, "estado", "text"),
-           exp(tCols, "prioridad", "text"),
-           exp(tCols, "orden", "int"),
-           exp(tCols, "vence_en", "timestamptz"),
-           exp(tCols, "usuario_email", "text"),
-           exp(tCols, "updated_at", "timestamptz"),
-         ].join(", ")}
+         RETURNING id, ${
+           [
+             exp(tCols, "titulo", "text"),
+             exp(tCols, "estado", "text"),
+             exp(tCols, "prioridad", "text"),
+             exp(tCols, "orden", "int"),
+             exp(tCols, "vence_en", "timestamptz"),
+             exp(tCols, "usuario_email", "text"),
+             exp(tCols, "updated_at", "timestamptz"),
+           ].join(", ")
+         }
         `,
         params
       );
@@ -745,14 +939,16 @@ router.patch("/reorder", authenticateToken, async (req, res) => {
            SET estado = $1
          WHERE id = ANY($2::int[])
            AND organizacion_id::text = $3::text
-         RETURNING id, ${[
-           exp(tCols, "titulo", "text"),
-           exp(tCols, "estado", "text"),
-           exp(tCols, "prioridad", "text"),
-           exp(tCols, "vence_en", "timestamptz"),
-           exp(tCols, "usuario_email", "text"),
-           exp(tCols, "updated_at", "timestamptz"),
-         ].join(", ")}
+         RETURNING id, ${
+           [
+             exp(tCols, "titulo", "text"),
+             exp(tCols, "estado", "text"),
+             exp(tCols, "prioridad", "text"),
+             exp(tCols, "vence_en", "timestamptz"),
+             exp(tCols, "usuario_email", "text"),
+             exp(tCols, "updated_at", "timestamptz"),
+           ].join(", ")
+         }
         `,
         [estado, ids, organizacion_id]
       );
@@ -804,14 +1000,16 @@ router.delete("/:id", authenticateToken, async (req, res) => {
 
     const prev = await q(
       `
-      SELECT ${[
-        "id",
-        exp(tCols, "titulo", "text"),
-        exp(tCols, "estado", "text"),
-        exp(tCols, "prioridad", "text"),
-        exp(tCols, "vence_en", "timestamptz"),
-        exp(tCols, "usuario_email", "text"),
-      ].join(", ")}
+      SELECT ${
+        [
+          "id",
+          exp(tCols, "titulo", "text"),
+          exp(tCols, "estado", "text"),
+          exp(tCols, "prioridad", "text"),
+          exp(tCols, "vence_en", "timestamptz"),
+          exp(tCols, "usuario_email", "text"),
+        ].join(", ")
+      }
         FROM tareas t
        WHERE t.id=$1 AND t.organizacion_id::text=$2::text
       `,
