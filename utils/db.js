@@ -97,19 +97,24 @@ export async function q(text, params = []) {
  *  Helpers de migración
  * =========================== */
 async function ensureOrgText(table) {
-  const r = await q(
-    `SELECT data_type
-       FROM information_schema.columns
-      WHERE table_schema='public' AND table_name=$1 AND column_name='organizacion_id'`,
-    [table]
-  );
-  const t = r.rows?.[0]?.data_type;
-  if (t && t !== "text") {
-    await q(
-      `ALTER TABLE public.${table}
-         ALTER COLUMN organizacion_id TYPE TEXT
-         USING organizacion_id::text;`
+  try {
+    const r = await q(
+      `SELECT data_type
+         FROM information_schema.columns
+        WHERE table_schema='public' AND table_name=$1 AND column_name='organizacion_id'`,
+      [table]
     );
+    const t = r.rows?.[0]?.data_type;
+    if (t && t !== "text") {
+      await q(
+        `ALTER TABLE public.${table}
+           ALTER COLUMN organizacion_id TYPE TEXT
+           USING organizacion_id::text;`
+      );
+    }
+  } catch (e) {
+    // Si hay vistas/reglas dependientes, no frenamos el boot; logueamos y seguimos.
+    console.warn(`[ensureOrgText] skip ${table}: ${e?.message || e}`);
   }
 }
 

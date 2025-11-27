@@ -738,8 +738,7 @@ router.patch("/tareas/:id/move", authenticateToken, async (req, res) => {
     }
 
     // Aseguramos placeholder válido para el estado en el RETURNING cuando no hay columna 'estado'
-    const estadoParamIndex = params.length + 1;
-    params.push(estado);
+    const estadoParamIndex = 1; // el primer placeholder (estado) ya está en params
 
     const returnEstadoExpr = tCols.has("estado")
       ? "estado"

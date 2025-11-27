@@ -217,22 +217,22 @@ router.get("/kpis", authenticateToken, nocache, async (req, res) => {
     if (hasTareas) {
       const tasksOverdue = await q(
         `SELECT COUNT(*)::int AS overdue
-           FROM tareas
-          WHERE completada = FALSE
-            AND vence_en IS NOT NULL
-            AND vence_en < NOW()
-            AND organizacion_id::text = $1::text`,
+           FROM tareas t
+          WHERE t.completada = FALSE
+            AND t.vence_en IS NOT NULL
+            AND t.vence_en < NOW()
+            AND t.organizacion_id::text = $1::text`,
         [orgId]
       );
       tasks_overdue = num(tasksOverdue.rows?.[0]?.overdue, 0);
 
       const tasksNext7d = await q(
         `SELECT COUNT(*)::int AS due_next_7d
-           FROM tareas
-          WHERE completada = FALSE
-            AND vence_en IS NOT NULL
-            AND vence_en <= NOW() + INTERVAL '7 days'
-            AND organizacion_id::text = $1::text`,
+           FROM tareas t
+          WHERE t.completada = FALSE
+            AND t.vence_en IS NOT NULL
+            AND t.vence_en <= NOW() + INTERVAL '7 days'
+            AND t.organizacion_id::text = $1::text`,
         [orgId]
       );
       tasks_next_7d = num(tasksNext7d.rows?.[0]?.due_next_7d, 0);

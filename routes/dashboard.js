@@ -248,7 +248,12 @@ router.get("/", auth, async (req, res) => {
     /* ======= First touch (p50/avg en minutos) ======= */
     try {
       if (hasClientes && hasTareas && colsClientes.has("created_at") && colsTareas.has("created_at") && colsTareas.has("cliente_id")) {
-        const { where: wc, params: pc } = orgFilterText(colsClientes, orgId);
+        const pc = [];
+        const wc = [];
+        if (orgId && colsClientes.has("organizacion_id")) {
+          pc.push(String(orgId));
+          wc.push(`c.organizacion_id::text = $${pc.length}::text`);
+        }
         const condCli = wc.length ? `WHERE ${wc.join(" AND ")}` : "";
 
         // Si ambas tienen organizacion_id, forzamos join por org también
@@ -387,8 +392,12 @@ router.get("/", auth, async (req, res) => {
     /* ======= Próximos seguimientos (<= 7 días) ======= */
     try {
       if (hasTareas && colsTareas.has("vence_en") && colsTareas.has("completada")) {
-        const { where, params } = orgFilterText(colsTareas, orgId);
-        const w = where.length ? ` AND ${where.join(" AND ")}` : "";
+        const params = [];
+        const where = [];
+        if (orgId && colsTareas.has("organizacion_id")) {
+          params.push(String(orgId));
+          where.push(`t.organizacion_id::text = $${params.length}::text`);
+        }
         const joinCli = await hasTable("clientes"); // opcional
         const colsCli = joinCli ? await tableColumns("clientes") : new Set();
 
@@ -410,7 +419,8 @@ router.get("/", auth, async (req, res) => {
             ${joinCli ? `LEFT JOIN clientes c ON c.id = t.cliente_id${joinOrg}` : ""}
             WHERE t.completada = FALSE
               AND t.vence_en IS NOT NULL
-              AND t.vence_en <= NOW() + INTERVAL '7 days' ${w}
+              AND t.vence_en <= NOW() + INTERVAL '7 days'
+              ${where.length ? "AND " + where.join(" AND ") : ""}
             ORDER BY t.vence_en ASC NULLS LAST, t.id DESC
             LIMIT 20
             `,
