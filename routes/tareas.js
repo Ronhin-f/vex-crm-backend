@@ -395,17 +395,17 @@ router.post("/", authenticateToken, async (req, res) => {
       `INSERT INTO tareas (${fields.join(",")}) VALUES (${placeholders})
        RETURNING id, ${
          [
-           exp(tCols, "titulo", "text"),
-           exp(tCols, "descripcion", "text"),
-           exp(tCols, "cliente_id", "int"),
-           exp(tCols, "estado", "text"),
-           exp(tCols, "prioridad", "text"),
-           exp(tCols, "orden", "int"),
-           exp(tCols, "vence_en", "timestamptz"),
-           exp(tCols, "completada", "bool"),
-           exp(tCols, "created_at", "timestamptz"),
-           exp(tCols, "updated_at", "timestamptz"),
-           exp(tCols, "usuario_email", "text"),
+           tCols.has("titulo") ? "titulo" : "NULL::text AS titulo",
+           tCols.has("descripcion") ? "descripcion" : "NULL::text AS descripcion",
+           tCols.has("cliente_id") ? "cliente_id" : "NULL::int AS cliente_id",
+           tCols.has("estado") ? "estado" : "NULL::text AS estado",
+           tCols.has("prioridad") ? "prioridad" : "NULL::text AS prioridad",
+           tCols.has("orden") ? "orden" : "0 AS orden",
+           tCols.has("vence_en") ? "vence_en" : "NULL::timestamptz AS vence_en",
+           tCols.has("completada") ? "completada" : "FALSE AS completada",
+           tCols.has("created_at") ? "created_at" : "NOW() AS created_at",
+           tCols.has("updated_at") ? "updated_at" : "NULL::timestamptz AS updated_at",
+           tCols.has("usuario_email") ? "usuario_email" : "NULL::text AS usuario_email",
          ].join(", ")
        }`,
       values
@@ -492,9 +492,8 @@ router.patch("/:id/state", authenticateToken, async (req, res) => {
       where += ` AND organizacion_id::text = $${idx++}::text`;
     }
 
-    // Placeholder extra para computar estado en RETURNING si no hay columna
-    const estadoParamIndex = params.length + 1;
-    params.push(estado);
+    // Placeholder para computar estado en RETURNING si no hay columna (reutiliza el 1er parámetro: estado)
+    const estadoParamIndex = 1;
 
     const r = await q(
       `UPDATE tareas SET ${sets.join(", ")} WHERE ${where}
