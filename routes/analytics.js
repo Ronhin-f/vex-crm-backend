@@ -43,12 +43,19 @@ async function regclassExists(name) {
 
 /* ---------- detección de tabla pipeline (con cache) ---------- */
 let PIPE_CACHE = { name: null, ts: 0 };
-async function pickPipelineTable() {
+async function pickPipelineTable(preferred) {
   const now = Date.now();
-  if (PIPE_CACHE.name && now - PIPE_CACHE.ts < 10 * 60 * 1000) return PIPE_CACHE.name;
+  if (PIPE_CACHE.name && now - PIPE_CACHE.ts < 10 * 60 * 1000 && !preferred) return PIPE_CACHE.name;
+
   const hasProy = await regclassExists("proyectos");
   const hasCli = await regclassExists("clientes");
-  const name = hasProy ? "proyectos" : hasCli ? "clientes" : null;
+
+  // override opcional via query (?pipeline_table=clientes|proyectos)
+  let name = null;
+  if (preferred === "proyectos" && hasProy) name = "proyectos";
+  else if (preferred === "clientes" && hasCli) name = "clientes";
+  else name = hasProy ? "proyectos" : hasCli ? "clientes" : null;
+
   PIPE_CACHE = { name, ts: now };
   return name;
 }
@@ -85,6 +92,7 @@ router.get("/kpis", authenticateToken, nocache, async (req, res) => {
 
   try {
     const { fromISO, toISO } = parseRange(req.query);
+    const preferredPipe = req.query?.pipeline_table;
 
     // stalled_days seguro: entero >=1; si no, 7
     const stalledDays = (() => {
@@ -95,7 +103,7 @@ router.get("/kpis", authenticateToken, nocache, async (req, res) => {
 
     const hasClientes = await regclassExists("clientes");
     const hasTareas = await regclassExists("tareas");
-    const PIPE = await pickPipelineTable();
+    const PIPE = await pickPipelineTable(preferredPipe);
 
     // Sin clientes ni pipeline -> estructura vacía
     if (!hasClientes && !PIPE) {
@@ -268,8 +276,8 @@ router.get("/kpis", authenticateToken, nocache, async (req, res) => {
         : `($2::timestamptz IS NOT NULL AND $3::timestamptz IS NOT NULL)`;
 
       // condiciones won/lost robustas
-      const wonCond = `(${stageCol ? `${stageCol} ~* '^(won|ganad)'` : "FALSE"}${resultCol ? ` OR ${resultCol}='won'` : ""})`;
-      const lostCond = `(${stageCol ? `${stageCol} ~* '^(lost|perdid)'` : "FALSE"}${resultCol ? ` OR ${resultCol}='lost'` : ""})`;
+      const wonCond = `(${stageCol ? `${stageCol} ~* '(won|ganad|cerrad)'` : "FALSE"}${resultCol ? ` OR ${resultCol} ~* '^(won|ganad)'` : ""})`;
+      const lostCond = `(${stageCol ? `${stageCol} ~* '(lost|perdid|caid|cerrad)'` : "FALSE"}${resultCol ? ` OR ${resultCol} ~* '^(lost|perdid|caid)'` : ""})`;
 
       const bySourceSQL = `
         WITH agg AS (
@@ -314,6 +322,7 @@ router.get("/kpis", authenticateToken, nocache, async (req, res) => {
       pipeline_by_owner = byOwner.rows || [];
 
       const dateAggExpr = `COALESCE(${[closedCol, updatedCol, createdCol].filter(Boolean).join(", ") || "NULL"}, NOW())`;
+      // Cierres en rango
       const wonLostAgg = await q(
         `SELECT
            SUM(CASE WHEN ${wonCond}  THEN 1 ELSE 0 END)::int AS won,
@@ -324,8 +333,23 @@ router.get("/kpis", authenticateToken, nocache, async (req, res) => {
           AND ${dateAggExpr} <  $3::timestamptz`,
         [orgId, fromISO, toISO]
       );
-      const wonTotal = num(wonLostAgg.rows?.[0]?.won, 0);
-      const lostTotal = num(wonLostAgg.rows?.[0]?.lost, 0);
+      let wonTotal = num(wonLostAgg.rows?.[0]?.won, 0);
+      let lostTotal = num(wonLostAgg.rows?.[0]?.lost, 0);
+
+      // Si no hay cierres en el rango, calculamos lifetime como fallback
+      if (wonTotal + lostTotal === 0) {
+        const lifetime = await q(
+          `SELECT
+             SUM(CASE WHEN ${wonCond}  THEN 1 ELSE 0 END)::int AS won,
+             SUM(CASE WHEN ${lostCond} THEN 1 ELSE 0 END)::int AS lost
+           FROM ${PIPE}
+          WHERE organizacion_id::text = $1::text`,
+          [orgId]
+        );
+        wonTotal = num(lifetime.rows?.[0]?.won, 0);
+        lostTotal = num(lifetime.rows?.[0]?.lost, 0);
+      }
+
       const win_rate = wonTotal + lostTotal > 0 ? Math.round((wonTotal * 100) / (wonTotal + lostTotal)) : 0;
 
       const stagesAggSQL = `
@@ -334,7 +358,18 @@ router.get("/kpis", authenticateToken, nocache, async (req, res) => {
          WHERE organizacion_id::text = $1::text
            AND ${rangeClause}
          GROUP BY 1`;
-      const stagesAgg = await q(stagesAggSQL, [orgId, fromISO, toISO]);
+      let stagesAgg = await q(stagesAggSQL, [orgId, fromISO, toISO]);
+
+      // Fallback a lifetime si no hay datos en el rango
+      if (!(stagesAgg.rows || []).length) {
+        stagesAgg = await q(
+          `SELECT COALESCE(${stageCol ? stageCol : "'Uncategorized'"} ,'Uncategorized') AS stage, COUNT(*)::int AS total
+             FROM ${PIPE}
+            WHERE organizacion_id::text = $1::text
+            GROUP BY 1`,
+          [orgId]
+        );
+      }
 
       pipeline_summary = {
         won: wonTotal,
