@@ -12,20 +12,17 @@ import { authenticateToken as auth } from "./middleware/auth.js";
 import { scheduleReminders } from "./workers/reminders.worker.js";
 import { startOutboxDispatcher } from "./workers/outbox.dispatch.js";
 
-// ✅ Defaults útiles (no pisan Railway)
 process.env.SLACK_WEBHOOK_FALLBACK_CHANNEL ??= "#reminders-and-follow-ups";
 process.env.REMINDER_CRON ??= "*/10 * * * *";
-process.env.INVOICE_REMINDER_CRON ??= "0 * * * *"; // cada hora
+process.env.INVOICE_REMINDER_CRON ??= "0 * * * *";
 process.env.OUTBOX_DISPATCH_INTERVAL_MS ??= "60000";
 
 const app = express();
 app.set("trust proxy", true);
 
-// Parsers
 app.use(express.json({ limit: process.env.JSON_LIMIT || "1mb" }));
 app.use(express.urlencoded({ extended: false }));
 
-// Logs
 if (process.env.NODE_ENV !== "test") {
   app.use(
     morgan(process.env.LOG_FORMAT || "tiny", {
@@ -42,88 +39,74 @@ if (process.env.NODE_ENV !== "test") {
   );
 }
 
-// Seguridad (CORS + headers)
 applySecurity(app);
 
-// Estáticos (uploads para estimates/adjuntos)
 const UPLOAD_DIR = process.env.UPLOAD_DIR || path.join(process.cwd(), "uploads");
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 app.use("/uploads", express.static(UPLOAD_DIR));
 
-// Silenciar 404 de favicon en consola
 app.get("/favicon.ico", (_req, res) => res.status(204).end());
 
-/* ───────── Health & readiness ───────── */
 let dbReady = false;
 app.get("/healthz", (_req, res) => res.status(200).json({ ok: true, minimal: true }));
 app.get("/readyz", (_req, res) =>
   dbReady ? res.json({ ok: true }) : res.status(503).json({ ok: false, dbReady })
 );
 
-/* ───────── Migraciones mínimas + catálogo ───────── */
 try {
   await initDB();
-  await ensureInvoicesSchema(); // 🔹 esquema mínimo de invoices si aún no corriste migración
+  await ensureInvoicesSchema();
   dbReady = true;
 } catch (e) {
-  console.error("💥 initDB() falló:", e?.stack || e?.message || e);
-  // seguimos levantando el server; /readyz devolverá 503 hasta que esté OK
+  console.error("initDB() fallo:", e?.stack || e?.message || e);
 }
 
-/* ───────── Helper de montaje tolerante ───────── */
 async function mount(pathname, modulePath) {
   try {
     const mod = await import(modulePath);
-    const router = mod.default || mod.router || mod; // soporta default/named
+    const router = mod.default || mod.router || mod;
     if (router && typeof router === "function") {
       app.use(pathname, router);
-      console.log(`✅ Ruta montada: ${pathname} <- ${modulePath}`);
+      console.log(`Ruta montada: ${pathname} <- ${modulePath}`);
     } else {
-      console.warn(`⚠️  ${modulePath} no exporta un router válido. Stub 501 en ${pathname}`);
+      console.warn(`${modulePath} no exporta un router valido. Stub 501 en ${pathname}`);
       app.use(pathname, (_req, res) => res.status(501).json({ error: "Ruta no disponible" }));
     }
   } catch (e) {
-    console.error(`💥 Error importando ${modulePath}:`, e?.stack || e?.message || e);
-    app.use(pathname, (_req, res) => res.status(500).json({ error: "Ruta falló al cargar" }));
+    console.error(`Error importando ${modulePath}:`, e?.stack || e?.message || e);
+    app.use(pathname, (_req, res) => res.status(500).json({ error: "Ruta fallo al cargar" }));
   }
 }
 
-/* ───────── Montaje de rutas existentes ───────── */
-await mount("/clientes",       "./routes/clientes.js");
-await mount("/proyectos",      "./routes/proyectos.js");          // pipeline basado en proyectos
-await mount("/proyectos",      "./routes/proyectos.assign.js");   // reasignación + follow-up
-await mount("/proveedores",    "./routes/proveedores.js");        // proveedores/subcontratistas
+await mount("/clientes", "./routes/clientes.js");
+await mount("/proyectos", "./routes/proyectos.js");
+await mount("/proyectos", "./routes/proyectos.assign.js");
+await mount("/proveedores", "./routes/proveedores.js");
 
-// 🔑 Usuarios (para "Asignado a" en Tareas)
-await mount("/users",          "./routes/users.js");              // principal
-await mount("/usuarios",       "./routes/users.js");              // alias de compat
+await mount("/users", "./routes/users.js");
+await mount("/usuarios", "./routes/users.js");
 
-// Legacy/compat
-await mount("/compras",        "./routes/compras.js");
+await mount("/compras", "./routes/compras.js");
 
-// CRM utilidades
-await mount("/categorias",     "./routes/categorias.js");
-await mount("/kanban",         "./routes/kanban.js");             // Kanban + KPIs
-await mount("/tareas",         "./routes/tareas.js");
-await mount("/dashboard",      "./routes/dashboard.js");
+await mount("/categorias", "./routes/categorias.js");
+await mount("/kanban", "./routes/kanban.js");
+await mount("/tareas", "./routes/tareas.js");
+await mount("/dashboard", "./routes/dashboard.js");
 
-// KPIs consolidados
-await mount("/analytics",      "./routes/analytics.js");
+await mount("/analytics", "./routes/analytics.js");
 
-// Integraciones y otros
-await mount("/upload",         "./routes/upload.js");
-await mount("/modulos",        "./routes/modulos.js");
-await mount("/integraciones",  "./routes/integraciones.js");
-// Ojo con el nombre del archivo real:
-await mount("/jobs",           "./routes/job.js");                // si es jobs.js, cambiá aquí a "./routes/jobs.js"
-await mount("/ai",             "./routes/ai.js");
-await mount("/health",         "./routes/health.js");
+await mount("/upload", "./routes/upload.js");
+await mount("/modulos", "./routes/modulos.js");
+await mount("/integraciones", "./routes/integraciones.js");
+await mount("/jobs", "./routes/job.js");
+await mount("/ai", "./routes/ai.js");
+await mount("/health", "./routes/health.js");
 
-// 🔌 Endpoint público (funnel web → leads)
-await mount("/web",            "./routes/web.js");
+await mount("/area", "./routes/area.js");
+await mount("/historias", "./routes/historias.js");
 
-/* ───────── Invoices (inline router) ───────── */
-// middleware multi-tenant (corrige req.user → req.usuario)
+await mount("/web", "./routes/web.js");
+
 function withOrg(req, res, next) {
   const org =
     req.usuario?.organizacion_id ||
@@ -132,19 +115,17 @@ function withOrg(req, res, next) {
     null;
 
   if (!org) return res.status(400).json({ error: "organizacion_id requerido" });
-  req.orgId = String(org); // mantenemos TEXT por ahora
+  req.orgId = String(org);
   next();
 }
 
-// formateo seguro de montos
 const N = (x) => Number(x ?? 0);
 
-// minimal flows client
 async function notifyFlows(type, payload) {
   const base = process.env.FLOWS_BASE_URL;
   const token = process.env.FLOWS_BEARER;
   if (!base || !token) {
-    console.warn("⚠️  Flows no configurado (FLOWS_BASE_URL/FLOWS_BEARER). Se omite envío.");
+    console.warn("Flows no configurado (FLOWS_BASE_URL/FLOWS_BEARER). Se omite envio.");
     return { skipped: true };
   }
   await axios.post(
@@ -154,7 +135,6 @@ async function notifyFlows(type, payload) {
   );
 }
 
-// GET /invoices
 app.get("/invoices", auth, withOrg, async (req, res) => {
   const { rows } = await q(
     `
@@ -169,7 +149,6 @@ app.get("/invoices", auth, withOrg, async (req, res) => {
   res.json(rows);
 });
 
-// POST /invoices
 app.post("/invoices", auth, withOrg, async (req, res) => {
   const b = req.body || {};
   const { rows } = await q(
@@ -199,7 +178,6 @@ app.post("/invoices", auth, withOrg, async (req, res) => {
   res.status(201).json(rows[0]);
 });
 
-// POST /invoices/:id/remind  → cola recordatorio vía Flows
 app.post("/invoices/:id/remind", auth, withOrg, async (req, res) => {
   const { id } = req.params;
   const { rows } = await q(
@@ -227,47 +205,34 @@ app.post("/invoices/:id/remind", auth, withOrg, async (req, res) => {
   res.status(202).json({ queued: true });
 });
 
-/* ───────── Home / 404 / errores ───────── */
 app.get("/", (_req, res) => res.json({ ok: true, service: "vex-crm-backend" }));
 app.use((_req, res) => res.status(404).json({ error: "Not found" }));
 
-// Handler global
-/* eslint-disable no-unused-vars */
 app.use((err, _req, res, _next) => {
-  console.error("🔥 Unhandled error:", err?.stack || err?.message || err);
+  console.error("Unhandled error:", err?.stack || err?.message || err);
   res.status(500).json({ error: "Internal error" });
 });
-/* eslint-enable no-unused-vars */
 
-// Hardening
 process.on("unhandledRejection", (e) => console.error("UNHANDLED REJECTION:", e));
-process.on("uncaughtException",  (e) => console.error("UNCAUGHT EXCEPTION:", e));
+process.on("uncaughtException", (e) => console.error("UNCAUGHT EXCEPTION:", e));
 
-/* ───────── Schedulers ───────── */
 scheduleReminders();
 console.log(
-  `🕒 Reminders ON cron=${process.env.REMINDER_CRON} tz=America/Argentina/Mendoza | fallbackChannel=${process.env.SLACK_WEBHOOK_FALLBACK_CHANNEL || "(none)"}`
+  `Reminders ON cron=${process.env.REMINDER_CRON} tz=America/Argentina/Mendoza | fallbackChannel=${process.env.SLACK_WEBHOOK_FALLBACK_CHANNEL || "(none)"}`
 );
 
-// worker de recordatorios de invoices con advisory lock
 startInvoiceReminders();
 console.log(
-  `🕒 InvoiceReminders ON cron=${process.env.INVOICE_REMINDER_CRON} tz=${process.env.TZ || "UTC"}`
+  `InvoiceReminders ON cron=${process.env.INVOICE_REMINDER_CRON} tz=${process.env.TZ || "UTC"}`
 );
 
-// 🚚 Outbox dispatcher (cada OUTBOX_DISPATCH_INTERVAL_MS ms)
 startOutboxDispatcher();
-console.log(`🚚 Outbox ON interval=${process.env.OUTBOX_DISPATCH_INTERVAL_MS}ms`);
+console.log(`Outbox ON interval=${process.env.OUTBOX_DISPATCH_INTERVAL_MS}ms`);
 
-// Start
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`✅ VEX CRM en :${PORT} | dbReady=${dbReady}`));
+app.listen(PORT, () => console.log(`VEX CRM en :${PORT} | dbReady=${dbReady}`));
 
-/* =========================================================
- * Helpers locales: esquema invoices + worker reminders
- * =======================================================*/
 async function ensureInvoicesSchema() {
-  // indispensable para gen_random_uuid()
   await q(`CREATE EXTENSION IF NOT EXISTS pgcrypto;`);
 
   await q(`DO $$ BEGIN
@@ -323,7 +288,7 @@ async function ensureInvoicesSchema() {
 function startInvoiceReminders() {
   const CRON = process.env.INVOICE_REMINDER_CRON || "0 * * * *";
   const TZ = process.env.TZ || "UTC";
-  const LOCK = 842510; // advisory lock
+  const LOCK = 842510;
 
   cron.schedule(
     CRON,
@@ -356,9 +321,9 @@ function startInvoiceReminders() {
             AND (last_reminder_at IS NULL OR last_reminder_at < now() - interval '20 hours')
         `);
 
-        const N = (x) => Number(x ?? 0);
+        const Nnum = (x) => Number(x ?? 0);
         for (const i of rows) {
-          const due = Math.max(N(i.amount_total) - N(i.amount_paid), 0);
+          const due = Math.max(Nnum(i.amount_total) - Nnum(i.amount_paid), 0);
           await notifyFlows("invoice_reminder", {
             org: i.organizacion_id,
             invoiceId: i.id,
@@ -372,7 +337,7 @@ function startInvoiceReminders() {
           );
         }
       } catch (e) {
-        console.error("💥 InvoiceReminders error:", e?.message || e);
+        console.error("InvoiceReminders error:", e?.message || e);
       } finally {
         await c.query("SELECT pg_advisory_unlock($1)", [LOCK]).catch(() => {});
         c.release();

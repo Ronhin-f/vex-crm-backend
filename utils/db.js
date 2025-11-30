@@ -5,9 +5,9 @@ const { Pool, types } = pg;
 /* ===========================
  *  Parsers & defaults
  * =========================== */
-// NUMERIC → Number (evita strings en totales/amounts)
-types.setTypeParser(1700, (v) => (v == null ? null : parseFloat(v))); // NUMERIC
-// INT8 → Number (si lo usáramos para counts)
+// NUMERIC -> Number (evita strings en totales/amounts)
+types.setTypeParser(1700, (v) => (v == null ? null : parseFloat(v)));
+// INT8 -> Number (si lo usaramos para counts)
 types.setTypeParser(20, (v) => (v == null ? null : parseInt(v, 10)));
 
 /* ===========================
@@ -34,12 +34,12 @@ function envNum(name, def = 0) {
 }
 function envStr(name, def = "") {
   const v = process.env[name];
-  return (v == null || v === "") ? def : String(v);
+  return v == null || v === "" ? def : String(v);
 }
 
 function buildPoolConfig() {
   let cs = process.env.DATABASE_URL;
-  if (!cs) throw new Error("DATABASE_URL no está definido");
+  if (!cs) throw new Error("DATABASE_URL no esta definido");
 
   // Detecta sslmode desde la cadena o desde env
   const m = /sslmode=([^&]+)/i.exec(cs || "");
@@ -47,14 +47,14 @@ function buildPoolConfig() {
   const envSslMode = (process.env.PGSSLMODE || "").toLowerCase();
   const dbSslFlag = envBool("DB_SSL", process.env.NODE_ENV === "production" ? "true" : "false");
 
-  // En producción, por defecto 'require'
+  // En produccion, por defecto 'require'
   const defaultSslMode = process.env.NODE_ENV === "production" ? "require" : "disable";
   const sslMode = urlSslMode || envSslMode || (dbSslFlag ? "require" : defaultSslMode);
 
   const sslRequired = !["disable", "off", "allow"].includes(sslMode);
 
   // Compat con entornos donde hay certificados self-signed
-  // Prioridad: PGSSL_REJECT_UNAUTHORIZED (explícito) > DB_SSL_NO_VERIFY > NODE_ENV
+  // Prioridad: PGSSL_REJECT_UNAUTHORIZED (explicito) > DB_SSL_NO_VERIFY > NODE_ENV
   const rejectUnauthorized = !envBool(
     "PGSSL_REJECT_UNAUTHORIZED",
     envBool("DB_SSL_NO_VERIFY", process.env.NODE_ENV === "production" ? "false" : "true") ? "false" : "true"
@@ -69,17 +69,15 @@ function buildPoolConfig() {
     connectionTimeoutMillis: envNum("PG_CONNECT_TIMEOUT", 10_000),
     keepAlive: true,
     keepAliveInitialDelayMillis: envNum("PG_KEEPALIVE_DELAY", 10_000),
-    statement_timeout: envNum("PG_STMT_TIMEOUT", 0), // 0 = sin timeout
+    statement_timeout: envNum("PG_STMT_TIMEOUT", 0),
     query_timeout: envNum("PG_QUERY_TIMEOUT", 0),
     allowExitOnIdle: envBool("PG_ALLOW_EXIT_ON_IDLE", "false"),
   };
 }
 
 export const db = new Pool(buildPoolConfig());
-// compat para módulos que esperan { pool }
 export const pool = db;
 
-// Log minimal si el pool reporta error asíncrono
 db.on("error", (err) => {
   console.error("[pg:pool error]", err?.message || err);
 });
@@ -94,7 +92,7 @@ export async function q(text, params = []) {
 }
 
 /* ===========================
- *  Helpers de migración
+ *  Helpers de migracion
  * =========================== */
 async function ensureOrgText(table) {
   try {
@@ -113,7 +111,6 @@ async function ensureOrgText(table) {
       );
     }
   } catch (e) {
-    // Si hay vistas/reglas dependientes, no frenamos el boot; logueamos y seguimos.
     console.warn(`[ensureOrgText] skip ${table}: ${e?.message || e}`);
   }
 }
@@ -122,11 +119,9 @@ async function ensureOrgText(table) {
  *  Migraciones / bootstrap
  * =========================== */
 export async function initDB() {
-  /* ---- Extensiones ---- */
   await q(`CREATE EXTENSION IF NOT EXISTS "uuid-ossp";`);
   await q(`CREATE EXTENSION IF NOT EXISTS "pgcrypto";`);
 
-  /* ---- Tablas base ---- */
   await q(`
     CREATE TABLE IF NOT EXISTS usuarios (
       id SERIAL PRIMARY KEY,
@@ -143,25 +138,21 @@ export async function initDB() {
       email TEXT,
       direccion TEXT,
       observacion TEXT,
-      -- pipeline / ownership
       stage TEXT,
       categoria TEXT,
       assignee TEXT,
       source TEXT,
       due_date TIMESTAMPTZ,
       contacto_nombre TEXT,
-      -- estimate
       estimate_url TEXT,
       estimate_file TEXT,
       estimate_uploaded_at TIMESTAMPTZ,
-      -- tracking
       usuario_email TEXT,
       organizacion_id TEXT,
       created_at TIMESTAMPTZ DEFAULT NOW(),
       updated_at TIMESTAMPTZ DEFAULT NOW()
     );
 
-    -- Comercial legacy
     CREATE TABLE IF NOT EXISTS pedidos (
       id SERIAL PRIMARY KEY,
       cliente_id INTEGER,
@@ -180,7 +171,6 @@ export async function initDB() {
       observacion TEXT
     );
 
-    -- Compras (transitoria)
     CREATE TABLE IF NOT EXISTS compras (
       id SERIAL PRIMARY KEY,
       proveedor TEXT,
@@ -207,13 +197,12 @@ export async function initDB() {
       observacion TEXT
     );
 
-    /* ===== TAREAS ===== */
     CREATE TABLE IF NOT EXISTS tareas (
       id SERIAL PRIMARY KEY,
       titulo TEXT NOT NULL,
       descripcion TEXT,
       cliente_id INTEGER,
-      estado TEXT DEFAULT 'todo',     -- todo | doing | waiting | done
+      estado TEXT DEFAULT 'todo',
       vence_en TIMESTAMPTZ,
       completada BOOLEAN DEFAULT FALSE,
       orden INTEGER DEFAULT 0,
@@ -222,7 +211,6 @@ export async function initDB() {
       created_at TIMESTAMPTZ DEFAULT NOW()
     );
 
-    /* ===== INTEGRACIONES (1 x org) ===== */
     CREATE TABLE IF NOT EXISTS integraciones (
       id SERIAL PRIMARY KEY,
       organizacion_id TEXT UNIQUE,
@@ -236,7 +224,6 @@ export async function initDB() {
       updated_at TIMESTAMPTZ DEFAULT NOW()
     );
 
-    /* ===== RECORDATORIOS ===== */
     CREATE TABLE IF NOT EXISTS recordatorios (
       id SERIAL PRIMARY KEY,
       organizacion_id TEXT NOT NULL,
@@ -245,14 +232,13 @@ export async function initDB() {
       enviar_en TIMESTAMPTZ NOT NULL,
       cliente_id INTEGER,
       tarea_id INTEGER,
-      estado TEXT DEFAULT 'pendiente',     -- pendiente | enviado | error
+      estado TEXT DEFAULT 'pendiente',
       intento_count INTEGER DEFAULT 0,
       last_error TEXT,
       created_at TIMESTAMPTZ DEFAULT NOW(),
       sent_at TIMESTAMPTZ
     );
 
-    /* ===== CATEGORIAS ===== */
     CREATE TABLE IF NOT EXISTS categorias (
       id SERIAL PRIMARY KEY,
       nombre TEXT NOT NULL,
@@ -261,7 +247,6 @@ export async function initDB() {
       orden INTEGER DEFAULT 0
     );
 
-    /* ===== SLACK USERS (mínimo util) ===== */
     CREATE TABLE IF NOT EXISTS slack_users (
       id SERIAL PRIMARY KEY,
       organizacion_id TEXT,
@@ -270,9 +255,36 @@ export async function initDB() {
       created_at TIMESTAMPTZ DEFAULT NOW(),
       updated_at TIMESTAMPTZ DEFAULT NOW()
     );
+
+    CREATE TABLE IF NOT EXISTS org_profiles (
+      organizacion_id TEXT PRIMARY KEY,
+      area TEXT NOT NULL DEFAULT 'general',
+      vocab JSONB DEFAULT '{}'::jsonb,
+      features JSONB DEFAULT '{}'::jsonb,
+      forms JSONB DEFAULT '{}'::jsonb,
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      updated_at TIMESTAMPTZ DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS historias_clinicas (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      cliente_id INTEGER NOT NULL,
+      organizacion_id TEXT NOT NULL,
+      tipo TEXT,
+      motivo TEXT,
+      diagnostico TEXT,
+      tratamiento TEXT,
+      indicaciones TEXT,
+      notas TEXT,
+      signos_vitales JSONB DEFAULT '{}'::jsonb,
+      antecedentes JSONB DEFAULT '{}'::jsonb,
+      extras JSONB DEFAULT '{}'::jsonb,
+      creado_por TEXT,
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      updated_at TIMESTAMPTZ DEFAULT NOW()
+    );
   `);
 
-  /* ---- Proyectos & Proveedores ---- */
   await q(`
     CREATE TABLE IF NOT EXISTS proyectos (
       id SERIAL PRIMARY KEY,
@@ -307,7 +319,6 @@ export async function initDB() {
     );
   `);
 
-  /* ====== Compatibilidad con KPIs: closed_at & result ====== */
   await q(`
     ALTER TABLE public.proyectos
       ADD COLUMN IF NOT EXISTS closed_at TIMESTAMPTZ,
@@ -320,14 +331,13 @@ export async function initDB() {
       ADD COLUMN IF NOT EXISTS contacto_nombre  TEXT;
   `);
 
-  // Trigger: setea closed_at/result cuando stage pasa a Won/Lost
   await q(`
     CREATE OR REPLACE FUNCTION proyectos_on_close() RETURNS trigger AS $$
     BEGIN
       IF NEW.stage IN ('Won','Lost')
          AND (OLD.stage IS DISTINCT FROM NEW.stage OR OLD.stage IS NULL) THEN
         IF NEW.closed_at IS NULL THEN NEW.closed_at := NOW(); END IF;
-        NEW.result := lower(NEW.stage); -- 'won' | 'lost'
+        NEW.result := lower(NEW.stage);
       END IF;
       RETURN NEW;
     END; $$ LANGUAGE plpgsql;
@@ -344,13 +354,11 @@ export async function initDB() {
     END$$;
   `);
 
-  // Trigger genérico para updated_at
   await q(`
     CREATE OR REPLACE FUNCTION touch_updated_at() RETURNS trigger AS $$
     BEGIN NEW.updated_at := NOW(); RETURN NEW; END; $$ LANGUAGE plpgsql;
   `);
 
-  // Aplica touch a tablas con updated_at
   await q(`
     DO $$
     BEGIN
@@ -378,10 +386,19 @@ export async function initDB() {
         CREATE TRIGGER tr_slack_users_touch BEFORE UPDATE ON public.slack_users
         FOR EACH ROW EXECUTE FUNCTION touch_updated_at();
       END IF;
+      IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='org_profiles' AND column_name='updated_at')
+         AND NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname='tr_org_profiles_touch') THEN
+        CREATE TRIGGER tr_org_profiles_touch BEFORE UPDATE ON public.org_profiles
+        FOR EACH ROW EXECUTE FUNCTION touch_updated_at();
+      END IF;
+      IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='historias_clinicas' AND column_name='updated_at')
+         AND NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname='tr_historias_touch') THEN
+        CREATE TRIGGER tr_historias_touch BEFORE UPDATE ON public.historias_clinicas
+        FOR EACH ROW EXECUTE FUNCTION touch_updated_at();
+      END IF;
     END$$;
   `);
 
-  /* ===== Backfill suave (incluye casos ya "Won") ===== */
   await q(`
     UPDATE public.proyectos
        SET result = lower(stage)
@@ -394,7 +411,6 @@ export async function initDB() {
      WHERE stage IN ('Won','Lost') AND closed_at IS NULL;
   `);
 
-  /* ===== Vista de compatibilidad "projects" (inglés) ===== */
   await q(`
     CREATE OR REPLACE VIEW public.projects AS
     SELECT
@@ -408,16 +424,15 @@ export async function initDB() {
     FROM public.proyectos;
   `);
 
-  /* ---- Normalización organizacion_id a TEXT ---- */
   const ORG_TABLES = [
     "usuarios","clientes","pedidos","tareas","integraciones","recordatorios",
-    "categorias","compras","compra_items","pedido_items","proyectos","proveedores","slack_users"
+    "categorias","compras","compra_items","pedido_items","proyectos","proveedores","slack_users",
+    "org_profiles","historias_clinicas"
   ];
   for (const t of ORG_TABLES) {
     await ensureOrgText(t).catch(() => {});
   }
 
-  /* ---- Índices útiles ---- */
   await q(`CREATE INDEX IF NOT EXISTS idx_clientes_org         ON clientes(organizacion_id);`);
   await q(`CREATE INDEX IF NOT EXISTS idx_clientes_created     ON clientes(created_at);`);
   await q(`CREATE INDEX IF NOT EXISTS idx_clientes_updated     ON clientes(updated_at);`);
@@ -455,7 +470,15 @@ export async function initDB() {
       ON categorias (organizacion_id, lower(nombre));
   `);
 
-  // Integraciones: 1 fila por org (idempotente)
+  await q(`
+    CREATE INDEX IF NOT EXISTS idx_historias_org_cli
+      ON historias_clinicas (organizacion_id, cliente_id);
+  `);
+  await q(`
+    CREATE INDEX IF NOT EXISTS idx_historias_org_created
+      ON historias_clinicas (organizacion_id, created_at);
+  `);
+
   await q(`
     DO $$
     BEGIN
@@ -469,14 +492,12 @@ export async function initDB() {
     END$$;
   `);
 
-  // Recordatorios: índice parcial para el cron
   await q(`
     CREATE INDEX IF NOT EXISTS idx_recordatorios_pend
       ON recordatorios(enviar_en)
       WHERE estado = 'pendiente';
   `);
 
-  /* ---- Seed del pipeline canónico global (org NULL) ---- */
   for (let i = 0; i < CANON_CATS.length; i++) {
     const name = CANON_CATS[i];
     await q(
@@ -495,7 +516,6 @@ export async function initDB() {
     );
   }
 
-  /* ---- Backfills suaves ---- */
   await q(`UPDATE clientes  SET stage = categoria WHERE stage IS NULL AND categoria IS NOT NULL;`);
   await q(`UPDATE clientes  SET categoria = stage WHERE categoria IS NULL AND stage IS NOT NULL;`);
   await q(`UPDATE proyectos SET stage = COALESCE(stage, 'Incoming Leads');`);
@@ -509,9 +529,8 @@ export async function initDB() {
   await q(`UPDATE tareas SET orden = COALESCE(orden, 0) WHERE orden IS NULL;`);
 }
 
-/* ===========================
- *  Shutdown limpio (opcional)
- * =========================== */
 export async function closeDB() {
-  try { await db.end(); } catch {}
+  try {
+    await db.end();
+  } catch {}
 }
