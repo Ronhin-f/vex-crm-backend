@@ -62,12 +62,13 @@ function pickOne(set, candidates) {
  * - Si hay columna `organizacion_id`, compara como TEXT.
  * - Si NO hay columna o no hay org => `1=0` para no mezclar tenants.
  */
-function orgFilterText(cols, orgId) {
+function orgFilterText(cols, orgId, alias = null) {
   const where = [];
   const params = [];
   if (orgId && cols.has("organizacion_id")) {
     params.push(String(orgId));
-    where.push(`organizacion_id::text = $${params.length}::text`);
+    const q = alias ? `${alias}.organizacion_id` : "organizacion_id";
+    where.push(`${q}::text = $${params.length}::text`);
   } else {
     where.push("1=0");
   }
@@ -360,7 +361,7 @@ router.get("/", auth, async (req, res) => {
         let top = (await q(sqlTop, params)).rows || [];
 
         if (!top.length && hasProyectos) {
-          const { where: wp, params: pp } = orgFilterText(colsProyectos, orgId);
+          const { where: wp, params: pp } = orgFilterText(colsProyectos, orgId, "p");
           const colsCli = colsClientes; // ya calculado
           const joinOrg =
             colsCli.has("organizacion_id") && colsProyectos.has("organizacion_id")

@@ -203,12 +203,14 @@ export async function initDB() {
       descripcion TEXT,
       cliente_id INTEGER,
       estado TEXT DEFAULT 'todo',
+      prioridad TEXT DEFAULT 'media',
       vence_en TIMESTAMPTZ,
       completada BOOLEAN DEFAULT FALSE,
       orden INTEGER DEFAULT 0,
       usuario_email TEXT,
       organizacion_id TEXT,
-      created_at TIMESTAMPTZ DEFAULT NOW()
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      updated_at TIMESTAMPTZ DEFAULT NOW()
     );
 
     CREATE TABLE IF NOT EXISTS integraciones (
@@ -329,6 +331,12 @@ export async function initDB() {
       ADD COLUMN IF NOT EXISTS estimate_url     TEXT,
       ADD COLUMN IF NOT EXISTS estimate_file    TEXT,
       ADD COLUMN IF NOT EXISTS contacto_nombre  TEXT;
+  `);
+
+  await q(`
+    ALTER TABLE public.tareas
+      ADD COLUMN IF NOT EXISTS prioridad TEXT DEFAULT 'media',
+      ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT now();
   `);
 
   await q(`
@@ -525,8 +533,14 @@ export async function initDB() {
        SET estado = COALESCE(NULLIF(TRIM(estado), ''), 'todo')
      WHERE estado IS NULL OR TRIM(estado) = '';
   `);
+  await q(`
+    UPDATE tareas
+       SET prioridad = COALESCE(NULLIF(TRIM(prioridad), ''), 'media')
+     WHERE prioridad IS NULL OR TRIM(prioridad) = '';
+  `);
   await q(`UPDATE tareas SET completada = COALESCE(completada, FALSE) WHERE completada IS NULL;`);
   await q(`UPDATE tareas SET orden = COALESCE(orden, 0) WHERE orden IS NULL;`);
+  await q(`UPDATE tareas SET updated_at = COALESCE(updated_at, created_at, NOW()) WHERE updated_at IS NULL;`);
 }
 
 export async function closeDB() {

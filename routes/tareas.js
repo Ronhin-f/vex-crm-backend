@@ -2,6 +2,7 @@
 import { Router } from "express";
 import { q } from "../utils/db.js";
 import { authenticateToken } from "../middleware/auth.js";
+import { getOrgText } from "../utils/org.js";
 import { emit as emitFlow } from "../services/flows.client.js";
 
 const router = Router();
@@ -12,17 +13,6 @@ const coerceText = (v) => { const s = T(v); return s && s.length ? s : null; };
 function coerceDate(v) { if (!v) return null; const d = new Date(v); return isNaN(d.getTime()) ? null : d.toISOString(); }
 function toInt(v) { const n = Number(v); return Number.isInteger(n) ? n : null; }
 
-// Org TEXT-safe
-function getOrgText(req) {
-  const raw =
-    T(req.usuario?.organizacion_id) ||
-    T(req.organizacion_id) ||
-    T(req.headers?.["x-org-id"]) ||
-    T(req.query?.organizacion_id) ||
-    T(req.body?.organizacion_id) ||
-    null;
-  return raw ? String(raw) : null;
-}
 function getUserFromReq(req) {
   const u = req.usuario || {};
   return {
@@ -31,6 +21,14 @@ function getUserFromReq(req) {
   };
 }
 function getBearer(req) { return req.headers?.authorization || null; }
+function requireOrg(req, res) {
+  const org = getOrgText(req);
+  if (!org) {
+    res.status(400).json({ message: "organizacion_id requerido" });
+    return null;
+  }
+  return org;
+}
 
 /* ---------- dominios ---------- */
 const VALID_ESTADOS = ["todo", "doing", "waiting", "done"];
@@ -126,7 +124,8 @@ router.get("/", authenticateToken, async (req, res) => {
       return res.status(501).json([]);
     }
 
-    const { organizacion_id } = getUserFromReq(req);
+    const organizacion_id = requireOrg(req, res);
+    if (!organizacion_id) return;
     let { estado, prioridad, q: qtext, cliente_id, limit = 200, offset = 0 } = req.query || {};
 
     const params = [];
@@ -212,13 +211,13 @@ router.get("/kanban", authenticateToken, async (req, res) => {
     const hasClientes = await hasTable("clientes");
     const cCols = hasClientes ? await tableColumns("clientes") : new Set();
 
-    const { organizacion_id } = getUserFromReq(req);
+    if (!tCols.has("organizacion_id")) return res.status(501).json(emptyKanban());
+    const organizacion_id = requireOrg(req, res);
+    if (!organizacion_id) return;
     const params = [];
     const where = [];
-    if (tCols.has("organizacion_id") && organizacion_id != null) {
-      params.push(organizacion_id);
-      where.push(`t.organizacion_id::text = $${params.length}::text`);
-    }
+    params.push(organizacion_id);
+    where.push(`t.organizacion_id::text = $${params.length}::text`);
 
     const sel = (col, asType = "text") => {
       if (tCols.has(col)) return `t.${col}`;
@@ -297,7 +296,8 @@ router.get("/:id", authenticateToken, async (req, res) => {
 
     const { organizacion_id } = getUserFromReq(req);
     const id = toInt(req.params.id);
-    if (id == null) return res.status(400).json({ message: "ID inválido" });
+    if (organizacion_id == null) return res.status(400).json({ message: "organizacion_id requerido" });
+    if (id == null) return res.status(400).json({ message: "ID invalido" });
 
     const select = [
       `t.id`,
@@ -339,7 +339,9 @@ router.post("/", authenticateToken, async (req, res) => {
     if (!tCols.has("organizacion_id")) return res.status(501).json({ message: "Schema sin organizacion_id" });
 
     const bearer = getBearer(req);
-    const { email: creador_email, organizacion_id } = getUserFromReq(req);
+    const organizacion_id = requireOrg(req, res);
+    if (!organizacion_id) return;
+    const { email: creador_email } = getUserFromReq(req);
 
     let {
       titulo,
@@ -445,6 +447,7 @@ router.patch("/:id/state", authenticateToken, async (req, res) => {
     if (!(await hasTable("tareas"))) return res.status(404).json({ message: "Tabla tareas no existe" });
     const tCols = await tableColumns("tareas");
     const { organizacion_id } = getUserFromReq(req);
+    if (organizacion_id == null) return res.status(400).json({ message: "organizacion_id requerido" });
 
     const id = toInt(req.params.id);
     let { estado, orden } = req.body || {};
@@ -529,8 +532,9 @@ async function updateTaskGeneric(req, res, { emptyAsComplete = false } = {}) {
 
     const bearer = getBearer(req);
     const { organizacion_id } = getUserFromReq(req);
+    if (organizacion_id == null) return res.status(400).json({ message: "organizacion_id requerido" });
     const id = toInt(req.params.id);
-    if (id == null) return res.status(400).json({ message: "ID inválido" });
+    if (id == null) return res.status(400).json({ message: "ID invalido" });
 
     const allowed = {
       titulo: (v) => coerceText(v),
@@ -699,6 +703,7 @@ router.patch("/:id/assign", authenticateToken, async (req, res) => {
 
     const bearer = getBearer(req);
     const { organizacion_id } = getUserFromReq(req);
+    if (organizacion_id == null) return res.status(400).json({ message: "organizacion_id requerido" });
     const id = toInt(req.params.id);
     const usuario_email = coerceText(req.body?.usuario_email || req.body?.assignee_email);
 
@@ -774,8 +779,9 @@ router.patch("/:id/toggle", authenticateToken, async (req, res) => {
 
     const bearer = getBearer(req);
     const { organizacion_id } = getUserFromReq(req);
+    if (organizacion_id == null) return res.status(400).json({ message: "organizacion_id requerido" });
     const id = toInt(req.params.id);
-    if (id == null) return res.status(400).json({ message: "ID inválido" });
+    if (id == null) return res.status(400).json({ message: "ID invalido" });
 
     const cur = await q(
       `
@@ -884,6 +890,7 @@ router.patch("/reorder", authenticateToken, async (req, res) => {
 
     const bearer = getBearer(req);
     const { organizacion_id } = getUserFromReq(req);
+    if (organizacion_id == null) return res.status(400).json({ message: "organizacion_id requerido" });
     const estado = normEstado(req.body?.estado);
     const ids = Array.isArray(req.body?.ordered_ids)
       ? req.body.ordered_ids.map(toInt).filter((x) => x != null)
@@ -994,8 +1001,9 @@ router.delete("/:id", authenticateToken, async (req, res) => {
 
     const bearer = getBearer(req);
     const { organizacion_id } = getUserFromReq(req);
+    if (organizacion_id == null) return res.status(400).json({ message: "organizacion_id requerido" });
     const id = toInt(req.params.id);
-    if (id == null) return res.status(400).json({ message: "ID inválido" });
+    if (id == null) return res.status(400).json({ message: "ID invalido" });
 
     const prev = await q(
       `
