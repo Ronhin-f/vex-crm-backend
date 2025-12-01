@@ -631,12 +631,12 @@ async function updateTaskGeneric(req, res, { emptyAsComplete = false } = {}) {
 
     const r = await q(
       `
-      UPDATE tareas
+      UPDATE tareas t
          SET ${sets.join(", ")}
-       WHERE id = $${values.length - 1} AND organizacion_id::text = $${values.length}::text
+       WHERE t.id = $${values.length - 1} AND t.organizacion_id::text = $${values.length}::text
        RETURNING ${
          [
-           "id",
+           "t.id",
            exp(tCols, "titulo", "text"),
            exp(tCols, "descripcion", "text"),
            exp(tCols, "cliente_id", "int"),
@@ -715,12 +715,12 @@ router.patch("/:id/assign", authenticateToken, async (req, res) => {
 
     const r = await q(
       `
-      UPDATE tareas
+      UPDATE tareas t
          SET ${sets.join(", ")}
-       WHERE id = $2 AND organizacion_id::text = $3::text
+       WHERE t.id = $2 AND t.organizacion_id::text = $3::text
        RETURNING ${
          [
-           "id",
+           "t.id",
            exp(tCols, "titulo", "text"),
            exp(tCols, "descripcion", "text"),
            exp(tCols, "cliente_id", "int"),
@@ -826,12 +826,12 @@ router.patch("/:id/toggle", authenticateToken, async (req, res) => {
 
     const upd = await q(
       `
-      UPDATE tareas
+      UPDATE tareas t
          SET ${sets.join(", ")}
-       WHERE id=$2 AND organizacion_id::text=$3::text
+       WHERE t.id=$2 AND t.organizacion_id::text=$3::text
        RETURNING ${
          [
-           "id",
+           "t.id",
            exp(tCols, "titulo", "text"),
            exp(tCols, "descripcion", "text"),
            exp(tCols, "cliente_id", "int"),
@@ -913,7 +913,7 @@ router.patch("/reorder", authenticateToken, async (req, res) => {
 
       r = await q(
         `
-        UPDATE tareas
+        UPDATE tareas t
            SET estado = $1,
                orden = CASE id
                  ${caseClauses.join("\n")}
@@ -923,7 +923,7 @@ router.patch("/reorder", authenticateToken, async (req, res) => {
                organizacion_id = organizacion_id
          WHERE id IN (${inHolders.join(", ")})
            AND organizacion_id::text = $${params.length}::text
-         RETURNING id, ${
+         RETURNING t.id, ${
            [
              exp(tCols, "titulo", "text"),
              exp(tCols, "estado", "text"),
@@ -941,11 +941,11 @@ router.patch("/reorder", authenticateToken, async (req, res) => {
       // Sin columna 'orden': solo movemos estado.
       r = await q(
         `
-        UPDATE tareas
+        UPDATE tareas t
            SET estado = $1
          WHERE id = ANY($2::int[])
            AND organizacion_id::text = $3::text
-         RETURNING id, ${
+         RETURNING t.id, ${
            [
              exp(tCols, "titulo", "text"),
              exp(tCols, "estado", "text"),
