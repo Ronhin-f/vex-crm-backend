@@ -7,6 +7,12 @@ import { ALLOWED_AREAS, resolveProfile, sanitizeProfilePayload } from "../utils/
 
 const router = Router();
 
+const cleanArea = (a) => {
+  if (!a) return null;
+  const v = String(a).trim().toLowerCase();
+  return ALLOWED_AREAS.includes(v) ? v : null;
+};
+
 async function fetchProfile(orgId) {
   const { rows } = await q(
     `SELECT area, vocab, features, forms, updated_at
@@ -26,6 +32,38 @@ router.get("/perfil", authenticateToken, async (req, res) => {
   } catch (e) {
     console.error("[GET /area/perfil]", e?.message || e);
     res.status(500).json({ message: "No se pudo leer el perfil" });
+  }
+});
+
+router.post("/sync", authenticateToken, async (req, res) => {
+  try {
+    const orgId = getOrgText(req, { require: true });
+    const area = cleanArea(req.body?.area || req.body?.area_vertical);
+    if (!area) return res.status(400).json({ message: "area_vertical requerida" });
+
+    const features = {
+      clinicalHistory:
+        typeof req.body?.features?.clinicalHistory === "boolean"
+          ? req.body.features.clinicalHistory
+          : undefined,
+    };
+
+    const payload = sanitizeProfilePayload({ area, features });
+
+    const { rows } = await q(
+      `INSERT INTO org_profiles (organizacion_id, area, vocab, features, forms, updated_at)
+       VALUES ($1,$2,$3,$4,$5,NOW())
+       ON CONFLICT (organizacion_id)
+       DO UPDATE SET area=$2, vocab=$3, features=$4, forms=$5, updated_at=NOW()
+       RETURNING area, vocab, features, forms, updated_at`,
+      [orgId, payload.area, payload.vocab, payload.features, payload.forms]
+    );
+
+    const perfil = resolveProfile(rows[0] || payload);
+    res.json({ perfil, organizacion_id: orgId });
+  } catch (e) {
+    console.error("[POST /area/sync]", e?.message || e);
+    res.status(500).json({ message: "No se pudo sincronizar el perfil de area" });
   }
 });
 
