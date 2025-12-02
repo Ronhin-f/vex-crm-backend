@@ -78,6 +78,7 @@ async function mount(pathname, modulePath) {
   }
 }
 
+await mount("/", "./routes/contactos.js");
 await mount("/clientes", "./routes/clientes.js");
 await mount("/proyectos", "./routes/proyectos.js");
 await mount("/proyectos", "./routes/proyectos.assign.js");

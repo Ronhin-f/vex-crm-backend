@@ -153,6 +153,34 @@ export async function initDB() {
       updated_at TIMESTAMPTZ DEFAULT NOW()
     );
 
+    CREATE TABLE IF NOT EXISTS contactos (
+      id SERIAL PRIMARY KEY,
+      cliente_id INTEGER NOT NULL REFERENCES clientes(id) ON DELETE CASCADE,
+      nombre TEXT,
+      email TEXT,
+      telefono TEXT,
+      cargo TEXT,
+      rol TEXT,
+      notas TEXT,
+      es_principal BOOLEAN DEFAULT FALSE,
+      obra_social TEXT,
+      plan TEXT,
+      numero_afiliado TEXT,
+      preguntas JSONB DEFAULT '{}'::jsonb,
+      motivo_consulta TEXT,
+      ultima_consulta TEXT,
+      cepillados_diarios TEXT,
+      sangrado TEXT,
+      momentos_azucar TEXT,
+      dolor TEXT,
+      golpe TEXT,
+      dificultad TEXT,
+      usuario_email TEXT,
+      organizacion_id TEXT,
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      updated_at TIMESTAMPTZ DEFAULT NOW()
+    );
+
     CREATE TABLE IF NOT EXISTS pedidos (
       id SERIAL PRIMARY KEY,
       cliente_id INTEGER,
@@ -288,6 +316,24 @@ export async function initDB() {
   `);
 
   await q(`
+    ALTER TABLE public.contactos
+      ADD COLUMN IF NOT EXISTS obra_social TEXT,
+      ADD COLUMN IF NOT EXISTS plan TEXT,
+      ADD COLUMN IF NOT EXISTS numero_afiliado TEXT,
+      ADD COLUMN IF NOT EXISTS preguntas JSONB DEFAULT '{}'::jsonb,
+      ADD COLUMN IF NOT EXISTS motivo_consulta TEXT,
+      ADD COLUMN IF NOT EXISTS ultima_consulta TEXT,
+      ADD COLUMN IF NOT EXISTS cepillados_diarios TEXT,
+      ADD COLUMN IF NOT EXISTS sangrado TEXT,
+      ADD COLUMN IF NOT EXISTS momentos_azucar TEXT,
+      ADD COLUMN IF NOT EXISTS dolor TEXT,
+      ADD COLUMN IF NOT EXISTS golpe TEXT,
+      ADD COLUMN IF NOT EXISTS dificultad TEXT,
+      ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW(),
+      ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW();
+  `);
+
+  await q(`
     CREATE TABLE IF NOT EXISTS proyectos (
       id SERIAL PRIMARY KEY,
       nombre TEXT NOT NULL,
@@ -404,6 +450,11 @@ export async function initDB() {
         CREATE TRIGGER tr_historias_touch BEFORE UPDATE ON public.historias_clinicas
         FOR EACH ROW EXECUTE FUNCTION touch_updated_at();
       END IF;
+      IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='contactos' AND column_name='updated_at')
+         AND NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname='tr_contactos_touch') THEN
+        CREATE TRIGGER tr_contactos_touch BEFORE UPDATE ON public.contactos
+        FOR EACH ROW EXECUTE FUNCTION touch_updated_at();
+      END IF;
     END$$;
   `);
 
@@ -433,7 +484,7 @@ export async function initDB() {
   `);
 
   const ORG_TABLES = [
-    "usuarios","clientes","pedidos","tareas","integraciones","recordatorios",
+    "usuarios","clientes","contactos","pedidos","tareas","integraciones","recordatorios",
     "categorias","compras","compra_items","pedido_items","proyectos","proveedores","slack_users",
     "org_profiles","historias_clinicas"
   ];
@@ -449,6 +500,10 @@ export async function initDB() {
   await q(`CREATE INDEX IF NOT EXISTS idx_clientes_assignee    ON clientes(assignee);`);
   await q(`CREATE INDEX IF NOT EXISTS idx_clientes_due         ON clientes(due_date);`);
   await q(`CREATE INDEX IF NOT EXISTS idx_clientes_source      ON clientes(source);`);
+
+  await q(`CREATE INDEX IF NOT EXISTS idx_contactos_cliente    ON contactos(cliente_id);`);
+  await q(`CREATE INDEX IF NOT EXISTS idx_contactos_org        ON contactos(organizacion_id);`);
+  await q(`CREATE INDEX IF NOT EXISTS idx_contactos_principal  ON contactos(cliente_id) WHERE COALESCE(es_principal, FALSE) = TRUE;`);
 
   await q(`CREATE INDEX IF NOT EXISTS idx_tareas_org           ON tareas(organizacion_id);`);
   await q(`CREATE INDEX IF NOT EXISTS idx_tareas_estado        ON tareas(estado);`);
