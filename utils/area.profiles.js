@@ -71,8 +71,8 @@ const PRESETS = {
     area: "veterinaria",
     vocab: {
       ...BASE_PROFILE.vocab,
-      clients: "Pacientes",
-      client: "Paciente",
+      clients: "Mascotas",
+      client: "Mascota",
       contacts: "Duenos",
       contact: "Dueno",
       projects: "Casos",
