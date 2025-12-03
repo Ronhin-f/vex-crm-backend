@@ -26,6 +26,7 @@
     "node-cron": "^4.2.1",
     "node-fetch": "^3.3.2",
     "openai": "^4.25.0",
+    "pdf-parse": "^1.1.1",
     "pg": "^8.11.5"
   },
   "devDependencies": {

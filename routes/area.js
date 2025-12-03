@@ -38,17 +38,21 @@ router.get("/perfil", authenticateToken, async (req, res) => {
 router.post("/sync", authenticateToken, async (req, res) => {
   try {
     const orgId = getOrgText(req, { require: true });
-    const area = cleanArea(req.body?.area || req.body?.area_vertical);
-    if (!area) return res.status(400).json({ message: "area_vertical requerida" });
+  const area = cleanArea(req.body?.area || req.body?.area_vertical);
+  if (!area) return res.status(400).json({ message: "area_vertical requerida" });
 
-    const features = {
-      clinicalHistory:
-        typeof req.body?.features?.clinicalHistory === "boolean"
-          ? req.body.features.clinicalHistory
-          : undefined,
-    };
+  const features = {
+    clinicalHistory:
+      typeof req.body?.features?.clinicalHistory === "boolean"
+        ? req.body.features.clinicalHistory
+        : undefined,
+    labResults:
+      typeof req.body?.features?.labResults === "boolean"
+        ? req.body.features.labResults
+        : undefined,
+  };
 
-    const payload = sanitizeProfilePayload({ area, features });
+  const payload = sanitizeProfilePayload({ area, features });
 
     const { rows } = await q(
       `INSERT INTO org_profiles (organizacion_id, area, vocab, features, forms, updated_at)

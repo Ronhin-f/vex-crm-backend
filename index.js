@@ -102,6 +102,7 @@ await mount("/integraciones", "./routes/integraciones.js");
 await mount("/jobs", "./routes/job.js");
 await mount("/ai", "./routes/ai.js");
 await mount("/health", "./routes/health.js");
+await mount("/labs", "./routes/labs.js");
 
 await mount("/area", "./routes/area.js");
 await mount("/historias", "./routes/historias.js");

@@ -16,7 +16,7 @@ const BASE_PROFILE = {
     clinicalHistory: "Historia clinica",
     clinicalHistoryList: "Historias clinicas",
   },
-  features: { clinicalHistory: false },
+  features: { clinicalHistory: false, labResults: false },
   forms: {
     clinicalHistory: {
       fields: [
@@ -44,7 +44,7 @@ const PRESETS = {
       projects: "Casos",
       providers: "Prestadores",
     },
-    features: { clinicalHistory: true },
+    features: { clinicalHistory: true, labResults: false },
     forms: {
       clinicalHistory: {
         ...BASE_PROFILE.forms.clinicalHistory,
@@ -78,7 +78,7 @@ const PRESETS = {
       projects: "Casos",
       providers: "Proveedores",
     },
-    features: { clinicalHistory: true },
+    features: { clinicalHistory: true, labResults: true },
     forms: {
       clinicalHistory: {
         ...BASE_PROFILE.forms.clinicalHistory,
@@ -91,6 +91,17 @@ const PRESETS = {
           { name: "tratamiento", label: "Plan / Tratamiento", type: "textarea" },
           { name: "vacunas", label: "Vacunas", type: "textarea" },
           { name: "notas", label: "Notas internas", type: "textarea" },
+          { name: "hematocrito", label: "Hematocrito (%)", type: "number" },
+          { name: "hemoglobina", label: "Hemoglobina (g/dL)", type: "number" },
+          { name: "leucocitos", label: "Leucocitos (10^3/uL)", type: "number" },
+          { name: "plaquetas", label: "Plaquetas (10^3/uL)", type: "number" },
+          { name: "glucosa", label: "Glucosa (mg/dL)", type: "number" },
+          { name: "urea", label: "Urea (mg/dL)", type: "number" },
+          { name: "creatinina", label: "Creatinina (mg/dL)", type: "number" },
+          { name: "alt", label: "ALT / TGP (U/L)", type: "number" },
+          { name: "ast", label: "AST / TGO (U/L)", type: "number" },
+          { name: "fosfatasa_alcalina", label: "Fosfatasa alcalina (U/L)", type: "number" },
+          { name: "proteinas_totales", label: "Proteinas totales (g/dL)", type: "number" },
         ],
       },
     },
@@ -180,6 +191,9 @@ export function sanitizeProfilePayload(body = {}) {
   const features = { ...preset.features };
   if (typeof body.features?.clinicalHistory === "boolean") {
     features.clinicalHistory = body.features.clinicalHistory;
+  }
+  if (typeof body.features?.labResults === "boolean") {
+    features.labResults = body.features.labResults;
   }
   const forms = cleanForms(body.forms, preset.forms);
   return { area, vocab, features, forms };
