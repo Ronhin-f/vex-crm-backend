@@ -122,6 +122,9 @@ router.get("/clientes/:clienteId/contactos", authenticateToken, async (req, res)
         ${S("telefono")}              AS telefono,
         ${S("cargo")}                 AS cargo,
         ${S("rol")}                   AS rol,
+        ${S("peso")}                  AS peso,
+        ${S("vacunas")}               AS vacunas,
+        ${S("proxima_vacuna")}        AS proxima_vacuna,
         ${S("es_principal","bool")}   AS es_principal,
         ${S("notas")}                 AS notas,
         ${S("obra_social")}           AS obra_social,
@@ -240,6 +243,9 @@ router.post("/clientes/:clienteId/contactos", authenticateToken, async (req, res
     add("telefono", T(telefono));
     add("cargo", T(cargo));
     add("rol", T(rol));
+    add("peso", T(peso));
+    add("vacunas", T(vacunas));
+    add("proxima_vacuna", T(proxima_vacuna));
     if (ctCols.has("es_principal")) add("es_principal", makePrimary);
     add("notas", T(notas));
     add("obra_social", T(obra_social));
@@ -332,6 +338,9 @@ router.patch("/contactos/:id", authenticateToken, async (req, res) => {
       "telefono",
       "cargo",
       "rol",
+      "peso",
+      "vacunas",
+      "proxima_vacuna",
       "es_principal",
       "notas",
       "obra_social",
