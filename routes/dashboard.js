@@ -112,6 +112,7 @@ router.get("/", auth, async (req, res) => {
     },
     topClientes: [],
     proximosSeguimientos: [],
+    vacunas: [],
   };
 
   try {
@@ -119,12 +120,14 @@ router.get("/", auth, async (req, res) => {
 
     /* ======= Detección de tablas/columnas ======= */
     const hasClientes = await hasTable("clientes");
+    const hasContactos = await hasTable("contactos");
     const hasTareas = await hasTable("tareas");
     const hasProyectos = await hasTable("proyectos");
     const hasInvoices = await hasTable("invoices");
     const hasARView = await regclassExists("v_ar_aging");
 
     const colsClientes = hasClientes ? await tableColumns("clientes") : new Set();
+    const colsContactos = hasContactos ? await tableColumns("contactos") : new Set();
     const colsTareas = hasTareas ? await tableColumns("tareas") : new Set();
     const colsProyectos = hasProyectos ? await tableColumns("proyectos") : new Set();
     const colsInvoices = hasInvoices ? await tableColumns("invoices") : new Set();
@@ -428,6 +431,48 @@ router.get("/", auth, async (req, res) => {
           params
         );
         out.proximosSeguimientos = r.rows || [];
+      }
+    } catch {}
+
+    /* Vacunas proximas (14/7/3 dias) */
+    try {
+      if (hasContactos && colsContactos.has("proxima_vacuna")) {
+        const params = [];
+        const where = [];
+        if (orgId && colsContactos.has("organizacion_id")) {
+          params.push(String(orgId));
+          where.push(`ct.organizacion_id::text = $${params.length}::text`);
+        }
+        const joinCli = hasClientes;
+        const colsCli = colsClientes;
+        const joinOrg =
+          joinCli && colsCli.has("organizacion_id") && colsContactos.has("organizacion_id")
+            ? ` AND c.organizacion_id::text = ct.organizacion_id::text`
+            : ``;
+
+        const r = await q(
+          `
+            SELECT
+              ct.id,
+              ${colsContactos.has("nombre") ? "ct.nombre" : "NULL::text AS nombre"},
+              ${colsContactos.has("cliente_id") ? "ct.cliente_id" : "NULL::int AS cliente_id"},
+              ${colsContactos.has("proxima_vacuna") ? "ct.proxima_vacuna::date" : "NULL::date"} AS proxima_vacuna,
+              ${colsContactos.has("vacunas") ? "ct.vacunas" : "NULL::text AS vacunas"},
+              ${colsContactos.has("peso") ? "ct.peso" : "NULL::text AS peso"},
+              ${colsContactos.has("telefono") ? "ct.telefono" : "NULL::text AS telefono"},
+              ${colsContactos.has("email") ? "ct.email" : "NULL::text AS email"},
+              ${joinCli && colsCli.has("nombre") ? "c.nombre AS cliente_nombre" : "NULL::text AS cliente_nombre"}
+            FROM contactos ct
+            ${joinCli ? `LEFT JOIN clientes c ON c.id = ct.cliente_id${joinOrg}` : ""}
+            WHERE ct.proxima_vacuna IS NOT NULL
+              AND ct.proxima_vacuna::date <= (now()::date + INTERVAL '14 days')
+              ${where.length ? "AND " + where.join(" AND ") : ""}
+            ORDER BY ct.proxima_vacuna::date ASC NULLS LAST, ct.id DESC
+            LIMIT 100
+          `,
+          params
+        );
+        out.vacunas = r.rows || [];
       }
     } catch {}
 
