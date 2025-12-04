@@ -85,8 +85,9 @@ const PRESETS = {
         vitalSigns: ["peso", "temperatura"],
         fields: [
           { name: "animal", label: "Animal/Especie", type: "text" },
+          { name: "raza", label: "Raza", type: "text" },
           { name: "motivo", label: "Motivo de consulta", type: "text" },
-          { name: "sintomas", label: "Sintomas", type: "textarea" },
+          { name: "sintomas", label: "Síntomas", type: "textarea" },
           { name: "diagnostico", label: "Diagnostico", type: "textarea" },
           { name: "tratamiento", label: "Plan / Tratamiento", type: "textarea" },
           { name: "vacunas", label: "Vacunas", type: "textarea" },
