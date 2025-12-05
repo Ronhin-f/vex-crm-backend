@@ -1,6 +1,6 @@
 // routes/web.routes.js
 import { Router } from "express";
-import { pool, CANON_CATS } from "../utils/db.js";
+import { pool, CANON_CATS, pipelineForOrg } from "../utils/db.js";
 import { ensureFollowupForAssignment } from "../services/followups.service.js";
 
 const r = Router();
@@ -114,6 +114,7 @@ r.post("/leads", async (req, res) => {
   const due_date = toISO(b.due_date);
   const estimate_amount = b.estimate_amount != null ? Number(b.estimate_amount) : null;
   const estimate_currency = T(b.estimate_currency);
+  const pipeline = await pipelineForOrg(organizacion_id);
 
   // Base para deep-link: no se “adivina” si no existe
   const envBase =
@@ -164,7 +165,7 @@ r.post("/leads", async (req, res) => {
 
       // c) crear si no existe
       if (!cliente_id) {
-        const stage0 = Array.isArray(CANON_CATS) && CANON_CATS.length ? CANON_CATS[0] : "Incoming Leads";
+        const stage0 = Array.isArray(pipeline) && pipeline.length ? pipeline[0] : "Incoming Leads";
         const ins = await cx.query(
           `INSERT INTO clientes
               (nombre, source, stage, categoria, usuario_email, organizacion_id, created_at, updated_at)
@@ -240,7 +241,7 @@ r.post("/leads", async (req, res) => {
     /* 3) (Opcional) Crear PROYECTO si existe tabla proyectos */
     let proyecto_id = null;
     if (crear_proyecto && hasProyectos) {
-      const stage0 = Array.isArray(CANON_CATS) && CANON_CATS.length ? CANON_CATS[0] : "Incoming Leads";
+      const stage0 = Array.isArray(pipeline) && pipeline.length ? pipeline[0] : "Incoming Leads";
       const insP = await cx.query(
         `INSERT INTO proyectos
            (nombre, descripcion, cliente_id, stage, categoria,

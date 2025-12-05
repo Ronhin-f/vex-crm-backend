@@ -13,7 +13,7 @@ types.setTypeParser(20, (v) => (v == null ? null : parseInt(v, 10)));
 /* ===========================
  *  Constantes / helpers
  * =========================== */
-export const CANON_CATS = [
+const DEFAULT_PIPELINE = [
   "Unqualified",
   "Incoming Leads",
   "Qualified",
@@ -22,6 +22,24 @@ export const CANON_CATS = [
   "Won",
   "Lost",
 ];
+
+const VET_PIPELINE = [
+  "Turno fijado",
+  "Pre quirurgico",
+  "Completado",
+  "Turno perdido",
+  "Lost",
+];
+
+export const CANON_CATS = DEFAULT_PIPELINE;
+export const PIPELINES = { default: DEFAULT_PIPELINE, veterinaria: VET_PIPELINE };
+const PIPELINE_CACHE = new Map(); // orgId -> { ts, pipeline }
+
+export const resolvePipeline = (area) => {
+  const a = (area || "").toLowerCase();
+  if (a === "veterinaria") return PIPELINES.veterinaria;
+  return PIPELINES.default;
+};
 
 function envBool(name, def = "false") {
   const v = (process.env[name] ?? def).toString().trim().toLowerCase();
@@ -89,6 +107,31 @@ export async function q(text, params = []) {
     console.error("[pg:q]", e?.message || e, { text });
     throw e;
   }
+}
+
+/* Pipeline por organizacion (cache 10m) */
+export async function pipelineForOrg(orgId) {
+  const key = orgId == null ? "__default__" : String(orgId);
+  const now = Date.now();
+  const cached = PIPELINE_CACHE.get(key);
+  if (cached && now - cached.ts < 10 * 60 * 1000) return cached.pipeline;
+
+  let area = null;
+  try {
+    if (orgId != null) {
+      const r = await q(
+        `SELECT area FROM org_profiles WHERE organizacion_id = $1 LIMIT 1`,
+        [String(orgId)]
+      );
+      area = r.rows?.[0]?.area ?? null;
+    }
+  } catch {
+    area = null;
+  }
+
+  const pipeline = resolvePipeline(area);
+  PIPELINE_CACHE.set(key, { ts: now, pipeline });
+  return pipeline;
 }
 
 /* ===========================

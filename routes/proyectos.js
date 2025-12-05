@@ -1,6 +1,6 @@
 // routes/proyectos.js — Oportunidades/Proyectos (blindado + multi-tenant + schema-agnostic, TEXT-safe)
 import { Router } from "express";
-import { q, CANON_CATS } from "../utils/db.js";
+import { q, CANON_CATS, pipelineForOrg } from "../utils/db.js";
 import { authenticateToken } from "../middleware/auth.js";
 import { emit as emitFlow } from "../services/flows.client.js";
 
@@ -31,6 +31,10 @@ function getUserFromReq(req) {
     email: (u.email ?? req.usuario_email ?? u.usuario_email ?? null) || null,
     organizacion_id: getOrg(req),
   };
+}
+async function getPipelineForReq(req) {
+  const { organizacion_id } = getUserFromReq(req);
+  return pipelineForOrg(organizacion_id);
 }
 
 async function regclassExists(name) {
@@ -112,17 +116,17 @@ function pickUpdate(cols, obj) {
 /* ============== OPTIONS (antes de :id) ============== */
 router.get("/options", authenticateToken, async (req, res) => {
   try {
+    const { organizacion_id, email } = getUserFromReq(req);
+    const pipeline = await getPipelineForReq(req);
     if (!(await hasTable("proyectos"))) {
-      const { email } = getUserFromReq(req);
       return res.json({
         ok: true,
-        stages: CANON_CATS,
+        stages: pipeline,
         sources: ["Website","Referral","Email","WhatsApp","Phone","Instagram","Facebook","Google Ads","LinkedIn","Cold Outreach","Event","Walk-in"],
         assignees: email ? [String(email).toLowerCase()] : [],
       });
     }
 
-    const { organizacion_id, email } = getUserFromReq(req);
     const cols = await tableColumns("proyectos");
 
     // sources
@@ -150,7 +154,7 @@ router.get("/options", authenticateToken, async (req, res) => {
     }
     const assigneesSet = new Set([...(email ? [String(email).toLowerCase()] : []), ...assignees]);
 
-    res.json({ ok: true, stages: CANON_CATS, sources: Array.from(sourcesSet), assignees: Array.from(assigneesSet) });
+    res.json({ ok: true, stages: pipeline, sources: Array.from(sourcesSet), assignees: Array.from(assigneesSet) });
   } catch (e) {
     console.error("[GET /proyectos/options]", e?.stack || e?.message || e);
     res.json({ ok: true, stages: CANON_CATS, sources: [], assignees: [] });
@@ -218,8 +222,13 @@ router.get("/", authenticateToken, async (req, res) => {
 /* ============== GET /proyectos/kanban (debe ir antes de :id) ============== */
 router.get("/kanban", authenticateToken, async (req, res) => {
   try {
+    const pipeline = await getPipelineForReq(req);
     if (!(await hasTable("proyectos"))) {
-      return res.json({ ok: true, order: CANON_CATS, columns: CANON_CATS.map(s => ({ key: s, title: s, items: [], count: 0 })) });
+      return res.json({
+        ok: true,
+        order: pipeline,
+        columns: pipeline.map((s) => ({ key: s, title: s, items: [], count: 0 })),
+      });
     }
 
     const { organizacion_id } = getUserFromReq(req);
@@ -258,26 +267,32 @@ router.get("/kanban", authenticateToken, async (req, res) => {
     );
 
     const rows = r.rows || [];
-    const byStage = new Map(CANON_CATS.map((s) => [s, []]));
-    const fallback = (cols.has("stage") || cols.has("categoria")) ? (CANON_CATS[0] || "Incoming Leads") : (CANON_CATS[CANON_CATS.length - 1] || "Lost");
+    const byStage = new Map(pipeline.map((s) => [s, []]));
+    const fallback = (cols.has("stage") || cols.has("categoria"))
+      ? (pipeline[0] || "Incoming Leads")
+      : (pipeline[pipeline.length - 1] || "Lost");
 
     for (const it of rows) {
       const stageVal = cols.has("stage") ? it.stage : (cols.has("categoria") ? it.categoria : null);
-      const key = stageVal && CANON_CATS.includes(stageVal) ? stageVal : fallback;
+      const key = stageVal && pipeline.includes(stageVal) ? stageVal : fallback;
       byStage.get(key)?.push(it);
     }
 
-    const columns = CANON_CATS.map((s) => ({
+    const columns = pipeline.map((s) => ({
       key: s,
       title: s,
       items: byStage.get(s),
       count: byStage.get(s).length,
     }));
 
-    res.json({ ok: true, order: CANON_CATS, columns });
+    res.json({ ok: true, order: pipeline, columns });
   } catch (e) {
     console.error("[GET /proyectos/kanban]", e?.stack || e?.message || e);
-    res.json({ ok: true, order: CANON_CATS, columns: CANON_CATS.map((s) => ({ key: s, title: s, items: [], count: 0 })) });
+    res.json({
+      ok: true,
+      order: CANON_CATS,
+      columns: CANON_CATS.map((s) => ({ key: s, title: s, items: [], count: 0 })),
+    });
   }
 });
 
@@ -314,6 +329,7 @@ router.post("/", authenticateToken, async (req, res) => {
     const bearer = getBearer(req);
     const { organizacion_id, email: usuario_email } = getUserFromReq(req);
     const cols = await tableColumns("proyectos");
+    const pipeline = await getPipelineForReq(req);
 
     if (!("assignee" in (req.body || {})) && "responsable" in (req.body || {})) req.body.assignee = req.body.responsable;
     if (!("source" in (req.body || {})) && "origen" in (req.body || {})) req.body.source = req.body.origen;
@@ -340,8 +356,8 @@ router.post("/", authenticateToken, async (req, res) => {
     if (!nombre || !String(nombre).trim()) return res.status(400).json({ ok: false, message: "Nombre requerido" });
     if (!T(descripcion) && T(notas)) descripcion = notas;
 
-    const stageIn = T(stage) ?? T(categoria) ?? (CANON_CATS[0] || "Incoming Leads");
-    const finalStage = CANON_CATS.includes(stageIn) ? stageIn : (CANON_CATS[0] || "Incoming Leads");
+    const stageIn = T(stage) ?? T(categoria) ?? (pipeline[0] || "Incoming Leads");
+    const finalStage = pipeline.includes(stageIn) ? stageIn : (pipeline[0] || "Incoming Leads");
 
     const payload = {
       nombre: T(nombre),
@@ -423,7 +439,7 @@ router.patch("/:id", authenticateToken, async (req, res) => {
     const updates = {};
 
     if (incomingStage) {
-      if (!CANON_CATS.includes(incomingStage)) return res.status(400).json({ ok: false, message: "stage fuera del pipeline" });
+      if (!pipeline.includes(incomingStage)) return res.status(400).json({ ok: false, message: "stage fuera del pipeline" });
       if (cols.has("stage")) updates.stage = incomingStage;
       if (cols.has("categoria")) updates.categoria = incomingStage;
       if (!cols.has("stage") && !cols.has("categoria")) {
@@ -508,9 +524,10 @@ router.patch("/:id/stage", authenticateToken, async (req, res) => {
     if (id == null) return res.status(400).json({ ok: false, message: "ID inválido" });
 
     const cols = await tableColumns("proyectos");
+    const pipeline = await getPipelineForReq(req);
     const next = T(req.body?.stage ?? req.body?.categoria);
     if (!next) return res.status(400).json({ ok: false, message: "stage requerido" });
-    if (!CANON_CATS.includes(next)) return res.status(400).json({ ok: false, message: "stage fuera del pipeline" });
+    if (!pipeline.includes(next)) return res.status(400).json({ ok: false, message: "stage fuera del pipeline" });
     if (!cols.has("stage") && !cols.has("categoria")) return res.status(501).json({ ok: false, message: "Schema no soporta stage/categoria" });
 
     const sets = [];

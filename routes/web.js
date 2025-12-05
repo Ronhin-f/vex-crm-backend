@@ -1,6 +1,6 @@
 // routes/web.js
 import { Router } from "express";
-import { q, CANON_CATS } from "../utils/db.js";
+import { q, CANON_CATS, pipelineForOrg } from "../utils/db.js";
 import { ensureFollowupForAssignment } from "../services/followups.service.js";
 
 const router = Router();
@@ -144,7 +144,8 @@ router.post("/leads", async (req, res) => {
     }
 
     /* 2) Crear lead en proyectos (stage/categoria alineadas) */
-    const stage = (Array.isArray(CANON_CATS) && CANON_CATS[0]) ? CANON_CATS[0] : "Incoming Leads";
+    const pipeline = await pipelineForOrg(orgId);
+    const stage = (Array.isArray(pipeline) && pipeline[0]) ? pipeline[0] : "Incoming Leads";
 
     const insLead = await q(
       `INSERT INTO proyectos

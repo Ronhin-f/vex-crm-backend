@@ -1,6 +1,6 @@
 // routes/kanban.js — Kanban (proyectos/clientes/tareas) + KPIs (blindado, sin deps fantasmas)
 import { Router } from "express";
-import { q, CANON_CATS } from "../utils/db.js";
+import { q, CANON_CATS, pipelineForOrg } from "../utils/db.js";
 import { authenticateToken } from "../middleware/auth.js";
 
 const router = Router();
@@ -73,6 +73,11 @@ const isTruthy = (v) => {
   const s = String(v).trim().toLowerCase();
   return s === "1" || s === "true" || s === "t" || s === "yes" || s === "y" || s === "on";
 };
+
+async function pipelineCtx(req) {
+  const order = await pipelineForOrg(resolveOrgId(req));
+  return { order, set: new Set(order) };
+}
 
 /* ============================ KPIs ============================ */
 router.get("/kpis", authenticateToken, async (req, res) => {
@@ -230,9 +235,11 @@ router.get("/kpis", authenticateToken, async (req, res) => {
 router.get("/proyectos", authenticateToken, async (req, res) => {
   noStore(res);
   try {
+    const { order: orderPipeline, set: pipelineSet } = await pipelineCtx(req);
+
     if (!(await hasTable("proyectos"))) {
-      const columns = ORDER.map((name) => ({ key: name, title: name, count: 0, items: [] }));
-      return res.status(200).json({ columns, order: ORDER });
+      const columns = orderPipeline.map((name) => ({ key: name, title: name, count: 0, items: [] }));
+      return res.status(200).json({ columns, order: orderPipeline });
     }
 
     const orgId = resolveOrgId(req);
@@ -318,14 +325,14 @@ router.get("/proyectos", authenticateToken, async (req, res) => {
       params
     );
 
-    const bucket = new Map(ORDER.map((k) => [k, []]));
+    const bucket = new Map(orderPipeline.map((k) => [k, []]));
     for (const row of rs.rows) {
       const key =
-        (row.stage && PIPELINE_SET.has(row.stage))
+        (row.stage && pipelineSet.has(row.stage))
           ? row.stage
-          : (row.categoria && PIPELINE_SET.has(row.categoria))
+          : (row.categoria && pipelineSet.has(row.categoria))
             ? row.categoria
-            : ORDER[ORDER.length - 1] || "Lost";
+            : orderPipeline[orderPipeline.length - 1] || "Lost";
 
       const estimateChip = !!(row.estimate_url || row.estimate_file);
       bucket.get(key)?.push({
@@ -347,23 +354,24 @@ router.get("/proyectos", authenticateToken, async (req, res) => {
       });
     }
 
-    const columns = ORDER.map((name) => ({
+    const columns = orderPipeline.map((name) => ({
       key: name,
       title: name,
       count: bucket.get(name)?.length || 0,
       items: bucket.get(name) || [],
     }));
 
-    res.json({ columns, order: ORDER });
+    res.json({ columns, order: orderPipeline });
   } catch (e) {
     console.error("[GET /kanban/proyectos]", e?.stack || e?.message || e);
-    const columns = ORDER.map((name) => ({ key: name, title: name, count: 0, items: [] }));
-    res.status(200).json({ columns, order: ORDER });
+    const columns = CANON_CATS.map((name) => ({ key: name, title: name, count: 0, items: [] }));
+    res.status(200).json({ columns, order: CANON_CATS });
   }
 });
 
 router.patch("/proyectos/:id/move", authenticateToken, async (req, res) => {
   try {
+    const { order: orderPipeline, set: pipelineSet } = await pipelineCtx(req);
     if (!(await hasTable("proyectos"))) return res.status(404).json({ message: "Tabla proyectos no existe" });
     const pCols = await tableColumns("proyectos");
     const orgId = resolveOrgId(req);
@@ -372,7 +380,7 @@ router.patch("/proyectos/:id/move", authenticateToken, async (req, res) => {
     let next = coerceText(req.body?.stage ?? req.body?.categoria);
     if (!Number.isInteger(id)) return res.status(400).json({ message: "ID inválido" });
     if (!next) return res.status(400).json({ message: "stage requerido" });
-    if (!PIPELINE_SET.has(next) && !ORDER.includes(next)) {
+    if (!pipelineSet.has(next) && !orderPipeline.includes(next)) {
       return res.status(400).json({ message: "stage fuera del pipeline" });
     }
 
