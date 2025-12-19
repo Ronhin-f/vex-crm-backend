@@ -5,6 +5,7 @@ import { q } from "../utils/db.js";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 import { emit as emitFlow } from "../services/flows.client.js";
+import { coreListUsers } from "../utils/core.client.js";
 
 const router = Router();
 
@@ -314,7 +315,45 @@ router.get("/", auth, async (req, res) => {
     `;
 
     const r = await q(unionSQL, [org, search, limit]);
-    return res.json(r.rows || []);
+    const base = r.rows || [];
+
+    let coreUsers = [];
+    try {
+      const bearer = req.headers?.authorization || undefined;
+      coreUsers = await coreListUsers(org, bearer, { allowSvcFallback: true, passOrgHeader: true });
+    } catch (e) {
+      console.warn("[GET /users] coreListUsers fallo:", e?.message || e);
+      coreUsers = [];
+    }
+
+    const merged = new Map();
+    base.forEach((u) => {
+      if (!u?.email) return;
+      merged.set(String(u.email).toLowerCase(), { ...u });
+    });
+
+    coreUsers.forEach((u) => {
+      const email = String(u?.email || "").toLowerCase();
+      if (!email) return;
+      const nombre = u?.name || u?.nombre || u?.full_name || u?.display_name || email.split("@")[0];
+      const prev = merged.get(email);
+      if (prev) {
+        if (!prev.nombre && nombre) prev.nombre = nombre;
+        return;
+      }
+      merged.set(email, {
+        email,
+        nombre,
+        id: u?.id ?? null,
+        rol: u?.rol ?? null,
+        activo: u?.activo ?? true,
+        organizacion_id: String(org),
+        created_at: u?.created_at ?? null,
+        updated_at: u?.updated_at ?? null,
+      });
+    });
+
+    return res.json(Array.from(merged.values()));
   } catch (e) {
     console.error("[GET /users]", e?.stack || e?.message || e);
     return res.json([]);
@@ -339,6 +378,71 @@ router.get("/full", auth, async (req, res) => {
   } catch (e) {
     console.error("[GET /users/full]", e?.stack || e?.message || e);
     res.json([]);
+  }
+});
+
+/* -------------------- GET /users/diag -------------------- */
+router.get("/diag", auth, async (req, res) => {
+  try {
+    const org = await resolveOrgText(req);
+    if (org == null) return res.json({ ok: false, message: "organizacion_id requerido" });
+
+    const bearer = req.headers?.authorization || undefined;
+
+    let coreUsers = [];
+    let coreError = null;
+    try {
+      coreUsers = await coreListUsers(org, bearer, { allowSvcFallback: true, passOrgHeader: true });
+    } catch (e) {
+      coreError = e?.message || String(e);
+      coreUsers = [];
+    }
+
+    const rLocal = await q(
+      `SELECT email, nombre, rol, activo
+         FROM public.usuarios
+        WHERE organizacion_id::text = $1::text
+        ORDER BY created_at DESC NULLS LAST
+        LIMIT 50`,
+      [org]
+    );
+
+    const rAssign = await q(
+      `SELECT DISTINCT lower(usuario_email) AS email
+         FROM tareas
+        WHERE organizacion_id::text = $1::text
+          AND COALESCE(usuario_email,'') <> ''
+        LIMIT 50`,
+      [org]
+    ).catch(() => ({ rows: [] }));
+
+    res.json({
+      ok: true,
+      org_id: String(org),
+      core: {
+        base_url:
+          process.env.CORE_URL ||
+          process.env.API_CORE_URL ||
+          process.env.CORE_BASE_URL ||
+          process.env.CORE_API_URL ||
+          null,
+        has_service_token: !!(process.env.CORE_SERVICE_TOKEN || process.env.CORE_MACHINE_TOKEN),
+        count: coreUsers.length,
+        sample: coreUsers.slice(0, 10),
+        error: coreError,
+      },
+      local_users: {
+        count: rLocal.rows?.length || 0,
+        sample: rLocal.rows || [],
+      },
+      tareas_assignees: {
+        count: rAssign.rows?.length || 0,
+        sample: rAssign.rows || [],
+      },
+    });
+  } catch (e) {
+    console.error("[GET /users/diag]", e?.stack || e?.message || e);
+    res.status(500).json({ ok: false, message: "Error en diag de usuarios" });
   }
 });
 
