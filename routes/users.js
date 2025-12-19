@@ -4,7 +4,7 @@ import { authenticateToken as auth, requireRole } from "../middleware/auth.js";
 import { q } from "../utils/db.js";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
-import { emit as emitFlow } from "../services/flows.client.js";
+import { emit as emitFlow, health as flowsHealth } from "../services/flows.client.js";
 import { coreListUsers } from "../utils/core.client.js";
 
 const router = Router();
@@ -398,6 +398,66 @@ router.get("/diag", auth, async (req, res) => {
       coreUsers = [];
     }
 
+    let flows = { configured: false, base_url: null, ok: false, reason: null };
+    try {
+      flows = {
+        configured: !!process.env.FLOWS_BASE_URL,
+        base_url: process.env.FLOWS_BASE_URL || null,
+        ...(await flowsHealth()),
+      };
+    } catch (e) {
+      flows = {
+        configured: !!process.env.FLOWS_BASE_URL,
+        base_url: process.env.FLOWS_BASE_URL || null,
+        ok: false,
+        reason: e?.message || "error",
+      };
+    }
+
+    let integraciones = {
+      slack: { configured: false, default_channel: null, source: null },
+      whatsapp: { configured: false, phone_id: null },
+    };
+    try {
+      const rInt = await q(
+        `SELECT slack_webhook_url, slack_default_channel, whatsapp_meta_token, whatsapp_phone_id
+           FROM public.integraciones
+          WHERE organizacion_id::text = $1::text
+          LIMIT 1`,
+        [org]
+      );
+      const row = rInt.rows?.[0] || null;
+      if (row) {
+        integraciones = {
+          slack: {
+            configured: !!row.slack_webhook_url,
+            default_channel: row.slack_default_channel || null,
+            source: "db",
+          },
+          whatsapp: {
+            configured: !!row.whatsapp_meta_token,
+            phone_id: row.whatsapp_phone_id || null,
+          },
+        };
+      } else {
+        const envWebhook = process.env.SLACK_WEBHOOK_URL || null;
+        const envChannel = process.env.SLACK_DEFAULT_CHANNEL || process.env.SLACK_WEBHOOK_FALLBACK_CHANNEL || null;
+        integraciones = {
+          slack: {
+            configured: !!envWebhook,
+            default_channel: envChannel,
+            source: envWebhook ? "env" : null,
+          },
+          whatsapp: {
+            configured: false,
+            phone_id: null,
+          },
+        };
+      }
+    } catch (e) {
+      console.warn("[GET /users/diag] integraciones fallo:", e?.message || e);
+    }
+
     const rLocal = await q(
       `SELECT email, nombre, rol, activo
          FROM public.usuarios
@@ -431,6 +491,8 @@ router.get("/diag", auth, async (req, res) => {
         sample: coreUsers.slice(0, 10),
         error: coreError,
       },
+      flows,
+      integraciones,
       local_users: {
         count: rLocal.rows?.length || 0,
         sample: rLocal.rows || [],
