@@ -34,12 +34,15 @@ const RAW_BASE =
 const CORE_BASE_URL = RAW_BASE.replace(/\/+$/, ""); // sin trailing slash
 const SERVICE_TOKEN =
   process.env.CORE_SERVICE_TOKEN || process.env.CORE_MACHINE_TOKEN || null;
+const SERVICE_EMAIL = process.env.CORE_SERVICE_EMAIL || null;
+const SERVICE_PASSWORD = process.env.CORE_SERVICE_PASSWORD || null;
 
 const CACHE_MS = Number(process.env.CORE_CACHE_MS || 60_000);
 
 // cache simple en memoria
 const mem = {
   users: new Map(), // key: `${orgKey}|${authKind}`
+  serviceAuth: null, // { token, exp }
 };
 
 // util: timeout con AbortController
@@ -115,6 +118,75 @@ function pickArrayFrom(data) {
   return [];
 }
 
+function decodeJwtExp(token) {
+  try {
+    const b64 = token.split(".")[1];
+    const json = Buffer.from(b64, "base64").toString("utf8");
+    const payload = JSON.parse(json);
+    const exp = Number(payload?.exp || 0);
+    return exp > 0 ? exp : null;
+  } catch {
+    return null;
+  }
+}
+
+async function corePost(path, body, { headers = {}, retry = 1 } = {}) {
+  const url = `${CORE_BASE_URL}${path.startsWith("/") ? "" : "/"}${path}`;
+  const { signal, cancel } = withTimeout(8000);
+  try {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+        ...headers,
+      },
+      body: JSON.stringify(body || {}),
+      signal,
+    });
+
+    const ct = (res.headers.get("content-type") || "").toLowerCase();
+    const data = ct.includes("application/json")
+      ? await res.json().catch(() => null)
+      : await res.text().catch(() => null);
+
+    return { ok: res.ok, status: res.status, data };
+  } catch (_e) {
+    if (retry > 0) {
+      await new Promise((r) => setTimeout(r, 150));
+      return corePost(path, body, { headers, retry: retry - 1 });
+    }
+    return { ok: false, status: 0, data: null };
+  } finally {
+    cancel();
+  }
+}
+
+async function getServiceAuthHeader() {
+  if (SERVICE_TOKEN) return `Bearer ${SERVICE_TOKEN}`;
+  if (!SERVICE_EMAIL || !SERVICE_PASSWORD || !CORE_BASE_URL) return null;
+
+  const now = Math.floor(Date.now() / 1000);
+  if (mem.serviceAuth?.token && mem.serviceAuth?.exp && mem.serviceAuth.exp - 60 > now) {
+    return `Bearer ${mem.serviceAuth.token}`;
+  }
+
+  const payload = { email: SERVICE_EMAIL, password: SERVICE_PASSWORD };
+  const endpoints = ["/api/auth/login", "/auth/login", "/api/login", "/login"];
+
+  for (const ep of endpoints) {
+    const res = await corePost(ep, payload, { retry: 0 });
+    const token = res?.data?.token || res?.data?.access_token || res?.data?.jwt || null;
+    if (res.ok && token) {
+      const exp = decodeJwtExp(token) || now + 25 * 24 * 3600;
+      mem.serviceAuth = { token, exp };
+      return `Bearer ${token}`;
+    }
+  }
+
+  return null;
+}
+
 /**
  * Lista usuarios desde Core, opcionalmente filtrando por organización.
  * Compatible con rutas /api/users?organizacion_id=... | orgId=... | org_id=...
@@ -131,7 +203,7 @@ export async function coreListUsers(orgId, bearerFromReq, opts = {}) {
   const { allowSvcFallback = false, passOrgHeader = true } = opts;
 
   // cache key distinta si es bearer de usuario o token de servicio
-  const authKind = bearerFromReq ? "user" : (SERVICE_TOKEN ? "svc" : "none");
+  const authKind = bearerFromReq ? "user" : (SERVICE_TOKEN || SERVICE_EMAIL ? "svc" : "none");
   const key = `${orgId ?? "none"}|${authKind}`;
 
   const hit = mem.users.get(key);
@@ -179,8 +251,8 @@ export async function coreListUsers(orgId, bearerFromReq, opts = {}) {
   };
 
   // 1) Intento con el bearer de usuario o con SERVICE_TOKEN si no hay bearer
-  const primaryAuth =
-    bearerFromReq || (SERVICE_TOKEN ? `Bearer ${SERVICE_TOKEN}` : undefined);
+  const svcAuth = await getServiceAuthHeader();
+  const primaryAuth = bearerFromReq || svcAuth || undefined;
   let res = await tryList(primaryAuth);
 
   // 2) Fallback opcional: si vino bearer de usuario y falló por 401/403, reintento con SERVICE_TOKEN
