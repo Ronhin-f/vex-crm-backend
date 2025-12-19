@@ -36,13 +36,14 @@ const SERVICE_TOKEN =
   process.env.CORE_SERVICE_TOKEN || process.env.CORE_MACHINE_TOKEN || null;
 const SERVICE_EMAIL = process.env.CORE_SERVICE_EMAIL || null;
 const SERVICE_PASSWORD = process.env.CORE_SERVICE_PASSWORD || null;
+const SERVICE_ORG_ID = process.env.CORE_SERVICE_ORG_ID || null;
 
 const CACHE_MS = Number(process.env.CORE_CACHE_MS || 60_000);
 
 // cache simple en memoria
 const mem = {
   users: new Map(), // key: `${orgKey}|${authKind}`
-  serviceAuth: null, // { token, exp }
+  serviceAuth: new Map(), // key: orgKey -> { token, exp }
 };
 
 // util: timeout con AbortController
@@ -162,16 +163,22 @@ async function corePost(path, body, { headers = {}, retry = 1 } = {}) {
   }
 }
 
-async function getServiceAuthHeader() {
+async function getServiceAuthHeader(orgId) {
   if (SERVICE_TOKEN) return `Bearer ${SERVICE_TOKEN}`;
   if (!SERVICE_EMAIL || !SERVICE_PASSWORD || !CORE_BASE_URL) return null;
 
+  const orgKey = SERVICE_ORG_ID || orgId || "none";
   const now = Math.floor(Date.now() / 1000);
-  if (mem.serviceAuth?.token && mem.serviceAuth?.exp && mem.serviceAuth.exp - 60 > now) {
-    return `Bearer ${mem.serviceAuth.token}`;
+  const cached = mem.serviceAuth.get(orgKey);
+  if (cached?.token && cached?.exp && cached.exp - 60 > now) {
+    return `Bearer ${cached.token}`;
   }
 
-  const payload = { email: SERVICE_EMAIL, password: SERVICE_PASSWORD };
+  const payload = {
+    email: SERVICE_EMAIL,
+    password: SERVICE_PASSWORD,
+    ...(orgKey && orgKey !== "none" ? { organizacion_id: orgKey } : {}),
+  };
   const endpoints = ["/api/auth/login", "/auth/login", "/api/login", "/login"];
 
   for (const ep of endpoints) {
@@ -179,7 +186,7 @@ async function getServiceAuthHeader() {
     const token = res?.data?.token || res?.data?.access_token || res?.data?.jwt || null;
     if (res.ok && token) {
       const exp = decodeJwtExp(token) || now + 25 * 24 * 3600;
-      mem.serviceAuth = { token, exp };
+      mem.serviceAuth.set(orgKey, { token, exp });
       return `Bearer ${token}`;
     }
   }
@@ -231,8 +238,13 @@ export async function coreListUsers(orgId, bearerFromReq, opts = {}) {
     const headers = { ...baseHeaders };
     if (authHeader) headers.Authorization = authHeader;
 
-    // Intento principal: /api/users
-    let res = await coreGet(`/api/users?${makeQS(orgId)}`, { headers, retry: 1 });
+    // Intento principal (Core actual): /api/usuarios
+    let res = await coreGet(`/api/usuarios?${makeQS(orgId)}`, { headers, retry: 1 });
+
+    // Fallback 0: /usuarios (alias)
+    if ((!res.ok || !res.data) && orgId) {
+      res = await coreGet(`/usuarios?${makeQS(orgId)}`, { headers, retry: 1 });
+    }
 
     // Fallback 1: /api/orgs/:orgId/users (si hay orgId)
     if ((!res.ok || !res.data) && orgId) {
@@ -242,7 +254,12 @@ export async function coreListUsers(orgId, bearerFromReq, opts = {}) {
       });
     }
 
-    // Fallback 2: /api/users sin filtros (último recurso)
+    // Fallback 2: /api/users (legacy)
+    if (!res.ok || !res.data) {
+      res = await coreGet(`/api/users?${makeQS(orgId)}`, { headers, retry: 1 });
+    }
+
+    // Fallback 3: /api/users sin filtros (último recurso)
     if (!res.ok || !res.data) {
       res = await coreGet(`/api/users`, { headers, retry: 0 });
     }
@@ -251,7 +268,7 @@ export async function coreListUsers(orgId, bearerFromReq, opts = {}) {
   };
 
   // 1) Intento con el bearer de usuario o con SERVICE_TOKEN si no hay bearer
-  const svcAuth = await getServiceAuthHeader();
+  const svcAuth = await getServiceAuthHeader(orgId);
   const primaryAuth = bearerFromReq || svcAuth || undefined;
   let res = await tryList(primaryAuth);
 
