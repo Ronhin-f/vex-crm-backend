@@ -1,4 +1,4 @@
-// routes/contactos.js — Contactos por cliente (blindado + multi-tenant, TEXT-safe)
+﻿// routes/contactos.js â€” Contactos por cliente (blindado + multi-tenant, TEXT-safe)
 import { Router } from "express";
 import { q, pool } from "../utils/db.js";
 import { authenticateToken } from "../middleware/auth.js";
@@ -75,7 +75,7 @@ async function hasInfra() {
 }
 
 /* ============================ GET ============================ */
-/** Lista los contactos de un cliente (valida organización) */
+/** Lista los contactos de un cliente (valida organizaciÃ³n) */
 router.get("/clientes/:clienteId/contactos", authenticateToken, async (req, res) => {
   try {
     if (!(await hasInfra())) return res.json([]);
@@ -85,10 +85,10 @@ router.get("/clientes/:clienteId/contactos", authenticateToken, async (req, res)
 
     const clienteId = Number(req.params.clienteId);
     if (!Number.isInteger(clienteId) || clienteId <= 0) {
-      return res.status(400).json({ ok: false, error: "clienteId inválido" });
+      return res.status(400).json({ ok: false, error: "clienteId invÃ¡lido" });
     }
 
-    // Cliente debe pertenecer a tu organización (si la columna existe)
+    // Cliente debe pertenecer a tu organizaciÃ³n (si la columna existe)
     const cCols = await tableColumns("clientes");
     const ownParams = [clienteId];
     let ownSQL = `SELECT 1 FROM clientes WHERE id=$1`;
@@ -166,14 +166,14 @@ router.post("/clientes/:clienteId/contactos", authenticateToken, async (req, res
   const client = await pool.connect();
   try {
     if (!(await hasInfra()))
-      return res.status(501).json({ ok: false, error: "Módulo de contactos no instalado" });
+      return res.status(501).json({ ok: false, error: "MÃ³dulo de contactos no instalado" });
 
     const orgId = getOrgText(req);
     if (!orgId) return res.status(400).json({ ok: false, error: "organizacion_id requerido" });
 
     const clienteId = Number(req.params.clienteId);
     if (!Number.isInteger(clienteId) || clienteId <= 0) {
-      return res.status(400).json({ ok: false, error: "clienteId inválido" });
+      return res.status(400).json({ ok: false, error: "clienteId invÃ¡lido" });
     }
 
     // Verifica que el cliente sea tuyo (si existe la columna)
@@ -199,6 +199,9 @@ router.post("/clientes/:clienteId/contactos", authenticateToken, async (req, res
       telefono,
       cargo,
       rol,
+      peso,
+      vacunas,
+      proxima_vacuna,
       es_principal = false,
       notas,
       obra_social,
@@ -215,14 +218,14 @@ router.post("/clientes/:clienteId/contactos", authenticateToken, async (req, res
       dificultad,
     } = body;
     if (!T(nombre) && !T(email) && !T(telefono)) {
-      return res.status(400).json({ ok: false, error: "nombre, email o teléfono requerido" });
+      return res.status(400).json({ ok: false, error: "nombre, email o telÃ©fono requerido" });
     }
 
     const ctCols = await tableColumns("contactos");
     const preguntasClean = cleanPreguntas(preguntas);
     await client.query("BEGIN");
 
-    // ¿Existe algún principal? (solo si la columna existe)
+    // Â¿Existe algÃºn principal? (solo si la columna existe)
     let makePrimary = false;
     if (ctCols.has("es_principal")) {
       const hasPrincipal = await client.query(
@@ -232,7 +235,7 @@ router.post("/clientes/:clienteId/contactos", authenticateToken, async (req, res
       makePrimary = hasPrincipal.rowCount ? bool(es_principal) : true;
     }
 
-    // Inserta dinámicamente
+    // Inserta dinÃ¡micamente
     const fields = [];
     const vals = [];
     const add = (col, val) => { if (ctCols.has(col)) { fields.push(col); vals.push(val); } };
@@ -267,7 +270,7 @@ router.post("/clientes/:clienteId/contactos", authenticateToken, async (req, res
 
     if (!fields.length) {
       await client.query("ROLLBACK");
-      return res.status(501).json({ ok: false, error: "Schema inválido en contactos" });
+      return res.status(501).json({ ok: false, error: "Schema invÃ¡lido en contactos" });
     }
 
     const placeholders = fields.map((_, i) => `$${i + 1}`);
@@ -277,7 +280,7 @@ router.post("/clientes/:clienteId/contactos", authenticateToken, async (req, res
     );
     const contacto = ins.rows[0];
 
-    // Si marcamos como principal, apagar los demás (misma TX)
+    // Si marcamos como principal, apagar los demÃ¡s (misma TX)
     if (ctCols.has("es_principal") && contacto?.es_principal) {
       await client.query(
         `UPDATE contactos
@@ -304,19 +307,19 @@ router.patch("/contactos/:id", authenticateToken, async (req, res) => {
   const client = await pool.connect();
   try {
     if (!(await hasInfra()))
-      return res.status(501).json({ ok: false, error: "Módulo de contactos no instalado" });
+      return res.status(501).json({ ok: false, error: "MÃ³dulo de contactos no instalado" });
 
     const orgId = getOrgText(req);
     if (!orgId) return res.status(400).json({ ok: false, error: "organizacion_id requerido" });
 
     const id = Number(req.params.id);
     if (!Number.isInteger(id) || id <= 0)
-      return res.status(400).json({ ok: false, error: "id inválido" });
+      return res.status(400).json({ ok: false, error: "id invÃ¡lido" });
 
     const cCols = await tableColumns("clientes");
     const ctCols = await tableColumns("contactos");
 
-    // Verifica pertenencia por organización (si existe la columna)
+    // Verifica pertenencia por organizaciÃ³n (si existe la columna)
     const params = [id];
     let curSQL = `SELECT ct.id, ct.cliente_id
                     FROM contactos ct
@@ -415,14 +418,14 @@ router.delete("/contactos/:id", authenticateToken, async (req, res) => {
   const client = await pool.connect();
   try {
     if (!(await hasInfra()))
-      return res.status(501).json({ ok: false, error: "Módulo de contactos no instalado" });
+      return res.status(501).json({ ok: false, error: "MÃ³dulo de contactos no instalado" });
 
     const orgId = getOrgText(req);
     if (!orgId) return res.status(400).json({ ok: false, error: "organizacion_id requerido" });
 
     const id = Number(req.params.id);
     if (!Number.isInteger(id) || id <= 0)
-      return res.status(400).json({ ok: false, error: "id inválido" });
+      return res.status(400).json({ ok: false, error: "id invÃ¡lido" });
 
     const cCols = await tableColumns("clientes");
     const ctCols = await tableColumns("contactos");
@@ -481,3 +484,4 @@ router.delete("/contactos/:id", authenticateToken, async (req, res) => {
 });
 
 export default router;
+
