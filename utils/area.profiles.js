@@ -1,5 +1,6 @@
 // utils/area.profiles.js — perfiles por vertical (vocabulario + forms)
-export const ALLOWED_AREAS = ["general", "salud", "construccion", "veterinaria"];
+export const ALLOWED_AREAS = ["general", "salud", "veterinaria"];
+const CLINICAL_AREAS = new Set(["salud", "veterinaria"]);
 
 /* ---------- Base ---------- */
 const BASE_PROFILE = {
@@ -55,16 +56,6 @@ const PRESETS = {
         ],
       },
     },
-  },
-  construccion: {
-    ...BASE_PROFILE,
-    area: "construccion",
-    vocab: {
-      ...BASE_PROFILE.vocab,
-      projects: "Obras",
-      providers: "Contratistas",
-    },
-    features: { clinicalHistory: false },
   },
   veterinaria: {
     ...BASE_PROFILE,
@@ -176,10 +167,16 @@ function cleanForms(raw, presetForms) {
 export function resolveProfile(row = {}) {
   const area = ALLOWED_AREAS.includes(row.area) ? row.area : "general";
   const preset = PRESETS[area] || PRESETS.general;
+  const rawFeatures = row.features || {};
+  const mergedFeatures = { ...preset.features, ...rawFeatures };
+  mergedFeatures.clinicalHistory =
+    CLINICAL_AREAS.has(area) && typeof rawFeatures.clinicalHistory === "boolean"
+      ? rawFeatures.clinicalHistory
+      : false;
   return {
     area,
     vocab: cleanVocab(row.vocab, preset.vocab),
-    features: { ...preset.features, ...(row.features || {}) },
+    features: mergedFeatures,
     forms: deepMerge(preset.forms, row.forms || {}),
     availableAreas: ALLOWED_AREAS,
   };
@@ -190,8 +187,11 @@ export function sanitizeProfilePayload(body = {}) {
   const preset = PRESETS[area] || PRESETS.general;
   const vocab = cleanVocab(body.vocab, preset.vocab);
   const features = { ...preset.features };
-  if (typeof body.features?.clinicalHistory === "boolean") {
+  const allowClinical = CLINICAL_AREAS.has(area);
+  if (allowClinical && typeof body.features?.clinicalHistory === "boolean") {
     features.clinicalHistory = body.features.clinicalHistory;
+  } else {
+    features.clinicalHistory = false;
   }
   if (typeof body.features?.labResults === "boolean") {
     features.labResults = body.features.labResults;
