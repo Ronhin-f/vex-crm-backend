@@ -121,9 +121,19 @@ router.get("/", authenticateToken, async (req, res) => {
       params.push(like);
       const i = params.length;
       // tolerante si telefono no es texto
-      where.push(
-        `(c.nombre ILIKE $${i} OR c.email ILIKE $${i} OR CAST(c.telefono AS TEXT) ILIKE $${i})`
-      );
+      const parts = [
+        `c.nombre ILIKE $${i}`,
+        `c.email ILIKE $${i}`,
+        `CAST(c.telefono AS TEXT) ILIKE $${i}`,
+      ];
+      if (contactosOk) {
+        parts.push(
+          `pc.nombre ILIKE $${i}`,
+          `pc.email ILIKE $${i}`,
+          `CAST(pc.telefono AS TEXT) ILIKE $${i}`
+        );
+      }
+      where.push(`(${parts.join(" OR ")})`);
     }
 
     // LATERAL a contactos si existe tabla
@@ -138,9 +148,9 @@ router.get("/", authenticateToken, async (req, res) => {
         `CASE WHEN pc.id IS NULL THEN NULL ELSE jsonb_build_object(
            'id', pc.id,'nombre', pc.nombre,'email', pc.email,'telefono', pc.telefono,'es_principal', true
          ) END AS primary_contact, ` +
-        `COALESCE(c.contacto_nombre, pc.nombre) AS contacto_nombre, ` +
-        `COALESCE(c.email, pc.email) AS email, ` +
-        `COALESCE(c.telefono, pc.telefono) AS telefono`;
+        `COALESCE(pc.nombre, c.contacto_nombre) AS contacto_nombre, ` +
+        `COALESCE(pc.email, c.email) AS email, ` +
+        `COALESCE(pc.telefono, c.telefono) AS telefono`;
       fromJoin = `
         LEFT JOIN LATERAL (
           SELECT id, nombre, email, telefono

@@ -199,9 +199,13 @@ router.get("/", authenticateToken, async (req, res) => {
 
     if (qtext) {
       const qv = `%${String(qtext).trim()}%`;
-      params.push(qv); const i = params.length;
-      if (cols.has("descripcion")) where.push(`(p.nombre ILIKE $${i} OR p.descripcion ILIKE $${i})`);
-      else where.push(`(p.nombre ILIKE $${i})`);
+      params.push(qv);
+      const i = params.length;
+      const parts = [`p.nombre ILIKE $${i}`];
+      if (cols.has("descripcion")) parts.push(`p.descripcion ILIKE $${i}`);
+      if (cols.has("contacto_nombre")) parts.push(`p.contacto_nombre ILIKE $${i}`);
+      if (cols.has("assignee")) parts.push(`p.assignee ILIKE $${i}`);
+      where.push(`(${parts.join(" OR ")})`);
     }
 
     params.push(limit, offset);
@@ -251,9 +255,13 @@ router.get("/kanban", authenticateToken, async (req, res) => {
 
     if (qtext) {
       const qv = `%${String(qtext).trim()}%`;
-      params.push(qv); const i = params.length;
-      if (cols.has("descripcion")) where.push(`(p.nombre ILIKE $${i} OR p.descripcion ILIKE $${i})`);
-      else where.push(`(p.nombre ILIKE $${i})`);
+      params.push(qv);
+      const i = params.length;
+      const parts = [`p.nombre ILIKE $${i}`];
+      if (cols.has("descripcion")) parts.push(`p.descripcion ILIKE $${i}`);
+      if (cols.has("contacto_nombre")) parts.push(`p.contacto_nombre ILIKE $${i}`);
+      if (cols.has("assignee")) parts.push(`p.assignee ILIKE $${i}`);
+      where.push(`(${parts.join(" OR ")})`);
     }
 
     const r = await q(
