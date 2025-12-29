@@ -430,6 +430,7 @@ router.patch("/:id", authenticateToken, async (req, res) => {
     if (id == null) return res.status(400).json({ ok: false, message: "ID inválido" });
 
     const cols = await tableColumns("proyectos");
+    const pipeline = await getPipelineForReq(req);
 
     if (!("descripcion" in (req.body || {})) && "notas" in (req.body || {})) req.body.descripcion = req.body.notas;
     if (!("assignee" in (req.body || {})) && "responsable" in (req.body || {})) req.body.assignee = req.body.responsable;
