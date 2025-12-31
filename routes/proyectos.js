@@ -695,6 +695,12 @@ router.delete("/:id", authenticateToken, async (req, res) => {
     res.json({ ok: true });
   } catch (e) {
     console.error("[DELETE /proyectos/:id]", e?.stack || e?.message || e);
+    if (e?.code === "23503") {
+      return res.status(409).json({ ok: false, message: "No se puede borrar: tiene datos asociados" });
+    }
+    if (e?.code === "22P02") {
+      return res.status(400).json({ ok: false, message: "ID inválido" });
+    }
     res.status(500).json({ ok: false, message: "Error eliminando proyecto" });
   }
 });
