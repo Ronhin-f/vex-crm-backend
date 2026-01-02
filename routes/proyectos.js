@@ -53,6 +53,34 @@ async function tableColumns(name) {
     return new Set((r.rows || []).map(x => x.column_name));
   } catch { return new Set(); }
 }
+function quoteIdent(v) {
+  return `"${String(v).replace(/"/g, "\"\"")}"`;
+}
+async function findProjectRefs() {
+  try {
+    const r = await q(
+      `
+      SELECT
+        tc.table_name AS table_name,
+        kcu.column_name AS column_name
+      FROM information_schema.table_constraints tc
+      JOIN information_schema.key_column_usage kcu
+        ON tc.constraint_name = kcu.constraint_name
+       AND tc.table_schema = kcu.table_schema
+      JOIN information_schema.constraint_column_usage ccu
+        ON ccu.constraint_name = tc.constraint_name
+       AND ccu.table_schema = tc.table_schema
+      WHERE tc.constraint_type = 'FOREIGN KEY'
+        AND tc.table_schema = 'public'
+        AND ccu.table_schema = 'public'
+        AND ccu.table_name = 'proyectos'
+      `
+    );
+    return r.rows || [];
+  } catch {
+    return [];
+  }
+}
 
 // Filtro multi-tenant TEXT-safe (si la tabla tiene org_id)
 function orgFilterText(cols, alias, orgId) {
@@ -675,7 +703,7 @@ router.delete("/:id", authenticateToken, async (req, res) => {
       paramsDel.push(String(organizacion_id));
       whereDel += ` AND organizacion_id::text = $2::text`;
     }
-    const del = await q(`DELETE FROM proyectos WHERE ${whereDel}`, paramsDel);
+    let del = await q(`DELETE FROM proyectos WHERE ${whereDel}`, paramsDel);
     if (!del.rowCount) return res.status(404).json({ ok: false, message: "Proyecto no encontrado" });
 
     if (prev.rowCount) {
@@ -696,6 +724,38 @@ router.delete("/:id", authenticateToken, async (req, res) => {
   } catch (e) {
     console.error("[DELETE /proyectos/:id]", e?.stack || e?.message || e);
     if (e?.code === "23503") {
+      try {
+        const { organizacion_id } = getUserFromReq(req);
+        const id = toInt(req.params.id);
+        if (id != null) {
+          const refs = await findProjectRefs();
+          for (const ref of refs) {
+            if (!ref?.table_name || !ref?.column_name) continue;
+            const colsRef = await tableColumns(ref.table_name);
+            const tableIdent = quoteIdent(ref.table_name);
+            const colIdent = quoteIdent(ref.column_name);
+            const params = [id];
+            let where = `${colIdent} = $1`;
+            if (colsRef.has("organizacion_id") && organizacion_id != null) {
+              params.push(String(organizacion_id));
+              where += ` AND organizacion_id::text = $2::text`;
+            }
+            await q(`DELETE FROM ${tableIdent} WHERE ${where}`, params);
+          }
+          const { cols } = await buildProjectSelect();
+          const paramsDel = [id];
+          let whereDel = `id = $1`;
+          if (cols.has("organizacion_id")) {
+            if (organizacion_id == null) return res.status(400).json({ ok: false, message: "organizacion_id requerido" });
+            paramsDel.push(String(organizacion_id));
+            whereDel += ` AND organizacion_id::text = $2::text`;
+          }
+          const retry = await q(`DELETE FROM proyectos WHERE ${whereDel}`, paramsDel);
+          if (retry.rowCount) return res.json({ ok: true });
+        }
+      } catch (inner) {
+        console.error("[DELETE /proyectos/:id] cleanup", inner?.stack || inner?.message || inner);
+      }
       return res.status(409).json({ ok: false, message: "No se puede borrar: tiene datos asociados" });
     }
     if (e?.code === "22P02") {
