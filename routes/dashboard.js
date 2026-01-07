@@ -89,6 +89,8 @@ function orgFilterText(cols, orgId, alias = null) {
  *  - proximosSeguimientos: tareas a 7d
  */
 router.get("/", auth, async (req, res) => {
+  const includeVacunas =
+    !/^(0|false|no)$/i.test(String(req.query?.include_vacunas ?? ""));
   const out = {
     metrics: {
       won: 0,
@@ -436,7 +438,7 @@ router.get("/", auth, async (req, res) => {
 
     /* Vacunas proximas (14/7/3 dias) */
     try {
-      if (hasContactos && colsContactos.has("proxima_vacuna")) {
+      if (includeVacunas && hasContactos && colsContactos.has("proxima_vacuna")) {
         const params = [];
         const where = [];
         if (orgId && colsContactos.has("organizacion_id")) {
