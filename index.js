@@ -61,6 +61,12 @@ try {
   console.error("initDB() fallo:", e?.stack || e?.message || e);
 }
 
+function joinPath(prefix, pathname) {
+  if (!prefix) return pathname;
+  if (pathname === "/") return prefix;
+  return `${prefix}${pathname}`;
+}
+
 async function mount(pathname, modulePath) {
   try {
     const mod = await import(modulePath);
@@ -78,37 +84,45 @@ async function mount(pathname, modulePath) {
   }
 }
 
-await mount("/", "./routes/contactos.js");
-await mount("/clientes", "./routes/clientes.js");
-await mount("/proyectos", "./routes/proyectos.js");
-await mount("/proyectos", "./routes/proyectos.assign.js");
-await mount("/proveedores", "./routes/proveedores.js");
+async function mountAll(pathname, modulePath) {
+  const prefixes = ["", "/api"];
+  for (const p of prefixes) {
+    await mount(joinPath(p, pathname), modulePath);
+  }
+}
 
-await mount("/users", "./routes/users.js");
-await mount("/usuarios", "./routes/users.js");
+await mountAll("/", "./routes/contactos.js");
+await mountAll("/clientes", "./routes/clientes.js");
+await mountAll("/proyectos", "./routes/proyectos.js");
+await mountAll("/proyectos", "./routes/proyectos.assign.js");
+await mountAll("/proveedores", "./routes/proveedores.js");
 
-await mount("/compras", "./routes/compras.js");
+await mountAll("/users", "./routes/users.js");
+await mountAll("/usuarios", "./routes/users.js");
 
-await mount("/categorias", "./routes/categorias.js");
-await mount("/kanban", "./routes/kanban.js");
-await mount("/tareas", "./routes/tareas.js");
-await mount("/dashboard", "./routes/dashboard.js");
+await mountAll("/compras", "./routes/compras.js");
 
-await mount("/analytics", "./routes/analytics.js");
+await mountAll("/categorias", "./routes/categorias.js");
+await mountAll("/kanban", "./routes/kanban.js");
+await mountAll("/tareas", "./routes/tareas.js");
+await mountAll("/dashboard", "./routes/dashboard.js");
 
-await mount("/upload", "./routes/upload.js");
-await mount("/modulos", "./routes/modulos.js");
-await mount("/integraciones", "./routes/integraciones.js");
-await mount("/jobs", "./routes/job.js");
-await mount("/ai", "./routes/ai.js");
-await mount("/health", "./routes/health.js");
-await mount("/labs", "./routes/labs.js");
-await mount("/recordatorios", "./routes/recordatorios.js");
+await mountAll("/analytics", "./routes/analytics.js");
 
-await mount("/area", "./routes/area.js");
-await mount("/historias", "./routes/historias.js");
+await mountAll("/upload", "./routes/upload.js");
+await mountAll("/modulos", "./routes/modulos.js");
+await mountAll("/integraciones", "./routes/integraciones.js");
+await mountAll("/jobs", "./routes/job.js");
+await mountAll("/ai", "./routes/ai.js");
+await mountAll("/health", "./routes/health.js");
+await mountAll("/labs", "./routes/labs.js");
+await mountAll("/recordatorios", "./routes/recordatorios.js");
+await mountAll("/billing", "./routes/billing.js");
 
-await mount("/web", "./routes/web.js");
+await mountAll("/area", "./routes/area.js");
+await mountAll("/historias", "./routes/historias.js");
+
+await mountAll("/web", "./routes/web.js");
 
 function withOrg(req, res, next) {
   const org =
