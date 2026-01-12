@@ -83,10 +83,10 @@ async function findProjectRefs() {
 }
 
 // Filtro multi-tenant TEXT-safe (si la tabla tiene org_id)
-function orgFilterText(cols, alias, orgId) {
+function orgFilterText(cols, alias, orgId, paramIndex = 1) {
   if (!cols.has("organizacion_id")) return { where: [], params: [] };
   if (orgId == null) return { where: ["1=0"], params: [] }; // evita mezclar tenants
-  return { where: [`${alias}.organizacion_id::text = $${1}::text`], params: [String(orgId)] };
+  return { where: [`${alias}.organizacion_id::text = $${paramIndex}::text`], params: [String(orgId)] };
 }
 
 function exp(cols, name, type) {
@@ -162,7 +162,7 @@ router.get("/options", authenticateToken, async (req, res) => {
     if (cols.has("source")) {
       const wh = [`p.source IS NOT NULL`, `p.source <> ''`];
       const params = [];
-      const of = orgFilterText(cols, "p", organizacion_id);
+      const of = orgFilterText(cols, "p", organizacion_id, params.length + 1);
       if (of.where.length) { wh.unshift(of.where[0]); params.push(...of.params); }
       const src = await q(`SELECT DISTINCT p.source AS v FROM proyectos p ${wh.length ? "WHERE " + wh.join(" AND ") : ""} ORDER BY 1`, params);
       sources = (src.rows || []).map(r => r.v).filter(Boolean);
@@ -175,7 +175,7 @@ router.get("/options", authenticateToken, async (req, res) => {
     if (cols.has("assignee")) {
       const wha = [`p.assignee IS NOT NULL`, `p.assignee <> ''`];
       const pa = [];
-      const of = orgFilterText(cols, "p", organizacion_id);
+      const of = orgFilterText(cols, "p", organizacion_id, pa.length + 1);
       if (of.where.length) { wha.unshift(of.where[0]); pa.push(...of.params); }
       const asg = await q(`SELECT DISTINCT p.assignee AS v FROM proyectos p ${wha.length ? "WHERE " + wha.join(" AND ") : ""} ORDER BY 1`, pa);
       assignees = (asg.rows || []).map(r => String(r.v || "").toLowerCase()).filter(Boolean);
@@ -210,7 +210,7 @@ router.get("/", authenticateToken, async (req, res) => {
     const params = [];
 
     // org TEXT-safe
-    const of = orgFilterText(cols, "p", organizacion_id);
+    const of = orgFilterText(cols, "p", organizacion_id, params.length + 1);
     if (of.where.length) { where.push(of.where[0]); params.push(...of.params); }
 
     if (stage && (cols.has("stage") || cols.has("categoria"))) {
@@ -274,7 +274,7 @@ router.get("/kanban", authenticateToken, async (req, res) => {
     const where = [];
     const params = [];
 
-    const of = orgFilterText(cols, "p", organizacion_id);
+    const of = orgFilterText(cols, "p", organizacion_id, params.length + 1);
     if (of.where.length) { where.push(of.where[0]); params.push(...of.params); }
 
     if (source && cols.has("source")) { params.push(String(source)); where.push(`p.source = $${params.length}`); }
@@ -345,7 +345,7 @@ router.get("/:id", authenticateToken, async (req, res) => {
 
     const params = [id];
     let where = `p.id = $1`;
-    const of = orgFilterText(cols, "p", organizacion_id);
+    const of = orgFilterText(cols, "p", organizacion_id, params.length + 1);
     if (of.where.length) { where += ` AND ${of.where[0]}`; params.push(...of.params); }
 
     const r = await q(`${selectSQL} WHERE ${where}`, params);
@@ -691,7 +691,7 @@ router.delete("/:id", authenticateToken, async (req, res) => {
     // Traigo previo con guardia TEXT-safe
     const paramsPrev = [id];
     let wherePrev = `p.id=$1`;
-    const of = orgFilterText(cols, "p", organizacion_id);
+    const of = orgFilterText(cols, "p", organizacion_id, paramsPrev.length + 1);
     if (of.where.length) { wherePrev += ` AND ${of.where[0]}`; paramsPrev.push(...of.params); }
     const prev = await q(`${selectSQL} WHERE ${wherePrev}`, paramsPrev);
 
