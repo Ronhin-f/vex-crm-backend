@@ -1,4 +1,4 @@
-// index.js — VEX CRM Backend (ESM)
+﻿// index.js ƒ?" VEX CRM Backend (ESM)
 import "dotenv/config";
 import express from "express";
 import morgan from "morgan";
@@ -101,6 +101,8 @@ await mountAll("/users", "./routes/users.js");
 await mountAll("/usuarios", "./routes/users.js");
 
 await mountAll("/compras", "./routes/compras.js");
+await mountAll("/stock", "./routes/stock.js");
+await mountAll("/cobros", "./routes/cobros.js");
 
 await mountAll("/categorias", "./routes/categorias.js");
 await mountAll("/kanban", "./routes/kanban.js");

@@ -1,4 +1,4 @@
-// utils/db.js — VEX CRM (Railway/Postgres, ESM)
+﻿// utils/db.js ƒ?" VEX CRM (Railway/Postgres, ESM)
 import pg from "pg";
 const { Pool, types } = pg;
 
@@ -268,6 +268,34 @@ export async function initDB() {
       observacion TEXT
     );
 
+    CREATE TABLE IF NOT EXISTS cobros (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      organizacion_id TEXT NOT NULL,
+      cliente_id INTEGER,
+      almacen_id INTEGER,
+      moneda TEXT DEFAULT 'ARS',
+      total NUMERIC(14,2) NOT NULL DEFAULT 0,
+      descuento_total NUMERIC(14,2) NOT NULL DEFAULT 0,
+      medio_pago TEXT,
+      notas TEXT,
+      estado TEXT DEFAULT 'pendiente',
+      usuario_email TEXT,
+      stock_error TEXT,
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      updated_at TIMESTAMPTZ DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS cobro_items (
+      id SERIAL PRIMARY KEY,
+      cobro_id UUID REFERENCES cobros(id) ON DELETE CASCADE,
+      producto_id INTEGER,
+      producto_nombre TEXT,
+      codigo_qr TEXT,
+      cantidad NUMERIC(14,3) NOT NULL DEFAULT 1,
+      precio_unitario NUMERIC(14,2) NOT NULL DEFAULT 0,
+      subtotal NUMERIC(14,2) NOT NULL DEFAULT 0
+    );
+
     CREATE TABLE IF NOT EXISTS tareas (
       id SERIAL PRIMARY KEY,
       titulo TEXT NOT NULL,
@@ -473,6 +501,11 @@ export async function initDB() {
         CREATE TRIGGER tr_compras_touch BEFORE UPDATE ON public.compras
         FOR EACH ROW EXECUTE FUNCTION touch_updated_at();
       END IF;
+      IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='cobros' AND column_name='updated_at')
+         AND NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname='tr_cobros_touch') THEN
+        CREATE TRIGGER tr_cobros_touch BEFORE UPDATE ON public.cobros
+        FOR EACH ROW EXECUTE FUNCTION touch_updated_at();
+      END IF;
       IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='proveedores' AND column_name='updated_at')
          AND NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname='tr_proveedores_touch') THEN
         CREATE TRIGGER tr_proveedores_touch BEFORE UPDATE ON public.proveedores
@@ -528,7 +561,7 @@ export async function initDB() {
 
   const ORG_TABLES = [
     "usuarios","clientes","contactos","pedidos","tareas","integraciones","recordatorios",
-    "categorias","compras","compra_items","pedido_items","proyectos","proveedores","slack_users",
+    "categorias","compras","compra_items","cobros","pedido_items","proyectos","proveedores","slack_users",
     "org_profiles","historias_clinicas"
   ];
   for (const t of ORG_TABLES) {
@@ -560,6 +593,11 @@ export async function initDB() {
   await q(`CREATE INDEX IF NOT EXISTS idx_compras_fecha        ON compras(fecha);`);
   await q(`CREATE INDEX IF NOT EXISTS idx_compras_estado       ON compras(estado);`);
   await q(`CREATE INDEX IF NOT EXISTS idx_compra_items_cid     ON compra_items(compra_id);`);
+
+  await q(`CREATE INDEX IF NOT EXISTS idx_cobros_org           ON cobros(organizacion_id);`);
+  await q(`CREATE INDEX IF NOT EXISTS idx_cobros_created       ON cobros(created_at);`);
+  await q(`CREATE INDEX IF NOT EXISTS idx_cobros_estado        ON cobros(estado);`);
+  await q(`CREATE INDEX IF NOT EXISTS idx_cobro_items_cobro    ON cobro_items(cobro_id);`);
 
   await q(`CREATE INDEX IF NOT EXISTS idx_proyectos_org        ON proyectos(organizacion_id);`);
   await q(`CREATE INDEX IF NOT EXISTS idx_proyectos_updated    ON proyectos(updated_at);`);
@@ -608,7 +646,7 @@ export async function initDB() {
     const name = CANON_CATS[i];
     await q(
       `UPDATE categorias SET orden=$2
-         WHERE organizacion_id IS NULL AND lower(nombre)=lower($1)`,
+         WHERE organizacion_id IS NULL AND lower(nombre)=lower($1)` ,
       [name, i]
     );
     await q(
