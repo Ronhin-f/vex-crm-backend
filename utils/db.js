@@ -1,4 +1,4 @@
-﻿// utils/db.js ƒ?" VEX CRM (Railway/Postgres, ESM)
+// utils/db.js �?" VEX CRM (Railway/Postgres, ESM)
 import pg from "pg";
 const { Pool, types } = pg;
 
@@ -268,11 +268,31 @@ export async function initDB() {
       observacion TEXT
     );
 
+    CREATE TABLE IF NOT EXISTS cajas (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      organizacion_id TEXT NOT NULL,
+      almacen_id INTEGER NOT NULL,
+      usuario_email TEXT,
+      estado TEXT DEFAULT 'abierta',
+      apertura_monto NUMERIC(14,2) NOT NULL DEFAULT 0,
+      apertura_at TIMESTAMPTZ DEFAULT NOW(),
+      cierre_monto NUMERIC(14,2),
+      cierre_total_esperado NUMERIC(14,2),
+      cierre_diferencia NUMERIC(14,2),
+      cierre_at TIMESTAMPTZ,
+      arqueo_detalle JSONB DEFAULT '{}'::jsonb,
+      arqueo_total NUMERIC(14,2),
+      notas TEXT,
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      updated_at TIMESTAMPTZ DEFAULT NOW()
+    );
     CREATE TABLE IF NOT EXISTS cobros (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
       organizacion_id TEXT NOT NULL,
       cliente_id INTEGER,
       almacen_id INTEGER,
+      caja_id UUID,
+
       moneda TEXT DEFAULT 'ARS',
       total NUMERIC(14,2) NOT NULL DEFAULT 0,
       descuento_total NUMERIC(14,2) NOT NULL DEFAULT 0,
@@ -386,6 +406,21 @@ export async function initDB() {
     );
   `);
 
+  await q(`
+    ALTER TABLE public.cobros
+      ADD COLUMN IF NOT EXISTS caja_id UUID;
+  `);
+
+  await q(`
+    DO $$
+    BEGIN
+      IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'cobros_caja_fk') THEN
+        ALTER TABLE public.cobros
+          ADD CONSTRAINT cobros_caja_fk
+          FOREIGN KEY (caja_id) REFERENCES public.cajas(id) ON DELETE SET NULL;
+      END IF;
+    END$$;
+  `);
   await q(`
     ALTER TABLE public.contactos
       ADD COLUMN IF NOT EXISTS obra_social TEXT,
@@ -506,6 +541,11 @@ export async function initDB() {
         CREATE TRIGGER tr_cobros_touch BEFORE UPDATE ON public.cobros
         FOR EACH ROW EXECUTE FUNCTION touch_updated_at();
       END IF;
+      IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='cajas' AND column_name='updated_at')
+         AND NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname='tr_cajas_touch') THEN
+        CREATE TRIGGER tr_cajas_touch BEFORE UPDATE ON public.cajas
+        FOR EACH ROW EXECUTE FUNCTION touch_updated_at();
+      END IF;
       IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='proveedores' AND column_name='updated_at')
          AND NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname='tr_proveedores_touch') THEN
         CREATE TRIGGER tr_proveedores_touch BEFORE UPDATE ON public.proveedores
@@ -561,7 +601,7 @@ export async function initDB() {
 
   const ORG_TABLES = [
     "usuarios","clientes","contactos","pedidos","tareas","integraciones","recordatorios",
-    "categorias","compras","compra_items","cobros","pedido_items","proyectos","proveedores","slack_users",
+    "categorias","compras","compra_items","cobros","cajas","pedido_items","proyectos","proveedores","slack_users",
     "org_profiles","historias_clinicas"
   ];
   for (const t of ORG_TABLES) {
@@ -598,6 +638,10 @@ export async function initDB() {
   await q(`CREATE INDEX IF NOT EXISTS idx_cobros_created       ON cobros(created_at);`);
   await q(`CREATE INDEX IF NOT EXISTS idx_cobros_estado        ON cobros(estado);`);
   await q(`CREATE INDEX IF NOT EXISTS idx_cobro_items_cobro    ON cobro_items(cobro_id);`);
+  await q(`CREATE INDEX IF NOT EXISTS idx_cobros_caja          ON cobros(caja_id);`);
+  await q(`CREATE INDEX IF NOT EXISTS idx_cajas_org_estado     ON cajas(organizacion_id, estado);`);
+  await q(`CREATE INDEX IF NOT EXISTS idx_cajas_created        ON cajas(organizacion_id, created_at);`);
+  await q(`CREATE INDEX IF NOT EXISTS idx_cajas_almacen        ON cajas(organizacion_id, almacen_id);`);
 
   await q(`CREATE INDEX IF NOT EXISTS idx_proyectos_org        ON proyectos(organizacion_id);`);
   await q(`CREATE INDEX IF NOT EXISTS idx_proyectos_updated    ON proyectos(updated_at);`);
@@ -684,3 +728,5 @@ export async function closeDB() {
     await db.end();
   } catch {}
 }
+
+

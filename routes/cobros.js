@@ -1,4 +1,4 @@
-﻿import { Router } from "express";
+import { Router } from "express";
 import { authenticateToken } from "../middleware/auth.js";
 import { getOrgText } from "../utils/org.js";
 import { q, pool } from "../utils/db.js";
@@ -172,6 +172,7 @@ router.get("/", authenticateToken, async (req, res) => {
     const pageSize = Math.min(Math.max(parseInt(req.query?.pageSize, 10) || 50, 1), 200);
     const estado = (req.query?.estado || "").toString().trim() || null;
     const clienteId = Number.isFinite(Number(req.query?.cliente_id)) ? Number(req.query?.cliente_id) : null;
+    const cajaId = (req.query?.caja_id || "").toString().trim() || null;
     const desde = (req.query?.desde || "").toString().trim() || null;
     const hasta = (req.query?.hasta || "").toString().trim() || null;
 
@@ -185,6 +186,10 @@ router.get("/", authenticateToken, async (req, res) => {
     if (clienteId) {
       params.push(clienteId);
       where.push(`cliente_id = $${params.length}`);
+    }
+    if (cajaId) {
+      params.push(cajaId);
+      where.push(`caja_id = $${params.length}`);
     }
     if (desde) {
       params.push(desde);
@@ -255,6 +260,8 @@ router.post("/", authenticateToken, async (req, res) => {
     return res.status(400).json({ error: "almacen_id requerido" });
   }
 
+  const caja_id = body.caja_id ?? body.cajaId ?? null;
+
   const itemsRaw = Array.isArray(body.items) ? body.items : [];
   if (!itemsRaw.length) return res.status(400).json({ error: "items requeridos" });
 
@@ -268,6 +275,24 @@ router.post("/", authenticateToken, async (req, res) => {
     }
     if (!it.producto_id && !it.producto_nombre && !it.codigo_qr) {
       return res.status(400).json({ error: "producto_id o nombre/codigo_qr requerido", item: it._raw });
+    }
+  }
+
+  if (caja_id) {
+    const rCaja = await q(
+      `SELECT * FROM cajas WHERE id = $1 AND organizacion_id = $2 LIMIT 1`,
+      [caja_id, org]
+    );
+    if (!rCaja.rowCount) {
+      return res.status(404).json({ error: "caja_no_encontrada" });
+    }
+    const caja = rCaja.rows[0];
+    if (String(caja.estado || "").toLowerCase() !== "abierta") {
+      return res.status(409).json({ error: "caja_no_abierta" });
+    }
+    const cajaAlm = Number(caja.almacen_id);
+    if (Number.isFinite(cajaAlm) && Number.isFinite(almacen_id) && cajaAlm != almacen_id) {
+      return res.status(409).json({ error: "caja_almacen_mismatch", caja_almacen_id: cajaAlm });
     }
   }
 
@@ -301,12 +326,12 @@ router.post("/", authenticateToken, async (req, res) => {
 
     const ins = await client.query(
       `INSERT INTO cobros
-        (id, organizacion_id, cliente_id, almacen_id, moneda, total, descuento_total,
+        (id, organizacion_id, cliente_id, almacen_id, caja_id, moneda, total, descuento_total,
          medio_pago, notas, estado, usuario_email)
        VALUES
-        (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, $8, 'pendiente', $9)
+        (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, $8, $9, 'pendiente', $10)
        RETURNING *`,
-      [org, cliente_id, almacen_id, moneda, total, descuento_total, medio_pago, notas, userEmail]
+      [org, cliente_id, almacen_id, caja_id, moneda, total, descuento_total, medio_pago, notas, userEmail]
     );
     cobro = ins.rows[0];
 
@@ -368,3 +393,4 @@ router.post("/", authenticateToken, async (req, res) => {
 });
 
 export default router;
+
