@@ -1,4 +1,4 @@
-// index.js �?" VEX CRM Backend (ESM)
+﻿// index.js ƒ?" VEX CRM Backend (ESM)
 import "dotenv/config";
 import express from "express";
 import morgan from "morgan";
@@ -366,4 +366,5 @@ function startInvoiceReminders() {
     { timezone: TZ }
   );
 }
+
 
