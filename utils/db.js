@@ -1,4 +1,4 @@
-// utils/db.js �?" VEX CRM (Railway/Postgres, ESM)
+﻿// utils/db.js ƒ?" VEX CRM (Railway/Postgres, ESM)
 import pg from "pg";
 const { Pool, types } = pg;
 
@@ -728,5 +728,6 @@ export async function closeDB() {
     await db.end();
   } catch {}
 }
+
 
 
